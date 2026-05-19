@@ -1,8 +1,8 @@
 diff --git a/CMakeLists.txt b/CMakeLists.txt
-index f58a5876ed..37ca7f512a 100644
+index af78323a..2cb36802 100644
 --- a/CMakeLists.txt
 +++ b/CMakeLists.txt
-@@ -517,12 +517,22 @@ target_include_directories(boost_headeronly SYSTEM INTERFACE ${Boost_INCLUDE_DIR
+@@ -613,12 +613,22 @@ target_include_directories(boost_headeronly SYSTEM INTERFACE ${Boost_INCLUDE_DIR
  target_link_libraries(boost_libs INTERFACE boost_headeronly ${Boost_LIBRARIES})
  
  # Find and configure intel-tbb
@@ -27,7 +27,7 @@ index f58a5876ed..37ca7f512a 100644
  # add_definitions(${TBB_DEFINITIONS})
  # if(MSVC)
 diff --git a/deps_src/hidapi/CMakeLists.txt b/deps_src/hidapi/CMakeLists.txt
-index efb7f62ebe..3f2fc36da8 100644
+index efb7f62e..3f2fc36d 100644
 --- a/deps_src/hidapi/CMakeLists.txt
 +++ b/deps_src/hidapi/CMakeLists.txt
 @@ -1,3 +1,10 @@
@@ -42,7 +42,7 @@ index efb7f62ebe..3f2fc36da8 100644
  if (WIN32)
      set(HIDAPI_IMPL win/hid.c)
 diff --git a/src/libslic3r/AABBTreeLines.hpp b/src/libslic3r/AABBTreeLines.hpp
-index 55cf328f57..2a2efb504b 100644
+index 55cf328f..2a2efb50 100644
 --- a/src/libslic3r/AABBTreeLines.hpp
 +++ b/src/libslic3r/AABBTreeLines.hpp
 @@ -32,7 +32,9 @@ namespace AABBTreeLines {
@@ -57,7 +57,7 @@ index 55cf328f57..2a2efb504b 100644
              }
          };
 diff --git a/src/libslic3r/CMakeLists.txt b/src/libslic3r/CMakeLists.txt
-index d85c65fd51..d6682734d2 100644
+index 5f959145..f2557a43 100644
 --- a/src/libslic3r/CMakeLists.txt
 +++ b/src/libslic3r/CMakeLists.txt
 @@ -20,6 +20,9 @@ endif()
@@ -70,7 +70,7 @@ index d85c65fd51..d6682734d2 100644
  set(lisbslic3r_sources
      AABBMesh.cpp
      AABBMesh.hpp
-@@ -461,7 +464,7 @@ if (APPLE)
+@@ -483,7 +486,7 @@ if (APPLE)
          )
  endif ()
  
@@ -79,7 +79,7 @@ index d85c65fd51..d6682734d2 100644
      "${CMAKE_CURRENT_BINARY_DIR}/libslic3r_version.h"
      ${OpenVDBUtils_SOURCES})
  source_group(TREE ${CMAKE_CURRENT_SOURCE_DIR} FILES ${lisbslic3r_sources})
-@@ -474,10 +477,12 @@ set(CGAL_DO_NOT_WARN_ABOUT_CMAKE_BUILD_TYPE ON CACHE BOOL "" FORCE)
+@@ -496,10 +499,12 @@ set(CGAL_DO_NOT_WARN_ABOUT_CMAKE_BUILD_TYPE ON CACHE BOOL "" FORCE)
  cmake_policy(PUSH)
  cmake_policy(SET CMP0011 NEW)
  find_package(CGAL REQUIRED)
@@ -94,16 +94,21 @@ index d85c65fd51..d6682734d2 100644
      CutSurface.hpp CutSurface.cpp
      IntersectionPoints.hpp IntersectionPoints.cpp
      MeshBoolean.hpp MeshBoolean.cpp
-@@ -515,59 +520,73 @@ target_include_directories(libslic3r PRIVATE ${CMAKE_CURRENT_SOURCE_DIR} PUBLIC
+@@ -536,42 +541,64 @@ target_compile_definitions(libslic3r PUBLIC -DUSE_TBB -DTBB_USE_CAPTURED_EXCEPTI
+ target_include_directories(libslic3r PRIVATE ${CMAKE_CURRENT_SOURCE_DIR} PUBLIC ${CMAKE_CURRENT_BINARY_DIR})
  target_include_directories(libslic3r SYSTEM PUBLIC ${EXPAT_INCLUDE_DIRS})
  
- # Find the OCCT and related libraries
+-# Find the OCCT and related libraries
 -set(OpenCASCADE_DIR "${CMAKE_PREFIX_PATH}/lib/cmake/occt")
 -find_package(OpenCASCADE REQUIRED)
 -target_include_directories(libslic3r SYSTEM PUBLIC ${OpenCASCADE_INCLUDE_DIR})
 -
 -find_package(JPEG REQUIRED)
--
++# Find draco (used unconditionally for 3MF compressed mesh I/O) and
++# libnoise (used by Fill/etc.) — both required regardless of OCCT.
+ find_package(draco REQUIRED)
++find_package(libnoise REQUIRED)
+ 
 -set(OCCT_LIBS
 -    TKXDESTEP
 -    TKSTEP
@@ -132,12 +137,12 @@ index d85c65fd51..d6682734d2 100644
 -    TKMath
 -    TKernel
 -)
--
- find_package(libnoise REQUIRED)
++# OCCT is optional. For headless WASM builds we set SLIC3R_WITH_OCCT=OFF
++# and define SLIC3R_NO_OCCT so STEP / SVG-OCCT code paths fall back to
++# stub implementations.
 +set(OCCT_PRIVATE_LIBS)
 +
 +if(SLIC3R_WITH_OCCT)
-+    # Find the OCCT and related libraries
 +    set(OpenCASCADE_DIR "${CMAKE_PREFIX_PATH}/lib/cmake/occt")
 +    find_package(OpenCASCADE REQUIRED)
 +    target_include_directories(libslic3r SYSTEM PUBLIC ${OpenCASCADE_INCLUDE_DIR})
@@ -185,10 +190,10 @@ index d85c65fd51..d6682734d2 100644
 +else()
 +    target_compile_definitions(libslic3r PUBLIC SLIC3R_NO_OCCT)
 +endif()
-+
+ 
  target_link_libraries(libslic3r
      PUBLIC
-         admesh
+@@ -579,11 +606,9 @@ target_link_libraries(libslic3r
          libigl
          libnest2d
          miniz
@@ -200,29 +205,35 @@ index d85c65fd51..d6682734d2 100644
          boost_libs
          cereal::cereal
          clipper
+@@ -591,7 +616,6 @@ target_link_libraries(libslic3r
+         draco::draco
          eigen
          glu-libtess
 -        JPEG::JPEG
          libslic3r_cgal
          mcut
          noise::noise
-@@ -575,18 +594,19 @@ target_link_libraries(libslic3r
+@@ -599,18 +623,23 @@ target_link_libraries(libslic3r
          qhull
          qoi
          semver
 -        TBB::tbb
 -        TBB::tbbmalloc
          ZLIB::ZLIB
+-        OpenSSL::Crypto
 +        ${OCCT_PRIVATE_LIBS}
      )
  
 -if(NOT WIN32)
 -    # Link freetype for OCCT dependency (CAD operations need font rendering)
 -    target_link_libraries(libslic3r PRIVATE ${FREETYPE_LIBRARIES})
--    target_link_libraries(libslic3r PRIVATE OpenSSL::Crypto)
 -    if (NOT APPLE)
 -        target_link_libraries(libslic3r PRIVATE fontconfig)
 -    endif()
++# OCCT_PRIVATE_LIBS already carries freetype / fontconfig / OpenSSL::Crypto
++# when SLIC3R_WITH_OCCT=ON (set above); leave the conditional link blocks
++# folded into that variable so the !OCCT (WASM) branch is empty.
++
 +if (TBB_FOUND)
 +    target_link_libraries(libslic3r PRIVATE TBB::tbb TBB::tbbmalloc)
 +endif()
@@ -236,7 +247,7 @@ index d85c65fd51..d6682734d2 100644
  
  if (APPLE)
 diff --git a/src/libslic3r/ExtrusionEntity.hpp b/src/libslic3r/ExtrusionEntity.hpp
-index edd7839cc1..a7e5689922 100644
+index edd7839c..a7e56899 100644
 --- a/src/libslic3r/ExtrusionEntity.hpp
 +++ b/src/libslic3r/ExtrusionEntity.hpp
 @@ -557,7 +557,7 @@ inline void extrusion_entities_append_paths_with_wipe(ExtrusionEntitiesPtr &dst,
@@ -249,7 +260,7 @@ index edd7839cc1..a7e5689922 100644
                      dst.push_back(multi_path);
                      multi_path = new ExtrusionMultiPath();
 diff --git a/src/libslic3r/Feature/FuzzySkin/FuzzySkin.cpp b/src/libslic3r/Feature/FuzzySkin/FuzzySkin.cpp
-index 66fc90dc99..af7a61c80e 100644
+index d7351362..8046eb89 100644
 --- a/src/libslic3r/Feature/FuzzySkin/FuzzySkin.cpp
 +++ b/src/libslic3r/Feature/FuzzySkin/FuzzySkin.cpp
 @@ -1,4 +1,7 @@
@@ -260,7 +271,7 @@ index 66fc90dc99..af7a61c80e 100644
  
  #include "libslic3r/Algorithm/LineSplit.hpp"
  #include "libslic3r/Arachne/utils/ExtrusionJunction.hpp"
-@@ -21,10 +24,16 @@ using namespace Slic3r;
+@@ -22,10 +25,16 @@ using namespace Slic3r;
  namespace Slic3r::Feature::FuzzySkin {
  
  // Produces a random value between 0 and 1. Thread-safe.
@@ -280,7 +291,7 @@ index 66fc90dc99..af7a61c80e 100644
      return dist(gen);
  }
 diff --git a/src/libslic3r/Feature/Interlocking/InterlockingGenerator.hpp b/src/libslic3r/Feature/Interlocking/InterlockingGenerator.hpp
-index 6f331fb8ef..3ba7432a49 100644
+index e6b79f9b..de033221 100644
 --- a/src/libslic3r/Feature/Interlocking/InterlockingGenerator.hpp
 +++ b/src/libslic3r/Feature/Interlocking/InterlockingGenerator.hpp
 @@ -7,6 +7,8 @@
@@ -293,7 +304,7 @@ index 6f331fb8ef..3ba7432a49 100644
  
  /*!
 diff --git a/src/libslic3r/Fill/Fill.cpp b/src/libslic3r/Fill/Fill.cpp
-index e8294ea673..4abe7345f2 100644
+index 9d9962db..dcaeb5fa 100644
 --- a/src/libslic3r/Fill/Fill.cpp
 +++ b/src/libslic3r/Fill/Fill.cpp
 @@ -1,6 +1,7 @@
@@ -305,25 +316,25 @@ index e8294ea673..4abe7345f2 100644
  #include "../ClipperUtils.hpp"
  #include "../Geometry.hpp"
 diff --git a/src/libslic3r/Fill/FillAdaptive.cpp b/src/libslic3r/Fill/FillAdaptive.cpp
-index 3ec9ec3685..3bee953ecb 100644
+index 344bb529..50a8206a 100644
 --- a/src/libslic3r/Fill/FillAdaptive.cpp
 +++ b/src/libslic3r/Fill/FillAdaptive.cpp
-@@ -1393,8 +1393,8 @@ void Filler::_fill_surface_single(
-     }
+@@ -1395,8 +1395,8 @@ void Filler::_fill_surface_single(
+         }
  #endif /* ADAPTIVE_CUBIC_INFILL_DEBUG_OUTPUT */
  
--    const auto hook_length     = coordf_t(std::min<float>(std::numeric_limits<coord_t>::max(), scale_(params.anchor_length)));
--    const auto hook_length_max = coordf_t(std::min<float>(std::numeric_limits<coord_t>::max(), scale_(params.anchor_length_max)));
-+    const auto hook_length     = coordf_t(std::min<coordf_t>(static_cast<coordf_t>(std::numeric_limits<coord_t>::max()), scale_(params.anchor_length)));
-+    const auto hook_length_max = coordf_t(std::min<coordf_t>(static_cast<coordf_t>(std::numeric_limits<coord_t>::max()), scale_(params.anchor_length_max)));
+-        const auto hook_length     = coordf_t(std::min<float>(std::numeric_limits<coord_t>::max(), scale_(params.anchor_length)));
+-        const auto hook_length_max = coordf_t(std::min<float>(std::numeric_limits<coord_t>::max(), scale_(params.anchor_length_max)));
++        const auto hook_length     = coordf_t(std::min<coordf_t>(static_cast<coordf_t>(std::numeric_limits<coord_t>::max()), scale_(params.anchor_length)));
++        const auto hook_length_max = coordf_t(std::min<coordf_t>(static_cast<coordf_t>(std::numeric_limits<coord_t>::max()), scale_(params.anchor_length_max)));
  
      Polylines all_polylines_with_hooks = all_polylines.size() > 1 ? connect_lines_using_hooks(std::move(all_polylines), expolygon, this->spacing, hook_length, hook_length_max) : std::move(all_polylines);
  
 diff --git a/src/libslic3r/Format/STEP.cpp b/src/libslic3r/Format/STEP.cpp
-index 5105d26776..669ebd44f6 100644
+index 3ea3de59..70950e4c 100644
 --- a/src/libslic3r/Format/STEP.cpp
 +++ b/src/libslic3r/Format/STEP.cpp
-@@ -4,6 +4,81 @@
+@@ -5,6 +5,81 @@
  
  #include "STEP.hpp"
  
@@ -405,14 +416,14 @@ index 5105d26776..669ebd44f6 100644
  #include <string>
  #include <boost/nowide/cstdio.hpp>
  #include <boost/nowide/iostream.hpp>
-@@ -518,3 +593,5 @@ unsigned int Step::get_triangle_num_tbb(double linear_defletion, double angle_de
+@@ -746,3 +821,5 @@ unsigned int Step::get_triangle_num_tbb(double linear_defletion, double angle_de
  }
  
  }; // namespace Slic3r
 +
 +#endif // SLIC3R_NO_OCCT
 diff --git a/src/libslic3r/Format/STEP.hpp b/src/libslic3r/Format/STEP.hpp
-index 85c8f655ef..8142e94c30 100644
+index 4c035e3e..7a5b061c 100644
 --- a/src/libslic3r/Format/STEP.hpp
 +++ b/src/libslic3r/Format/STEP.hpp
 @@ -1,18 +1,26 @@
@@ -454,7 +465,7 @@ index 85c8f655ef..8142e94c30 100644
  struct NamedSolid
  {
      NamedSolid(const TopoDS_Shape& s,
-@@ -105,6 +115,34 @@ private:
+@@ -119,6 +129,34 @@ private:
      std::vector<NamedSolid> m_name_solids;
  };
  
@@ -490,10 +501,10 @@ index 85c8f655ef..8142e94c30 100644
  
  #endif /* slic3r_Format_STEP_hpp_ */
 diff --git a/src/libslic3r/Format/svg.cpp b/src/libslic3r/Format/svg.cpp
-index 4a96274b99..43d64bfb81 100644
+index 7bfd73b9..649ede66 100644
 --- a/src/libslic3r/Format/svg.cpp
 +++ b/src/libslic3r/Format/svg.cpp
-@@ -9,6 +9,7 @@
+@@ -10,6 +10,7 @@
  
  #include <boost/log/trivial.hpp>
  
@@ -501,17 +512,19 @@ index 4a96274b99..43d64bfb81 100644
  #include "BRepBuilderAPI_MakeWire.hxx"
  #include "BRepBuilderAPI_MakeEdge.hxx"
  #include "BRepBuilderAPI_MakeFace.hxx"
-@@ -20,6 +21,9 @@
- #include "TopoDS.hxx"
+@@ -22,6 +23,11 @@
  #include "BRepExtrema_SelfIntersection.hxx"
- #include "clipper/clipper.hpp"
+ #include "libslic3r/clipper.hpp"
+ #include "libslic3r/Polygon.hpp"
 +#endif
 +
 +#ifndef SLIC3R_NO_OCCT
++
++using namespace ClipperLib;
  
- using namespace ClipperLib;
- 
-@@ -400,3 +404,17 @@ bool load_svg(const char *path, Model *model, std::string &message)
+ namespace Slic3r {
+ const double STEP_TRANS_CHORD_ERROR = 0.005;
+@@ -400,3 +406,17 @@ bool load_svg(const char *path, Model *model, std::string &message)
      return true;
  }
  } // namespace Slic3r
@@ -530,10 +543,10 @@ index 4a96274b99..43d64bfb81 100644
 +
 +#endif // SLIC3R_NO_OCCT
 diff --git a/src/libslic3r/GCode.cpp b/src/libslic3r/GCode.cpp
-index dda1d0c5ed..c341463d12 100644
+index fe10cbcd..85f3525a 100644
 --- a/src/libslic3r/GCode.cpp
 +++ b/src/libslic3r/GCode.cpp
-@@ -2758,6 +2758,78 @@ void GCode::process_layers(
+@@ -3537,6 +3537,78 @@ void GCode::process_layers(
      const std::vector<std::pair<coordf_t, std::vector<LayerToPrint>>>   &layers_to_print,
      GCodeOutputStream                                                   &output_stream)
  {
@@ -612,7 +625,7 @@ index dda1d0c5ed..c341463d12 100644
      // The pipeline is variable: The vase mode filter is optional.
      size_t layer_to_print_idx = 0;
      const auto generator = tbb::make_filter<void, LayerResult>(slic3r_tbb_filtermode::serial_in_order,
-@@ -2767,8 +2839,6 @@ void GCode::process_layers(
+@@ -3546,8 +3618,6 @@ void GCode::process_layers(
                      fc.stop();
                      return {};
                  } else {
@@ -621,14 +634,14 @@ index dda1d0c5ed..c341463d12 100644
                      ++layer_to_print_idx;
                      return LayerResult::make_nop_layer_result();
                  }
-@@ -2778,22 +2848,16 @@ void GCode::process_layers(
+@@ -3557,22 +3627,16 @@ void GCode::process_layers(
                  print.set_status(80, Slic3r::format(_(L("Generating G-code: layer %1%")), std::to_string(layer_to_print_idx)));
                  if (m_wipe_tower && layer_tools.has_wipe_tower)
                      m_wipe_tower->next_layer();
 -                //BBS
                  check_placeholder_parser_failed();
                  print.throw_if_canceled();
-                 return this->process_layer(print, layer.second, layer_tools, &layer == &layers_to_print.back(), &print_object_instances_ordering, size_t(-1));
+                 return this->process_layer(print, layer.second, layer_tools, &layer == &layers_to_print.back(), &print_object_instances_ordering, tool_ordering.get_most_used_extruder(), size_t(-1));
              }
          });
 -    if (m_spiral_vase) {
@@ -646,7 +659,7 @@ index dda1d0c5ed..c341463d12 100644
              spiral_mode.enable(in.spiral_vase_enable);
              bool last_layer = in.layer_id == layers_to_print.size() - 1;
              return { spiral_mode.process_layer(std::move(in.gcode), last_layer), in.layer_id, in.spiral_vase_enable, in.cooling_buffer_flush};
-@@ -2804,7 +2868,7 @@ void GCode::process_layers(
+@@ -3583,7 +3647,7 @@ void GCode::process_layers(
          });
      const auto cooling = tbb::make_filter<LayerResult, std::string>(slic3r_tbb_filtermode::serial_in_order,
          [&cooling_buffer = *this->m_cooling_buffer.get()](LayerResult in) -> std::string {
@@ -655,7 +668,7 @@ index dda1d0c5ed..c341463d12 100644
                  return in.gcode;
              return cooling_buffer.process_layer(std::move(in.gcode), in.layer_id, in.cooling_buffer_flush);
          });
-@@ -2813,7 +2877,7 @@ void GCode::process_layers(
+@@ -3592,7 +3656,7 @@ void GCode::process_layers(
                  return pa_processor.process_layer(std::move(in));
              }
          );
@@ -664,7 +677,7 @@ index dda1d0c5ed..c341463d12 100644
      const auto output = tbb::make_filter<std::string, void>(slic3r_tbb_filtermode::serial_in_order,
          [&output_stream](std::string s) { output_stream.write(s); }
      );
-@@ -2832,21 +2896,20 @@ void GCode::process_layers(
+@@ -3611,22 +3675,20 @@ void GCode::process_layers(
                      config.use_relative_e_distances.value,
                      config.fan_speedup_overhangs.value,
                      (float)config.fan_kickstart.value));
@@ -683,13 +696,13 @@ index dda1d0c5ed..c341463d12 100644
      else if	(m_pressure_equalizer)
          tbb::parallel_pipeline(12, generator & pressure_equalizer & cooling & fan_mover & pa_processor_filter & output);
      else
--    	tbb::parallel_pipeline(12, generator & cooling & fan_mover & pa_processor_filter & output);
-+	tbb::parallel_pipeline(12, generator & cooling & fan_mover & pa_processor_filter & output);
+     	tbb::parallel_pipeline(12, generator & cooling & fan_mover & pa_processor_filter & output);
+-
 +#endif
  }
  
  // Process all layers of a single object instance (sequential mode) with a parallel pipeline:
-@@ -2861,7 +2924,73 @@ void GCode::process_layers(
+@@ -3641,7 +3703,73 @@ void GCode::process_layers(
      // BBS
      const bool                               prime_extruder)
  {
@@ -764,7 +777,7 @@ index dda1d0c5ed..c341463d12 100644
      size_t layer_to_print_idx = 0;
      const auto generator = tbb::make_filter<void, LayerResult>(slic3r_tbb_filtermode::serial_in_order,
          [this, &print, &tool_ordering, &layers_to_print, &layer_to_print_idx, single_object_idx, prime_extruder](tbb::flow_control& fc) -> LayerResult {
-@@ -2870,15 +2999,12 @@ void GCode::process_layers(
+@@ -3650,15 +3778,12 @@ void GCode::process_layers(
                      fc.stop();
                      return {};
                  } else {
@@ -779,8 +792,8 @@ index dda1d0c5ed..c341463d12 100644
 -                //BBS
                  check_placeholder_parser_failed();
                  print.throw_if_canceled();
-                 return this->process_layer(print, { std::move(layer) }, tool_ordering.tools_for_layer(layer.print_z()), &layer == &layers_to_print.back(), nullptr, single_object_idx, prime_extruder);
-@@ -2912,7 +3038,7 @@ void GCode::process_layers(
+                 return this->process_layer(print, { std::move(layer) }, tool_ordering.tools_for_layer(layer.print_z()), &layer == &layers_to_print.back(), nullptr, tool_ordering.get_most_used_extruder(), single_object_idx, prime_extruder);
+@@ -3692,7 +3817,7 @@ void GCode::process_layers(
              return pa_processor.process_layer(std::move(in));
          }
      );
@@ -789,7 +802,7 @@ index dda1d0c5ed..c341463d12 100644
      const auto output = tbb::make_filter<std::string, void>(slic3r_tbb_filtermode::serial_in_order,
          [&output_stream](std::string s) { output_stream.write(s); }
      );
-@@ -2929,21 +3055,20 @@ void GCode::process_layers(
+@@ -3709,21 +3834,20 @@ void GCode::process_layers(
                      config.use_relative_e_distances.value,
                      config.fan_speedup_overhangs.value,
                      (float)config.fan_kickstart.value));
@@ -813,12 +826,12 @@ index dda1d0c5ed..c341463d12 100644
 +#endif
  }
  
- std::string GCode::placeholder_parser_process(const std::string &name, const std::string &templ, unsigned int current_extruder_id, const DynamicConfig *config_override)
+ std::string GCode::placeholder_parser_process(const std::string &name, const std::string &templ, unsigned int current_filament_id, const DynamicConfig *config_override)
 diff --git a/src/libslic3r/GCode.hpp b/src/libslic3r/GCode.hpp
-index f3ce7aaf74..d6b7ef5953 100644
+index d379300b..84a686de 100644
 --- a/src/libslic3r/GCode.hpp
 +++ b/src/libslic3r/GCode.hpp
-@@ -156,7 +156,7 @@ struct LayerResult {
+@@ -176,7 +176,7 @@ struct LayerResult {
      // It is used for the pressure equalizer because it needs to buffer one layer back.
      bool        nop_layer_result { false };
  
@@ -827,30 +840,8 @@ index f3ce7aaf74..d6b7ef5953 100644
  };
  
  class GCode {
-diff --git a/src/libslic3r/GCode/ToolOrdering.cpp b/src/libslic3r/GCode/ToolOrdering.cpp
-index debdb863d0..73fbc0f6f8 100644
---- a/src/libslic3r/GCode/ToolOrdering.cpp
-+++ b/src/libslic3r/GCode/ToolOrdering.cpp
-@@ -43,7 +43,7 @@ static std::vector<unsigned int> solve_extruder_order(const std::vector<std::vec
- 
-     unsigned int iterations = (1 << all_extruders.size());
-     unsigned int final_state = iterations - 1;
--    std::vector<std::vector<float>>cache(iterations, std::vector<float>(all_extruders.size(),0x7fffffff));
-+    std::vector<std::vector<float>> cache(iterations, std::vector<float>(all_extruders.size(), std::numeric_limits<float>::max()));
-     std::vector<std::vector<int>>prev(iterations, std::vector<int>(all_extruders.size(), -1));
-     cache[1][0] = 0.;
-     for (unsigned int state = 0; state < iterations; ++state) {
-@@ -70,7 +70,7 @@ static std::vector<unsigned int> solve_extruder_order(const std::vector<std::vec
-     for (unsigned int dst = 0; dst < all_extruders.size(); ++dst) {
-         if (all_extruders[dst] != start_extruder_id && cost > cache[final_state][dst]) {
-             cost = cache[final_state][dst];
--            final_dst = dst;
-+            final_dst = static_cast<int>(dst);
-         }
-     }
- 
 diff --git a/src/libslic3r/Geometry/VoronoiUtilsCgal.cpp b/src/libslic3r/Geometry/VoronoiUtilsCgal.cpp
-index 28a648851d..ad08dbfc6e 100644
+index 28a64885..ad08dbfc 100644
 --- a/src/libslic3r/Geometry/VoronoiUtilsCgal.cpp
 +++ b/src/libslic3r/Geometry/VoronoiUtilsCgal.cpp
 @@ -1,11 +1,7 @@
@@ -920,7 +911,7 @@ index 28a648851d..ad08dbfc6e 100644
 +
 +#endif // __EMSCRIPTEN__
 diff --git a/src/libslic3r/LocalesUtils.cpp b/src/libslic3r/LocalesUtils.cpp
-index d321072335..5379b53e34 100644
+index d3210723..5379b53e 100644
 --- a/src/libslic3r/LocalesUtils.cpp
 +++ b/src/libslic3r/LocalesUtils.cpp
 @@ -3,6 +3,7 @@
@@ -932,10 +923,10 @@ index d321072335..5379b53e34 100644
  
  #include <fast_float/fast_float.h>
 diff --git a/src/libslic3r/Model.cpp b/src/libslic3r/Model.cpp
-index 4edec076af..f7908b2170 100644
+index 4ef737de..7696eca1 100644
 --- a/src/libslic3r/Model.cpp
 +++ b/src/libslic3r/Model.cpp
-@@ -177,6 +177,7 @@ Model::~Model()
+@@ -181,6 +181,7 @@ Model::~Model()
          Slic3r::remove_backup(*this, true);
  }
  
@@ -943,7 +934,7 @@ index 4edec076af..f7908b2170 100644
  Model Model::read_from_step(const std::string&                                      input_file,
                              LoadStrategy                                            options,
                              ImportStepProgressFn                                    stepFn,
-@@ -222,6 +223,19 @@ Model Model::read_from_step(const std::string&
+@@ -234,6 +235,19 @@ _finished:
  
      return model;
  }
@@ -964,7 +955,7 @@ index 4edec076af..f7908b2170 100644
  // BBS: add part plate related logic
  // BBS: backup & restore
 diff --git a/src/libslic3r/MultiPoint.hpp b/src/libslic3r/MultiPoint.hpp
-index 0dfb98f4b4..9030703d06 100644
+index 0dfb98f4..9030703d 100644
 --- a/src/libslic3r/MultiPoint.hpp
 +++ b/src/libslic3r/MultiPoint.hpp
 @@ -22,6 +22,7 @@ public:
@@ -985,7 +976,7 @@ index 0dfb98f4b4..9030703d06 100644
  
      void translate(double x, double y);
 diff --git a/src/libslic3r/OpenVDBUtils.cpp b/src/libslic3r/OpenVDBUtils.cpp
-index 72c7668a45..ad77a8511e 100644
+index 72c7668a..ad77a851 100644
 --- a/src/libslic3r/OpenVDBUtils.cpp
 +++ b/src/libslic3r/OpenVDBUtils.cpp
 @@ -1,6 +1,29 @@
@@ -1025,7 +1016,7 @@ index 72c7668a45..ad77a8511e 100644
 +
 +#endif // defined(__EMSCRIPTEN__) && defined(ORCA_DISABLE_OPENVDB)
 diff --git a/src/libslic3r/OpenVDBUtils.hpp b/src/libslic3r/OpenVDBUtils.hpp
-index f4441ba964..5c439eef6d 100644
+index f4441ba9..5c439eef 100644
 --- a/src/libslic3r/OpenVDBUtils.hpp
 +++ b/src/libslic3r/OpenVDBUtils.hpp
 @@ -3,6 +3,45 @@
@@ -1084,7 +1075,7 @@ index f4441ba964..5c439eef6d 100644
 +
 +
 diff --git a/src/libslic3r/PNGReadWrite.cpp b/src/libslic3r/PNGReadWrite.cpp
-index 32b9a8f79e..023a78f1f0 100644
+index 32b9a8f7..023a78f1 100644
 --- a/src/libslic3r/PNGReadWrite.cpp
 +++ b/src/libslic3r/PNGReadWrite.cpp
 @@ -2,6 +2,7 @@
@@ -1096,7 +1087,7 @@ index 32b9a8f79e..023a78f1f0 100644
  #include <png.h>
  
 diff --git a/src/libslic3r/Platform.cpp b/src/libslic3r/Platform.cpp
-index 338752112b..1f1e09a3e7 100644
+index 33875211..1f1e09a3 100644
 --- a/src/libslic3r/Platform.cpp
 +++ b/src/libslic3r/Platform.cpp
 @@ -55,6 +55,10 @@ void detect_platform()
@@ -1111,10 +1102,10 @@ index 338752112b..1f1e09a3e7 100644
      BOOST_LOG_TRIVIAL(info) << "Platform: Linux";
  	s_platform 		  = Platform::Linux;
 diff --git a/src/libslic3r/Print.hpp b/src/libslic3r/Print.hpp
-index 7261bc2ce6..fcecc5148f 100644
+index b98811c8..9bc8993e 100644
 --- a/src/libslic3r/Print.hpp
 +++ b/src/libslic3r/Print.hpp
-@@ -861,8 +861,8 @@ public:
+@@ -910,8 +910,8 @@ public:
      // If preview_data is not null, the preview_data is filled in for the G-code visualization (not used by the command line Slic3r).
      std::string         export_gcode(const std::string& path_template, GCodeProcessorResult* result, ThumbnailsGeneratorCallback thumbnail_cb = nullptr);
      //return 0 means successful
@@ -1126,10 +1117,10 @@ index 7261bc2ce6..fcecc5148f 100644
      // methods for handling state
      bool                is_step_done(PrintStep step) const { return Inherited::is_step_done(step); }
 diff --git a/src/libslic3r/PrintConfig.cpp b/src/libslic3r/PrintConfig.cpp
-index 498678ad29..9224af6206 100644
+index 50be57e0..745fa551 100644
 --- a/src/libslic3r/PrintConfig.cpp
 +++ b/src/libslic3r/PrintConfig.cpp
-@@ -540,7 +540,7 @@ void PrintConfigDef::init_common_params()
+@@ -694,7 +694,7 @@ void PrintConfigDef::init_common_params()
      def->sidetext = L("layers");
      def->min      = 1;
      def->mode     = comAdvanced;
@@ -1138,7 +1129,7 @@ index 498678ad29..9224af6206 100644
  
      def = this->add("layer_height", coFloat);
      def->label = L("Layer height");
-@@ -666,7 +666,7 @@ void PrintConfigDef::init_common_params()
+@@ -836,7 +836,7 @@ void PrintConfigDef::init_common_params()
      def->mode = comAdvanced;
      def->cli = ConfigOptionDef::nocli;
      def->set_default_value(new ConfigOptionEnum<AuthorizationType>(atKeyPassword));
@@ -1147,7 +1138,7 @@ index 498678ad29..9224af6206 100644
      // temporary workaround for compatibility with older Slicer
      {
          def = this->add("preset_name", coString);
-@@ -825,7 +825,7 @@ void PrintConfigDef::init_fff_params()
+@@ -995,7 +995,7 @@ void PrintConfigDef::init_fff_params()
      def->tooltip = L("Bed types supported by the printer.");
      def->mode = comSimple;
      def->enum_keys_map = &s_keys_map_BedType;
@@ -1156,7 +1147,7 @@ index 498678ad29..9224af6206 100644
      def->enum_values.emplace_back("Cool Plate");
      def->enum_values.emplace_back("Engineering Plate");
      def->enum_values.emplace_back("High Temp Plate");
-@@ -1001,7 +1001,7 @@ void PrintConfigDef::init_fff_params()
+@@ -1171,7 +1171,7 @@ void PrintConfigDef::init_fff_params()
      def->min = 0;
      def->mode = comAdvanced;
      def->set_default_value(new ConfigOptionFloat(0.));
@@ -1165,7 +1156,7 @@ index 498678ad29..9224af6206 100644
      // ORCA: Internal bridge angle override
      def = this->add("internal_bridge_angle", coFloat);
      def->label = L("Internal bridge infill direction");
-@@ -1184,7 +1184,7 @@ void PrintConfigDef::init_fff_params()
+@@ -1453,7 +1453,7 @@ void PrintConfigDef::init_fff_params()
      def->tooltip = L("Enable this option to slow printing down for different overhang degree.");
      def->mode = comAdvanced;
      def->set_default_value(new ConfigOptionBool{ true });
@@ -1174,7 +1165,7 @@ index 498678ad29..9224af6206 100644
      def = this->add("slowdown_for_curled_perimeters", coBool);
      def->label = L("Slow down for curled perimeters");
      def->category = L("Speed");
-@@ -1506,7 +1506,7 @@ void PrintConfigDef::init_fff_params()
+@@ -1786,7 +1786,7 @@ void PrintConfigDef::init_fff_params()
                         "consider turning it off if you are using large nozzles.");
      def->mode = comAdvanced;
      def->set_default_value(new ConfigOptionBool(true));
@@ -1183,7 +1174,7 @@ index 498678ad29..9224af6206 100644
      def = this->add("enable_extra_bridge_layer", coEnum);
      def->label = L("Extra bridge layers (beta)");
      def->category = L("Quality");
-@@ -1621,7 +1621,7 @@ void PrintConfigDef::init_fff_params()
+@@ -1901,7 +1901,7 @@ void PrintConfigDef::init_fff_params()
      def->enum_labels.push_back(L("All"));
      def->mode = comAdvanced;
      def->set_default_value(new ConfigOptionEnum<EnsureVerticalShellThickness>(EnsureVerticalShellThickness::evstAll));
@@ -1192,7 +1183,7 @@ index 498678ad29..9224af6206 100644
      auto def_top_fill_pattern = def = this->add("top_surface_pattern", coEnum);
      def->label = L("Top surface pattern");
      def->category = L("Strength");
-@@ -1662,7 +1662,7 @@ void PrintConfigDef::init_fff_params()
+@@ -1942,7 +1942,7 @@ void PrintConfigDef::init_fff_params()
      def->enum_values   = def_top_fill_pattern->enum_values;
      def->enum_labels   = def_top_fill_pattern->enum_labels;
      def->set_default_value(new ConfigOptionEnum<InfillPattern>(ipMonotonic));
@@ -1201,7 +1192,7 @@ index 498678ad29..9224af6206 100644
      def = this->add("outer_wall_line_width", coFloatOrPercent);
      def->label = L("Outer wall");
      def->category = L("Quality");
-@@ -1891,7 +1891,7 @@ void PrintConfigDef::init_fff_params()
+@@ -2180,7 +2180,7 @@ void PrintConfigDef::init_fff_params()
      def->max = 2;
      def->mode = comAdvanced;
      def->set_default_value(new ConfigOptionFloats { 0.02 });
@@ -1210,7 +1201,7 @@ index 498678ad29..9224af6206 100644
      // Orca: Adaptive pressure advance option and calibration values
      def = this->add("adaptive_pressure_advance", coBools);
      def->label = L("Enable adaptive pressure advance (beta)");
-@@ -1932,7 +1932,7 @@ void PrintConfigDef::init_fff_params()
+@@ -2221,7 +2221,7 @@ void PrintConfigDef::init_fff_params()
      def->full_width = true;
      def->height = 15;
      def->set_default_value(new ConfigOptionStrings{"0,0,0\n0,0,0"});
@@ -1219,7 +1210,7 @@ index 498678ad29..9224af6206 100644
      // xgettext:no-c-format, no-boost-format
      def = this->add("adaptive_pressure_advance_overhangs", coBools);
      def->label = L("Enable adaptive pressure advance for overhangs (beta)");
-@@ -2068,20 +2068,20 @@ void PrintConfigDef::init_fff_params()
+@@ -2432,20 +2432,20 @@ void PrintConfigDef::init_fff_params()
  
      /*
          Large format printers with print volumes in the order of 1m^3 generally use pellets for printing.
@@ -1245,8 +1236,8 @@ index 498678ad29..9224af6206 100644
          does already with very minor adjustments.
  
          filament_diameter = sqrt( (4 * pellet_flow_coefficient) / PI )
-@@ -2110,7 +2110,7 @@ void PrintConfigDef::init_fff_params()
-     def->min = 10;
+@@ -2488,7 +2488,7 @@ void PrintConfigDef::init_fff_params()
+     def->max = 150;
      def->mode = comAdvanced;
      def->set_default_value(new ConfigOptionPercents{ 100 });
 -    
@@ -1254,7 +1245,7 @@ index 498678ad29..9224af6206 100644
      def = this->add("filament_shrinkage_compensation_z", coPercents);
      def->label = L("Shrinkage (Z)");
      // xgettext:no-c-format, no-boost-format
-@@ -2246,7 +2246,7 @@ void PrintConfigDef::init_fff_params()
+@@ -2672,7 +2672,7 @@ void PrintConfigDef::init_fff_params()
      def->min = 0;
      def->mode = comAdvanced;
      def->set_default_value(new ConfigOptionFloats { 10. });
@@ -1263,7 +1254,7 @@ index 498678ad29..9224af6206 100644
      def = this->add("filament_density", coFloats);
      def->label = L("Density");
      def->tooltip = L("Filament density. For statistics only.");
-@@ -2377,7 +2377,7 @@ void PrintConfigDef::init_fff_params()
+@@ -2787,7 +2787,7 @@ void PrintConfigDef::init_fff_params()
      def->min = 0;
      def->max = 100;
      def->set_default_value(new ConfigOptionPercent(20));
@@ -1272,7 +1263,7 @@ index 498678ad29..9224af6206 100644
      def           = this->add("align_infill_direction_to_model", coBool);
      def->label    = L("Align infill direction to model");
      def->category = L("Strength");
-@@ -2621,7 +2621,7 @@ void PrintConfigDef::init_fff_params()
+@@ -3033,7 +3033,7 @@ void PrintConfigDef::init_fff_params()
      def->tooltip = L("Klipper's max_accel_to_decel will be adjusted automatically.");
      def->mode = comAdvanced;
      def->set_default_value(new ConfigOptionBool(true));
@@ -1280,8 +1271,8 @@ index 498678ad29..9224af6206 100644
 +
      def = this->add("accel_to_decel_factor", coPercent);
      def->label = L("accel_to_decel");
-     def->tooltip = L("Klipper's max_accel_to_decel will be adjusted to this %% of acceleration.");
-@@ -2630,7 +2630,7 @@ void PrintConfigDef::init_fff_params()
+     def->category = L("Speed");
+@@ -3043,7 +3043,7 @@ void PrintConfigDef::init_fff_params()
      def->max = 100;
      def->mode = comAdvanced;
      def->set_default_value(new ConfigOptionPercent(50));
@@ -1289,8 +1280,8 @@ index 498678ad29..9224af6206 100644
 +
      def = this->add("default_jerk", coFloat);
      def->label = L("Default");
-     def->tooltip = L("Default jerk.");
-@@ -2780,7 +2780,7 @@ void PrintConfigDef::init_fff_params()
+     def->category = L("Speed");
+@@ -3202,7 +3202,7 @@ void PrintConfigDef::init_fff_params()
      def->max = 1000;
      def->mode = comAdvanced;
      def->set_default_value(new ConfigOptionInts { 0 });
@@ -1299,7 +1290,7 @@ index 498678ad29..9224af6206 100644
      def = this->add("support_material_interface_fan_speed", coInts);
      def->label = L("Support interface fan speed");
      def->tooltip = L("This part cooling fan speed is applied when printing support interfaces. Setting this parameter to a higher than regular speed "
-@@ -2792,7 +2792,7 @@ void PrintConfigDef::init_fff_params()
+@@ -3214,7 +3214,7 @@ void PrintConfigDef::init_fff_params()
      def->max = 100;
      def->mode = comAdvanced;
      def->set_default_value(new ConfigOptionInts{ -1 });
@@ -1308,7 +1299,7 @@ index 498678ad29..9224af6206 100644
      // ORCA: Add support for separate internal bridge fan speed control
      def = this->add("internal_bridge_fan_speed", coInts);
      def->label = L("Internal bridges fan speed");
-@@ -2804,7 +2804,7 @@ void PrintConfigDef::init_fff_params()
+@@ -3226,7 +3226,7 @@ void PrintConfigDef::init_fff_params()
      def->max = 100;
      def->mode = comAdvanced;
      def->set_default_value(new ConfigOptionInts{ -1 });
@@ -1317,8 +1308,8 @@ index 498678ad29..9224af6206 100644
      def = this->add("ironing_fan_speed", coInts);
      def->label = L("Ironing fan speed");
      def->tooltip = L("This part cooling fan speed is applied when ironing. Setting this parameter to a lower than regular speed "
-@@ -2942,7 +2942,7 @@ void PrintConfigDef::init_fff_params()
-     def->sidetext = "mm";	// milimeters, don't need translation
+@@ -3414,7 +3414,7 @@ void PrintConfigDef::init_fff_params()
+     def->sidetext = L("mm");	// milimeters, CIS languages need translation
      def->mode = comAdvanced;
      def->set_default_value(new ConfigOptionFloat(0));
 -    
@@ -1326,7 +1317,7 @@ index 498678ad29..9224af6206 100644
      def = this->add("gap_infill_speed", coFloat);
      def->label = L("Gap infill");
      def->category = L("Speed");
-@@ -3168,7 +3168,7 @@ void PrintConfigDef::init_fff_params()
+@@ -3657,7 +3657,7 @@ void PrintConfigDef::init_fff_params()
                     "slow down.");
      def->mode = comAdvanced;
      def->set_default_value(new ConfigOptionBool(0));
@@ -1335,7 +1326,7 @@ index 498678ad29..9224af6206 100644
      //BBS
      def = this->add("infill_combination", coBool);
      def->label = L("Infill combination");
-@@ -3335,7 +3335,7 @@ void PrintConfigDef::init_fff_params()
+@@ -3845,7 +3845,7 @@ void PrintConfigDef::init_fff_params()
      def->ratio_over = "inner_wall_line_width";
      def->mode = comAdvanced;
      def->set_default_value(new ConfigOptionPercent(15));
@@ -1344,16 +1335,16 @@ index 498678ad29..9224af6206 100644
      def = this->add("top_bottom_infill_wall_overlap", coPercent);
      def->label = L("Top/Bottom solid infill/wall overlap");
      def->category = L("Strength");
-@@ -3395,7 +3395,7 @@ void PrintConfigDef::init_fff_params()
+@@ -3905,7 +3905,7 @@ void PrintConfigDef::init_fff_params()
      def->tooltip  = L("Interlocking depth of a segmented region. It will be ignored if "
                      "\"mmu_segmented_region_max_width\" is zero or if \"mmu_segmented_region_interlocking_depth\" "
                      "is bigger than \"mmu_segmented_region_max_width\". Zero disables this feature.");
--    def->sidetext = "mm";	// milimeters, don't need translation 
-+    def->sidetext = "mm";	// milimeters, don't need translation
+-    def->sidetext = L("mm");	// milimeters, CIS languages need translation 
++    def->sidetext = L("mm");	// milimeters, CIS languages need translation
      def->min      = 0;
      def->category = L("Advanced");
      def->mode     = comAdvanced;
-@@ -3484,7 +3484,7 @@ void PrintConfigDef::init_fff_params()
+@@ -3994,7 +3994,7 @@ void PrintConfigDef::init_fff_params()
      def->enum_labels.push_back(L("Concentric"));
      def->mode = comAdvanced;
      def->set_default_value(new ConfigOptionEnum<InfillPattern>(ipRectilinear));
@@ -1362,16 +1353,7 @@ index 498678ad29..9224af6206 100644
      def = this->add("ironing_flow", coPercent);
      def->label = L("Ironing flow");
      def->category = L("Quality");
-@@ -3681,7 +3681,7 @@ void PrintConfigDef::init_fff_params()
-             def->set_default_value(new ConfigOptionFloats(axis.max_jerk));
-         }
-     }
--    // M205 J... [mm] machine junction deviation limits 
-+    // M205 J... [mm] machine junction deviation limits
-     def = this->add("machine_max_junction_deviation", coFloats);
-     def->full_label = L("Maximum Junction Deviation");
-     def->category = L("Machine limits");
-@@ -3793,11 +3793,11 @@ void PrintConfigDef::init_fff_params()
+@@ -4320,11 +4320,11 @@ void PrintConfigDef::init_fff_params()
  
      def = this->add("max_volumetric_extrusion_rate_slope", coFloat);
      def->label = L("Extrusion rate smoothing");
@@ -1385,8 +1367,8 @@ index 498678ad29..9224af6206 100644
                       "A value of 0 disables the feature.\n\n"
                       "For a high speed, high flow direct drive printer (like the Bambu lab or Voron) this value is usually not needed. "
                       "However it can provide some marginal benefit in certain cases where feature speeds vary greatly. For example, "
-@@ -3823,7 +3823,7 @@ void PrintConfigDef::init_fff_params()
-     def->sidetext = "mm";	// milimeters, don't need translation
+@@ -4350,7 +4350,7 @@ void PrintConfigDef::init_fff_params()
+     def->sidetext = L("mm");	// milimeters, CIS languages need translation
      def->mode = comAdvanced;
      def->set_default_value(new ConfigOptionFloat(3.0));
 -    
@@ -1394,16 +1376,7 @@ index 498678ad29..9224af6206 100644
      def = this->add("extrusion_rate_smoothing_external_perimeter_only", coBool);
      def->label = L("Apply only on external features");
      def->tooltip = L("Applies extrusion rate smoothing only on external perimeters and overhangs. This can help reduce artefacts due to sharp speed transitions on externally visible "
-@@ -3923,7 +3923,7 @@ void PrintConfigDef::init_fff_params()
-     def->mode = comAdvanced;
-     def->cli = ConfigOptionDef::nocli;
-     def->set_default_value(new ConfigOptionEnum<PrintHostType>(htOctoPrint));
--    
-+
- 
-     def = this->add("nozzle_volume", coFloat);
-     def->label = L("Nozzle volume");
-@@ -4079,7 +4079,7 @@ void PrintConfigDef::init_fff_params()
+@@ -4606,7 +4606,7 @@ void PrintConfigDef::init_fff_params()
      def->min = 0;
      def->max = 1000;
      def->set_default_value(new ConfigOptionInt(2));
@@ -1412,7 +1385,7 @@ index 498678ad29..9224af6206 100644
      def = this->add("alternate_extra_wall", coBool);
      def->label = L("Alternate extra wall");
      def->category = L("Strength");
-@@ -4088,7 +4088,7 @@ void PrintConfigDef::init_fff_params()
+@@ -4615,7 +4615,7 @@ void PrintConfigDef::init_fff_params()
                       "Using lightning infill together with this option is not recommended as there is limited infill to anchor the extra perimeters to.");
      def->mode = comAdvanced;
      def->set_default_value(new ConfigOptionBool(false));
@@ -1421,7 +1394,7 @@ index 498678ad29..9224af6206 100644
      def = this->add("post_process", coStrings);
      def->label = L("Post-processing Scripts");
      def->tooltip = L("If you want to process the output G-code through custom scripts, "
-@@ -4101,7 +4101,7 @@ void PrintConfigDef::init_fff_params()
+@@ -4628,7 +4628,7 @@ void PrintConfigDef::init_fff_params()
      def->height = 6;
      def->mode = comAdvanced;
      def->set_default_value(new ConfigOptionStrings());
@@ -1430,7 +1403,7 @@ index 498678ad29..9224af6206 100644
      def = this->add("printer_model", coString);
      def->label = L("Printer type");
      def->tooltip = L("Type of the printer.");
-@@ -4116,7 +4116,7 @@ void PrintConfigDef::init_fff_params()
+@@ -4643,7 +4643,7 @@ void PrintConfigDef::init_fff_params()
      def->height = 13;
      def->mode = comAdvanced;
      def->set_default_value(new ConfigOptionString());
@@ -1439,7 +1412,7 @@ index 498678ad29..9224af6206 100644
      def = this->add("printer_variant", coString);
      def->label = L("Printer variant");
      //def->tooltip = L("Name of the printer variant. For example, the printer variants may be differentiated by a nozzle diameter.");
-@@ -4404,7 +4404,7 @@ void PrintConfigDef::init_fff_params()
+@@ -5051,7 +5051,7 @@ void PrintConfigDef::init_fff_params()
      def->tooltip = L("This option causes the inner seams to be shifted backwards based on their depth, forming a zigzag pattern.");
      def->mode = comAdvanced;
      def->set_default_value(new ConfigOptionBool(false));
@@ -1447,8 +1420,8 @@ index 498678ad29..9224af6206 100644
 +
      def = this->add("seam_gap", coFloatOrPercent);
      def->label = L("Seam gap");
-     def->tooltip = L("In order to reduce the visibility of the seam in a closed loop extrusion, the loop is interrupted and shortened by a specified amount.\n"
-@@ -4520,7 +4520,7 @@ void PrintConfigDef::init_fff_params()
+     def->category = L("Quality");
+@@ -5178,7 +5178,7 @@ void PrintConfigDef::init_fff_params()
                       "e.g. if a wipe action is executed immediately following an outer wall extrusion, the speed of the outer wall extrusion will be utilized for the wipe action.");
      def->mode = comAdvanced;
      def->set_default_value(new ConfigOptionBool(true));
@@ -1456,8 +1429,8 @@ index 498678ad29..9224af6206 100644
 +
      def = this->add("wipe_on_loops", coBool);
      def->label = L("Wipe on loops");
-     def->tooltip = L("To minimize the visibility of the seam in a closed loop extrusion, a small inward movement is executed before the extruder leaves the loop.");
-@@ -4573,7 +4573,7 @@ void PrintConfigDef::init_fff_params()
+     def->category = L("Quality");
+@@ -5235,7 +5235,7 @@ void PrintConfigDef::init_fff_params()
      def->mode = comSimple;
      def->max = 10000;
      def->set_default_value(new ConfigOptionInt(1));
@@ -1466,7 +1439,7 @@ index 498678ad29..9224af6206 100644
      def = this->add("single_loop_draft_shield", coBool);
      def->label = L("Single loop after first layer");
      def->tooltip = L("Limits the skirt/draft shield loops to one wall after the first layer. This is useful, on occasion, to conserve filament but may cause the draft shield/skirt to warp / crack.");
-@@ -4606,7 +4606,7 @@ void PrintConfigDef::init_fff_params()
+@@ -5268,7 +5268,7 @@ void PrintConfigDef::init_fff_params()
      def->enum_labels.push_back(L("Per object"));
      def->mode = comAdvanced;
      def->set_default_value(new ConfigOptionEnum<SkirtType>(stCombined));
@@ -1475,8 +1448,8 @@ index 498678ad29..9224af6206 100644
      def = this->add("skirt_loops", coInt);
      def->label = L("Skirt loops");
      def->full_label = L("Skirt loops");
-@@ -4876,7 +4876,7 @@ void PrintConfigDef::init_fff_params()
-     def->sidetext = "mm";	// milimeters, don't need translation
+@@ -5561,7 +5561,7 @@ void PrintConfigDef::init_fff_params()
+     def->sidetext = L("mm");	// milimeters, CIS languages need translation
      def->mode = comAdvanced;
      def->set_default_value(new ConfigOptionFloat(0));
 -    
@@ -1484,10 +1457,10 @@ index 498678ad29..9224af6206 100644
      def = this->add("enable_support", coBool);
      //BBS: remove material behind support
      def->label = L("Enable support");
-@@ -5301,13 +5301,13 @@ void PrintConfigDef::init_fff_params()
-     def->category = L("Quality");
-     def->tooltip = L("Enabling this option means the height of tree support layer except the first will be automatically calculated.");
-     def->set_default_value(new ConfigOptionBool(1));
+@@ -5985,13 +5985,13 @@ void PrintConfigDef::init_fff_params()
+     def->max_literal = 35;
+     def->mode = comAdvanced;
+     def->set_default_value(new ConfigOptionPercent(30));
 -    
 +
      def = this->add("tree_support_auto_brim", coBool);
@@ -1500,7 +1473,7 @@ index 498678ad29..9224af6206 100644
      def = this->add("tree_support_brim_width", coFloat);
      def->label = L("Tree support brim width");
      def->category = L("Quality");
-@@ -5337,7 +5337,7 @@ void PrintConfigDef::init_fff_params()
+@@ -6021,7 +6021,7 @@ void PrintConfigDef::init_fff_params()
      def->set_default_value(new ConfigOptionFloat(5.));
  
      def = this->add("tree_support_branch_diameter_angle", coFloat);
@@ -1509,7 +1482,7 @@ index 498678ad29..9224af6206 100644
      def->label = L("Branch Diameter Angle");
      def->category = L("Support");
      // TRN PrintSettings: "Organic supports" > "Branch Diameter Angle"
-@@ -5375,7 +5375,7 @@ void PrintConfigDef::init_fff_params()
+@@ -6059,7 +6059,7 @@ void PrintConfigDef::init_fff_params()
      def->tooltip = L("This setting specifies whether to add infill inside large hollows of tree support.");
      def->mode = comAdvanced;
      def->set_default_value(new ConfigOptionBool(false));
@@ -1518,7 +1491,7 @@ index 498678ad29..9224af6206 100644
      def = this->add("support_ironing", coBool);
      def->label = L("Ironing Support Interface");
      def->category = L("Support");
-@@ -5395,7 +5395,7 @@ void PrintConfigDef::init_fff_params()
+@@ -6079,7 +6079,7 @@ void PrintConfigDef::init_fff_params()
      def->enum_labels.push_back(L("Concentric"));
      def->mode = comAdvanced;
      def->set_default_value(new ConfigOptionEnum<InfillPattern>(ipRectilinear));
@@ -1527,7 +1500,7 @@ index 498678ad29..9224af6206 100644
      def = this->add("support_ironing_flow", coPercent);
      def->label = L("Support Ironing flow");
      def->category = L("Support");
-@@ -5697,7 +5697,7 @@ void PrintConfigDef::init_fff_params()
+@@ -6390,7 +6390,7 @@ void PrintConfigDef::init_fff_params()
      def->min = 0.;
      def->max = 90.;
      def->set_default_value(new ConfigOptionFloat(30.0));
@@ -1536,7 +1509,7 @@ index 498678ad29..9224af6206 100644
      def = this->add("wipe_tower_max_purge_speed", coFloat);
      def->label = L("Maximum wipe tower print speed");
      def->tooltip = L("The maximum print speed when purging in the wipe tower and printing the wipe tower sparse layers. "
-@@ -6910,7 +6910,7 @@ void PrintConfigDef::handle_legacy(t_config_option_key &opt_key, std::string &va
+@@ -7690,7 +7690,7 @@ void PrintConfigDef::handle_legacy(t_config_option_key &opt_key, std::string &va
      static std::set<std::string> ignore = {
          "acceleration", "scale", "rotate", "duplicate", "duplicate_grid",
          "bed_size",
@@ -1545,7 +1518,7 @@ index 498678ad29..9224af6206 100644
          "support_sharp_tails","support_remove_small_overhangs", "support_with_sheath",
          "tree_support_collision_resolution", "tree_support_with_infill",
          "max_volumetric_speed", "max_print_speed",
-@@ -7419,7 +7419,7 @@ std::map<std::string, std::string> validate(const FullPrintConfig &cfg, bool und
+@@ -9663,7 +9663,7 @@ std::map<std::string, std::string> validate(const FullPrintConfig &cfg, bool und
          for (unsigned char wipe : cfg.wipe.values)
               if (wipe)
                  error_message.emplace("use_firmware_retraction", "--use-firmware-retraction is not compatible with --wipe");
@@ -1554,7 +1527,7 @@ index 498678ad29..9224af6206 100644
      // --gcode-flavor
      if (! print_config_def.get("gcode_flavor")->has_enum_value(cfg.gcode_flavor.serialize())) {
          error_message.emplace("gcode_flavor", L("invalid value ") + cfg.gcode_flavor.serialize());
-@@ -7454,7 +7454,7 @@ std::map<std::string, std::string> validate(const FullPrintConfig &cfg, bool und
+@@ -9698,7 +9698,7 @@ std::map<std::string, std::string> validate(const FullPrintConfig &cfg, bool und
      if (cfg.bridge_flow <= 0) {
          error_message.emplace("bridge_flow", L("invalid value ") + std::to_string(cfg.bridge_flow));
      }
@@ -1563,7 +1536,7 @@ index 498678ad29..9224af6206 100644
      // --bridge-flow-ratio
      if (cfg.bridge_flow <= 0) {
          error_message.emplace("internal_bridge_flow", L("invalid value ") + std::to_string(cfg.internal_bridge_flow));
-@@ -8394,7 +8394,7 @@ static std::map<t_custom_gcode_key, t_config_option_keys> s_CustomGcodeSpecificP
+@@ -10647,7 +10647,7 @@ static std::map<t_custom_gcode_key, t_config_option_keys> s_CustomGcodeSpecificP
      {"machine_pause_gcode",         {}},
      {"template_custom_gcode",       {}},
      // Filament G-code
@@ -1572,7 +1545,7 @@ index 498678ad29..9224af6206 100644
      {"filament_end_gcode",          {"layer_num", "layer_z", "max_layer_z", "filament_extruder_id"}},
  };
  
-@@ -8424,6 +8424,14 @@ CustomGcodeSpecificConfigDef::CustomGcodeSpecificConfigDef()
+@@ -10677,6 +10677,14 @@ CustomGcodeSpecificConfigDef::CustomGcodeSpecificConfigDef()
      def->label = L("Filament extruder ID");
      def->tooltip = L("The current extruder ID. The same as current_extruder.");
  
@@ -1588,7 +1561,7 @@ index 498678ad29..9224af6206 100644
      new_def("previous_extruder", coInt, "Previous extruder", "Index of the extruder that is being unloaded. The index is zero based (first extruder has index 0).");
      new_def("next_extruder", coInt, "Next extruder", "Index of the extruder that is being loaded. The index is zero based (first extruder has index 0).");
 diff --git a/src/libslic3r/SLA/Hollowing.cpp b/src/libslic3r/SLA/Hollowing.cpp
-index df62127770..ed3a1a2d4a 100644
+index df621277..ed3a1a2d 100644
 --- a/src/libslic3r/SLA/Hollowing.cpp
 +++ b/src/libslic3r/SLA/Hollowing.cpp
 @@ -19,6 +19,53 @@
@@ -1652,7 +1625,7 @@ index df62127770..ed3a1a2d4a 100644
 +
 +#endif // defined(__EMSCRIPTEN__) && defined(ORCA_DISABLE_OPENVDB)
 diff --git a/src/libslic3r/Shape/TextShape.cpp b/src/libslic3r/Shape/TextShape.cpp
-index dce731af19..95047f4e0b 100644
+index dce731af..95047f4e 100644
 --- a/src/libslic3r/Shape/TextShape.cpp
 +++ b/src/libslic3r/Shape/TextShape.cpp
 @@ -6,7 +6,9 @@
@@ -1707,10 +1680,10 @@ index dce731af19..95047f4e0b 100644
 +
 +#endif // SLIC3R_NO_OCCT
 diff --git a/src/libslic3r/Support/SupportMaterial.cpp b/src/libslic3r/Support/SupportMaterial.cpp
-index 7580976ac9..7866e2a97a 100644
+index d1fa5d86..1128ad1d 100644
 --- a/src/libslic3r/Support/SupportMaterial.cpp
 +++ b/src/libslic3r/Support/SupportMaterial.cpp
-@@ -1587,7 +1587,7 @@ static inline std::tuple<Polygons, Polygons, double> detect_contacts(
+@@ -1586,7 +1586,7 @@ static inline std::tuple<Polygons, Polygons, double> detect_contacts(
  
          // Cache support trimming polygons derived from lower layer polygons, possible merged with "on build plate only" trimming polygons.
          auto slices_margin_update =
@@ -1720,7 +1693,7 @@ index 7580976ac9..7866e2a97a 100644
              if (slices_margin.offset != slices_margin_offset) {
                  slices_margin.offset = slices_margin_offset;
 diff --git a/src/libslic3r/Thread.cpp b/src/libslic3r/Thread.cpp
-index 3030b6d194..52d25a4d8b 100644
+index 3030b6d1..52d25a4d 100644
 --- a/src/libslic3r/Thread.cpp
 +++ b/src/libslic3r/Thread.cpp
 @@ -34,7 +34,7 @@ static bool WindowsGetSetThreadNameAPIInitialize()
@@ -1788,7 +1761,7 @@ index 3030b6d194..52d25a4d8b 100644
  #endif
  
 diff --git a/src/libslic3r/utils.cpp b/src/libslic3r/utils.cpp
-index a493f6ebd1..8c1b128594 100644
+index 25aad9a0..fd8daed8 100644
 --- a/src/libslic3r/utils.cpp
 +++ b/src/libslic3r/utils.cpp
 @@ -7,6 +7,7 @@
@@ -1931,7 +1904,7 @@ index a493f6ebd1..8c1b128594 100644
  }
  
  void disable_multi_threading()
-@@ -322,6 +403,7 @@ std::string debug_out_path(const char *name, ...)
+@@ -327,6 +408,7 @@ std::string debug_out_path(const char *name, ...)
  	return svg_folder.string() + std::string(buffer);
  }
  
@@ -1939,7 +1912,7 @@ index a493f6ebd1..8c1b128594 100644
  namespace logging = boost::log;
  namespace src = boost::log::sources;
  namespace expr = boost::log::expressions;
-@@ -371,6 +453,18 @@ void flush_logs()
+@@ -377,6 +459,18 @@ void flush_logs()
  
  	return;
  }

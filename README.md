@@ -4,7 +4,7 @@
 
 ## What is This?
 
-This project compiles the core slicing engine of [OrcaSlicer](https://github.com/SoftFever/OrcaSlicer) (based on v2.3.1) to WebAssembly, enabling it to run entirely in modern web browsers. Users can:
+This project compiles the core slicing engine of [OrcaSlicer](https://github.com/SoftFever/OrcaSlicer) (based on v2.3.2) to WebAssembly, enabling it to run entirely in modern web browsers. Users can:
 
 - 📦 **Upload 3D models** (STL files) directly in the browser
 - ⚙️ **Configure print settings** through a web-based UI
@@ -70,7 +70,7 @@ Work is underway or planned to restore these capabilities:
 
 ## Technical Architecture
 
-- **Core Engine**: OrcaSlicer v2.3.1 C++ codebase compiled with Emscripten
+- **Core Engine**: OrcaSlicer v2.3.2 C++ codebase compiled with Emscripten
 - **Build System**: Custom PowerShell/Bash build pipeline with dependency management
 - **Web UI**: React + TypeScript with Vite
 - **Communication**: Web Workers for non-blocking WASM execution
@@ -177,12 +177,12 @@ If you prefer to control each step manually (or are bringing your own toolchains
 ### Submodule initialization
 
 The Orca slicer sources live in the `orca/` submodule and are pinned to the
-latest upstream stable tag (currently `v2.3.1`).
+latest upstream stable tag (currently `v2.3.2`).
 
 - Refresh the submodule and check out the expected tag:
    ```bash
    git submodule update --init --depth 1 --progress -- orca
-   (cd orca && git fetch --tags && git checkout v2.3.1)
+   (cd orca && git fetch --tags && git checkout v2.3.2)
    ```
 - If the submodule becomes corrupted, reset it:
    ```bash
@@ -190,7 +190,7 @@ latest upstream stable tag (currently `v2.3.1`).
    rm -rf .git/modules/orca orca
    git submodule add -f https://github.com/SoftFever/OrcaSlicer.git orca
    git submodule update --init --depth 1 --progress -- orca
-   (cd orca && git fetch --tags && git checkout v2.3.1)
+   (cd orca && git fetch --tags && git checkout v2.3.2)
    ```
 
 ### Toolchain provisioning
