@@ -77,6 +77,29 @@ static inline void XML_SetCharacterDataHandler(XML_Parser parser, XML_CharacterD
     if (parser != NULL) parser->character_handler = handler;
 }
 
+/* Orca v2.3.2's bbs_3mf.cpp installs XML_SetEntityDeclHandler(nullptr) and
+ * XML_SetExternalEntityRefHandler(nullptr) defensively to disable entity
+ * expansion (XXE hardening). The shim parses no input, so these can be
+ * no-op stubs. Signatures match upstream expat so the calls compile. */
+typedef void (*XML_EntityDeclHandler)(void* userData,
+                                      const XML_Char* entityName,
+                                      int is_parameter_entity,
+                                      const XML_Char* value,
+                                      int value_length,
+                                      const XML_Char* base,
+                                      const XML_Char* systemId,
+                                      const XML_Char* publicId,
+                                      const XML_Char* notationName);
+
+typedef int (*XML_ExternalEntityRefHandler)(XML_Parser parser,
+                                            const XML_Char* context,
+                                            const XML_Char* base,
+                                            const XML_Char* systemId,
+                                            const XML_Char* publicId);
+
+static inline void XML_SetEntityDeclHandler(XML_Parser /*parser*/, XML_EntityDeclHandler /*handler*/) {}
+static inline void XML_SetExternalEntityRefHandler(XML_Parser /*parser*/, XML_ExternalEntityRefHandler /*handler*/) {}
+
 static inline void* XML_GetBuffer(XML_Parser /*parser*/, int size)
 {
     if (size <= 0) return NULL;
