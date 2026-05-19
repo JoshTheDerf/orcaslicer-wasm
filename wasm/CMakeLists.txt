@@ -89,6 +89,14 @@ add_compile_definitions(
   EIGEN_HAS_STD_RESULT_OF=0
   _LIBCPP_ENABLE_CXX17_REMOVED_FEATURES=1
   _LIBCPP_DISABLE_DEPRECATION_WARNINGS=1
+  # orca v2.3.2's strict placeholder validation (#if ORCA_CHECK_GCODE_PLACEHOLDERS)
+  # fires on layer_change_gcode/timelapse_gcode/wrapping_detection_gcode because
+  # the s_CustomGcodeSpecificPlaceholders map is incomplete upstream. The macro
+  # is supposed to default to 0 via the generated libslic3r_version.h, but
+  # GCode.hpp's `#if !defined(NDEBUG)` define + transitive include order in
+  # some TUs leaves it active anyway. Pin to 0 explicitly so the slice path
+  # doesn't blow up at gcode-export time with placeholder mismatch errors.
+  ORCA_CHECK_GCODE_PLACEHOLDERS=0
 )
 
 # --- Disable TBB usage (shim will satisfy REQUIRED without linking) ---
@@ -280,12 +288,13 @@ set(EM_FLAGS
 # First, clear any previous LINK_FLAGS we set earlier:
 
 # --- Emscripten link options ---
-# Link-time -O2 (not -O3): -O3 + --fpcast-emu (needed for our function-pointer
-# casts) triggers a wasm-opt assertion in binaryen's directize pass on the
-# orca binary. -O2 dodges that pass without affecting runtime correctness;
-# size delta is negligible because libslic3r object files are already -O3.
+# Link-time -O0 (not -O3): higher levels run wasm-opt with --fpcast-emu +
+# directize-initial-contents-immutable, which triggers a binaryen assertion
+# on the full orca binary. -O0 skips those passes entirely. Object files
+# are still compiled with -O3 so runtime perf is unaffected — we only lose
+# late-stage wasm-level dead-code elim and import-merging.
 target_link_options(slicer PRIVATE
-  -O2
+  -O0
   -sALLOW_MEMORY_GROWTH=1
   -sMALLOC=emmalloc
   -sSTACK_SIZE=16777216
@@ -296,13 +305,13 @@ target_link_options(slicer PRIVATE
   -sMODULARIZE=1
   -sEXPORT_NAME=OrcaModule
   -sDISABLE_EXCEPTION_CATCHING=0
-  # EMULATE_FUNCTION_POINTER_CASTS triggers wasm-opt's --fpcast-emu pass
-  # which hits a binaryen assertion on the orca binary (interacts badly with
-  # the directize-initial-contents-immutable pass). Disabled until either
-  # emsdk ships a fixed binaryen or we identify the indirect call that
-  # genuinely needs it. The slice path doesn't appear to rely on cross-
-  # signature function pointer casts.
-  # -sEMULATE_FUNCTION_POINTER_CASTS=1
+  # Needed: libslic3r's G-code export path stores typed function pointers
+  # via boost::signals2 and then invokes them through differently-shaped
+  # call sites. Without --fpcast-emu they raise a wasm signature trap and
+  # the C++ exception escapes to JS as a WebAssembly.Exception that we
+  # can't decode. We pair this with link-time -O0 above to dodge the
+  # wasm-opt directize crash.
+  -sEMULATE_FUNCTION_POINTER_CASTS=1
   -fexceptions
   # Resource preload: orca's full resources/ tree is ~230 MB on disk
   # (profiles 70M, hms 63M, images 35M, fonts 35M, web 19M, …) — almost all

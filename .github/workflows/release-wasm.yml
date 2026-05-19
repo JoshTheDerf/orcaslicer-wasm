@@ -184,6 +184,15 @@ jobs:
         run: ccache --show-stats
 
       # ------------------------------------------------------------------
+      # Smoke test: instantiate the wasm module, slice a fixture STL, and
+      # validate the produced G-code against a structural fingerprint.
+      # ------------------------------------------------------------------
+      - name: Run baseline slice test
+        run: |
+          node tests/slice-test.cjs
+          node tests/verify-gcode.cjs
+
+      # ------------------------------------------------------------------
       # Stage artifacts + split profiles out of the bundle.
       # ------------------------------------------------------------------
       - name: Package release artifacts

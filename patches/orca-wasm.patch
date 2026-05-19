@@ -905,7 +905,7 @@ index fe10cbcd..85f3525a 100644
  
  std::string GCode::placeholder_parser_process(const std::string &name, const std::string &templ, unsigned int current_filament_id, const DynamicConfig *config_override)
 diff --git a/src/libslic3r/GCode.hpp b/src/libslic3r/GCode.hpp
-index d379300b..84a686de 100644
+index d379300b..4346fecd 100644
 --- a/src/libslic3r/GCode.hpp
 +++ b/src/libslic3r/GCode.hpp
 @@ -176,7 +176,7 @@ struct LayerResult {
@@ -917,6 +917,25 @@ index d379300b..84a686de 100644
  };
  
  class GCode {
+@@ -574,10 +574,16 @@ private:
+     float                               m_last_width{ 0.0f };
+ 
+     // Always check gcode placeholders when building in debug mode.
+-#if !defined(NDEBUG)
++    // WASM headless override: upstream's strict validation throws
++    // PlaceholderParserError on incomplete s_CustomGcodeSpecificPlaceholders
++    // entries (layer_change_gcode / timelapse_gcode / wrapping_detection_gcode)
++    // which we hit during gcode export. Force the check off so the slice
++    // path doesn't blow up. Toolchains can still opt back in by defining
++    // ORCA_CHECK_GCODE_PLACEHOLDERS=1 at compile time.
++#if !defined(NDEBUG) && !defined(ORCA_CHECK_GCODE_PLACEHOLDERS)
+ #define ORCA_CHECK_GCODE_PLACEHOLDERS 1
+ #endif
+-    
++
+ #if ORCA_CHECK_GCODE_PLACEHOLDERS
+     std::map<std::string, std::vector<std::string>> m_placeholder_error_messages;
+ #endif
 diff --git a/src/libslic3r/Geometry/VoronoiUtilsCgal.cpp b/src/libslic3r/Geometry/VoronoiUtilsCgal.cpp
 index 28a64885..ad08dbfc 100644
 --- a/src/libslic3r/Geometry/VoronoiUtilsCgal.cpp
