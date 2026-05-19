@@ -98,6 +98,8 @@ set(SLIC3R_USE_TBB OFF CACHE BOOL "" FORCE)
 # OCCT-based functionality is not available in the WASM toolchain
 set(SLIC3R_WITH_OCCT OFF CACHE BOOL "Disable OCCT for WASM" FORCE)
 set(SLIC3R_WITH_OPENCV OFF CACHE BOOL "Disable OpenCV for WASM" FORCE)
+# Draco isn't built for wasm32; load_drc() falls back to a no-op stub.
+set(SLIC3R_WITH_DRACO OFF CACHE BOOL "Disable Draco for WASM" FORCE)
 
 # --- Tell Orca to avoid GUI and NLS (no Boost.Locale required) ---
 set(SLIC3R_GUI OFF CACHE BOOL "Disable GUI for WASM" FORCE)
