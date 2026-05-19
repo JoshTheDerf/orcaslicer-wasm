@@ -58,20 +58,56 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p dist
+          # Core engine — small (~7 MB wasm + ~200 KB JS + tiny data blob).
           cp web/public/wasm/slicer.js web/public/wasm/slicer.wasm dist/
+          if [ -f web/public/wasm/slicer.data ]; then
+            cp web/public/wasm/slicer.data dist/
+          fi
+          # Profile library — split out of the .data blob so hosts can fetch
+          # only the vendor JSON(s) they need at slice time, instead of
+          # preloading the full ~70 MB tree into MEMFS.
+          mkdir -p dist/profiles
+          if [ -d orca/resources/profiles ]; then
+            cp -R orca/resources/profiles/. dist/profiles/
+          fi
+          # Convenience bundle for users who still want a single archive.
           cd dist
-          zip "slicer-wasm-${GITHUB_REF_NAME}.zip" slicer.js slicer.wasm
+          zip -r "slicer-wasm-${GITHUB_REF_NAME}.zip" slicer.js slicer.wasm $( [ -f slicer.data ] && echo slicer.data )
 
       - name: Upload build artifacts (workflow run)
         uses: actions/upload-artifact@v4
         with:
           name: slicer-wasm-${{ github.ref_name }}
-          path: dist/slicer-wasm-${{ github.ref_name }}.zip
+          path: |
+            dist/slicer-wasm-${{ github.ref_name }}.zip
+            dist/slicer.js
+            dist/slicer.wasm
+            dist/slicer.data
+            dist/profiles/**
+
+      - name: Tar profile library
+        run: |
+          set -euo pipefail
+          cd dist
+          if [ -d profiles ] && [ -n "$(ls -A profiles 2>/dev/null)" ]; then
+            tar -C profiles -czf profiles.tar.gz .
+          else
+            echo "No profiles directory — skipping tarball"
+          fi
 
       - name: Publish GitHub Release
         uses: softprops/action-gh-release@v2
         with:
-          files: dist/slicer-wasm-${{ github.ref_name }}.zip
+          # Ship engine and profile bundle as separate assets so hosts can
+          # cache them independently and skip downloading profiles they
+          # don't need.
+          files: |
+            dist/slicer-wasm-${{ github.ref_name }}.zip
+            dist/slicer.js
+            dist/slicer.wasm
+            dist/slicer.data
+            dist/profiles.tar.gz
           generate_release_notes: true
+          fail_on_unmatched_files: false
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

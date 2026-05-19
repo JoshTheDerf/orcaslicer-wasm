@@ -292,7 +292,20 @@ target_link_options(slicer PRIVATE
   -sDISABLE_EXCEPTION_CATCHING=0
   -sEMULATE_FUNCTION_POINTER_CASTS=1
   -fexceptions
-  --preload-file=../orca/resources@/resources
+  # Resource preload: orca's full resources/ tree is ~230 MB on disk
+  # (profiles 70M, hms 63M, images 35M, fonts 35M, web 19M, …) — almost all
+  # of it is UI / BBL telemetry / preset previews that headless slicing
+  # never touches. Audit of src/libslic3r shows only these subdirs are
+  # actually read from at slice time:
+  #   info/   — nozzle_info.json, nozzle_incompatibles.json (~16 KB)
+  #   flush/  — multi-material flush volume tables (~24 KB)
+  #
+  # Profiles are split out and served separately by the host. The host
+  # writes the specific vendor JSON(s) it needs into MEMFS at
+  # /resources/profiles/ before slicing, so we don't pack them either —
+  # see cad-project/scripts/fetch-orca-wasm.sh and OrcaBackend's loader.
+  --preload-file=../orca/resources/info@/resources/info
+  --preload-file=../orca/resources/flush@/resources/flush
   "-sEXPORTED_FUNCTIONS=['_orc_init','_orc_slice','_malloc','_free','_orc_free','_orc_decode_exception']"
   "-sEXPORTED_RUNTIME_METHODS=['ccall','cwrap','getValue','setValue','UTF8ToString','stringToUTF8','lengthBytesUTF8','HEAP8','HEAPU8','HEAP32','HEAPU32']"
 )
