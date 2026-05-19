@@ -189,7 +189,11 @@ build_mpfr() {
 }
 
 build_cgal() {
-  local version="5.4"
+  # Match the CGAL version that upstream OrcaSlicer pins in
+  # orca/deps/CGAL/CGAL.cmake (v5.6.3). Bumping past 5.6.x breaks
+  # orca's libslic3r_cgal code (CGAL 6.0 removed `iter.base()` on
+  # Halfedge_around_*_iterator; CGAL 5.5 lacked `parameters::default_values`).
+  local version="5.6.3"
   local tarball="CGAL-${version}.tar.xz"
   local src="${SRC_DIR}/CGAL-${version}"
   fetch "${tarball}" \
