@@ -280,8 +280,12 @@ set(EM_FLAGS
 # First, clear any previous LINK_FLAGS we set earlier:
 
 # --- Emscripten link options ---
+# Link-time -O2 (not -O3): -O3 + --fpcast-emu (needed for our function-pointer
+# casts) triggers a wasm-opt assertion in binaryen's directize pass on the
+# orca binary. -O2 dodges that pass without affecting runtime correctness;
+# size delta is negligible because libslic3r object files are already -O3.
 target_link_options(slicer PRIVATE
-  -O3
+  -O2
   -sALLOW_MEMORY_GROWTH=1
   -sMALLOC=emmalloc
   -sSTACK_SIZE=16777216
@@ -292,7 +296,13 @@ target_link_options(slicer PRIVATE
   -sMODULARIZE=1
   -sEXPORT_NAME=OrcaModule
   -sDISABLE_EXCEPTION_CATCHING=0
-  -sEMULATE_FUNCTION_POINTER_CASTS=1
+  # EMULATE_FUNCTION_POINTER_CASTS triggers wasm-opt's --fpcast-emu pass
+  # which hits a binaryen assertion on the orca binary (interacts badly with
+  # the directize-initial-contents-immutable pass). Disabled until either
+  # emsdk ships a fixed binaryen or we identify the indirect call that
+  # genuinely needs it. The slice path doesn't appear to rely on cross-
+  # signature function pointer casts.
+  # -sEMULATE_FUNCTION_POINTER_CASTS=1
   -fexceptions
   # Resource preload: orca's full resources/ tree is ~230 MB on disk
   # (profiles 70M, hms 63M, images 35M, fonts 35M, web 19M, …) — almost all
