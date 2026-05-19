@@ -2,112 +2,268 @@ name: release-wasm
 
 on:
   push:
-    tags:
-      - 'v*.*.*'
+    branches: [main]
+    tags: ['v*.*.*']
   workflow_dispatch: {}
 
+# Tag pushes (v*.*.*) need write access to publish releases. PRs and
+# main-branch pushes only need read access (workflow_dispatch may also
+# need write if the user re-triggers a release).
 permissions:
   contents: write
 
+env:
+  # Pinned to match the preflight-wasm CI so both slicers stay on the
+  # same Emscripten ABI. Bump deliberately.
+  EMSDK_VERSION: '5.0.7'
+  BOOST_VERSION: '1.83.0'
+
 jobs:
   build-release:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120  # orca is larger than preflight; cold build is ~45 min
 
     steps:
-      - name: Install Intel TBB
-        run: sudo apt-get update && sudo apt-get install -y libtbb-dev
       - name: Checkout (with submodules)
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
           submodules: recursive
 
-      - name: Set up emscripten
-        uses: mymindstorm/setup-emsdk@v14
-        with:
-          version: latest
-          actions-cache-folder: emsdk-cache
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends \
+            build-essential cmake ninja-build ccache \
+            python3 python3-pip \
+            autoconf libtool texinfo m4 \
+            libtbb-dev \
+            curl wget ca-certificates zip
+          cmake --version
+          ccache --version
 
-      - name: Cache Boost (wasm)
+      - name: Use Node 22
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      # ------------------------------------------------------------------
+      # emsdk — pinned + cached.
+      # ------------------------------------------------------------------
+      - name: Cache emsdk
+        id: cache-emsdk
+        uses: actions/cache@v4
+        with:
+          path: deps/emsdk
+          key: emsdk-${{ runner.os }}-${{ env.EMSDK_VERSION }}
+
+      - name: Install emsdk
+        if: steps.cache-emsdk.outputs.cache-hit != 'true'
+        run: |
+          mkdir -p deps
+          if [ ! -d deps/emsdk ]; then
+            git clone --depth 1 https://github.com/emscripten-core/emsdk.git deps/emsdk
+          fi
+          cd deps/emsdk
+          ./emsdk install "${{ env.EMSDK_VERSION }}"
+          ./emsdk activate "${{ env.EMSDK_VERSION }}"
+
+      - name: Activate emsdk env for subsequent steps
+        run: |
+          # shellcheck disable=SC1091
+          source deps/emsdk/emsdk_env.sh
+          {
+            echo "EMSDK=$EMSDK"
+            echo "EM_CONFIG=$EM_CONFIG"
+            echo "EM_CACHE=$EM_CACHE"
+            echo "EMSDK_NODE=$EMSDK_NODE"
+          } >> "$GITHUB_ENV"
+          {
+            echo "$EMSDK"
+            echo "$EMSDK/upstream/emscripten"
+            echo "$EMSDK/upstream/bin"
+          } >> "$GITHUB_PATH"
+          emcc -v 2>&1 | head -3
+
+      # ------------------------------------------------------------------
+      # Boost 1.83 cross-built for wasm32. Cold build ~20 min.
+      # ------------------------------------------------------------------
+      - name: Cache Boost install
         id: cache-boost
         uses: actions/cache@v4
         with:
           path: deps/boost-wasm/install
-          key: boost-wasm-${{ runner.os }}-${{ hashFiles('deps/boost-wasm/build_boost.sh') }}
+          key: boost-${{ runner.os }}-${{ env.EMSDK_VERSION }}-${{ env.BOOST_VERSION }}-${{ hashFiles('deps/boost-wasm/build_boost.sh') }}
 
-      - name: Build Boost (if cache miss)
+      - name: Build Boost for WASM
         if: steps.cache-boost.outputs.cache-hit != 'true'
-        run: bash deps/boost-wasm/build_boost.sh
+        run: NPROC=4 bash deps/boost-wasm/build_boost.sh
 
+      # ------------------------------------------------------------------
+      # GMP + MPFR + CGAL. Cold build ~10 min. Depends on Boost being
+      # already built (build_math.sh reads BOOST_PREFIX).
+      # ------------------------------------------------------------------
+      - name: Cache math install (GMP / MPFR / CGAL)
+        id: cache-math
+        uses: actions/cache@v4
+        with:
+          path: deps/toolchain-wasm/install
+          key: math-${{ runner.os }}-${{ env.EMSDK_VERSION }}-${{ hashFiles('deps/toolchain-wasm/build_math.sh', 'deps/boost-wasm/build_boost.sh') }}
+
+      - name: Build math toolchain
+        if: steps.cache-math.outputs.cache-hit != 'true'
+        run: NPROC=4 bash deps/toolchain-wasm/build_math.sh
+
+      # ------------------------------------------------------------------
+      # ccache — large, restorable across runs.
+      # ------------------------------------------------------------------
+      - name: Restore ccache
+        uses: actions/cache@v4
+        with:
+          path: deps/ccache-cache
+          key: ccache-${{ runner.os }}-${{ github.run_id }}
+          restore-keys: |
+            ccache-${{ runner.os }}-
+
+      - name: Configure ccache
+        run: |
+          mkdir -p deps/ccache
+          # Inline write — avoids YAML/heredoc indentation pitfalls.
+          printf '%s\n' '#!/usr/bin/env bash' 'exec /usr/bin/ccache "$@"' \
+            > deps/ccache/ccache
+          chmod +x deps/ccache/ccache
+          export CCACHE_DIR="$PWD/deps/ccache-cache"
+          ccache --max-size=2G
+          ccache --zero-stats
+
+      # ------------------------------------------------------------------
+      # Apply the WASM patch to the orca submodule (idempotent).
+      # ------------------------------------------------------------------
       - name: Apply WASM patch to Orca
-        if: ${{ always() }}
         run: |
           set -euo pipefail
-          if [ -f patches/orca-wasm.patch ]; then
-            echo "Applying patches/orca-wasm.patch to orca submodule"
-            git -C orca apply ../patches/orca-wasm.patch || echo "Patch did not apply cleanly; continuing"
-          else
+          if [ ! -f patches/orca-wasm.patch ]; then
             echo "No patches/orca-wasm.patch found; skipping"
+            exit 0
+          fi
+          if git -C orca apply --reverse --check ../patches/orca-wasm.patch >/dev/null 2>&1; then
+            echo "Orca WASM patch already applied"
+          elif git -C orca apply --check ../patches/orca-wasm.patch >/dev/null 2>&1; then
+            git -C orca apply ../patches/orca-wasm.patch
+            echo "Applied Orca WASM patch"
+          else
+            echo "WARN: Orca WASM patch did not apply cleanly; continuing" >&2
           fi
 
-      - name: Build WASM module
-        shell: pwsh
-        run: ./build.ps1 -Clean -Jobs 4
+      # ------------------------------------------------------------------
+      # Build slicer.{js,wasm,data}
+      # ------------------------------------------------------------------
+      - name: Build slicer
+        env:
+          NPROC: '4'
+          CCACHE_DIR: ${{ github.workspace }}/deps/ccache-cache
+        run: |
+          set -euo pipefail
+          CMAKE_EXTRA=()
+          if [ -x deps/ccache/ccache ]; then
+            export PATH="$PWD/deps/ccache:$PATH"
+            CMAKE_EXTRA+=(
+              -DCMAKE_C_COMPILER_LAUNCHER=$PWD/deps/ccache/ccache
+              -DCMAKE_CXX_COMPILER_LAUNCHER=$PWD/deps/ccache/ccache
+            )
+          fi
+          emcmake cmake -S wasm -B build-wasm -DCMAKE_BUILD_TYPE=Release "${CMAKE_EXTRA[@]}"
+          cmake --build build-wasm -j"${NPROC:-4}"
+          echo "--- artifacts ---"
+          ls -la build-wasm/slicer.* 2>/dev/null || true
+          du -h build-wasm/slicer.* 2>/dev/null || true
 
+      - name: ccache stats
+        env:
+          CCACHE_DIR: ${{ github.workspace }}/deps/ccache-cache
+        run: ccache --show-stats
+
+      # ------------------------------------------------------------------
+      # Stage artifacts + split profiles out of the bundle.
+      # ------------------------------------------------------------------
       - name: Package release artifacts
         run: |
           set -euo pipefail
           mkdir -p dist
-          # Core engine — small (~7 MB wasm + ~200 KB JS + tiny data blob).
-          cp web/public/wasm/slicer.js web/public/wasm/slicer.wasm dist/
-          if [ -f web/public/wasm/slicer.data ]; then
-            cp web/public/wasm/slicer.data dist/
-          fi
+          # Engine artifacts — slim now that the .data preload only carries
+          # info/ + flush/ (a few dozen KB, not the full 230 MB resources tree).
+          for asset in slicer.js slicer.wasm slicer.data; do
+            if [ -f "build-wasm/$asset" ]; then
+              cp "build-wasm/$asset" "dist/$asset"
+              echo "staged dist/$asset"
+            else
+              echo "warn: build-wasm/$asset missing" >&2
+            fi
+          done
           # Profile library — split out of the .data blob so hosts can fetch
-          # only the vendor JSON(s) they need at slice time, instead of
-          # preloading the full ~70 MB tree into MEMFS.
-          mkdir -p dist/profiles
+          # only the vendor JSON(s) they actually slice with.
           if [ -d orca/resources/profiles ]; then
+            mkdir -p dist/profiles
             cp -R orca/resources/profiles/. dist/profiles/
+            tar -C dist/profiles -czf dist/profiles.tar.gz .
+            rm -rf dist/profiles
+            echo "staged dist/profiles.tar.gz"
+          else
+            echo "warn: orca/resources/profiles not found — skipping profile tarball" >&2
           fi
-          # Convenience bundle for users who still want a single archive.
-          cd dist
-          zip -r "slicer-wasm-${GITHUB_REF_NAME}.zip" slicer.js slicer.wasm $( [ -f slicer.data ] && echo slicer.data )
+          # Single-archive convenience bundle.
+          REF_NAME="${GITHUB_REF_NAME:-dev}"
+          (
+            cd dist
+            ZIP_INPUTS=()
+            for f in slicer.js slicer.wasm slicer.data; do
+              [ -f "$f" ] && ZIP_INPUTS+=("$f")
+            done
+            if [ ${#ZIP_INPUTS[@]} -gt 0 ]; then
+              zip -j "slicer-wasm-${REF_NAME}.zip" "${ZIP_INPUTS[@]}"
+            fi
+          )
+          ls -lh dist/
 
-      - name: Upload build artifacts (workflow run)
+      - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: slicer-wasm-${{ github.ref_name }}
+          name: slicer-wasm-${{ github.sha }}
           path: |
-            dist/slicer-wasm-${{ github.ref_name }}.zip
-            dist/slicer.js
-            dist/slicer.wasm
-            dist/slicer.data
-            dist/profiles/**
-
-      - name: Tar profile library
-        run: |
-          set -euo pipefail
-          cd dist
-          if [ -d profiles ] && [ -n "$(ls -A profiles 2>/dev/null)" ]; then
-            tar -C profiles -czf profiles.tar.gz .
-          else
-            echo "No profiles directory — skipping tarball"
-          fi
-
-      - name: Publish GitHub Release
-        uses: softprops/action-gh-release@v2
-        with:
-          # Ship engine and profile bundle as separate assets so hosts can
-          # cache them independently and skip downloading profiles they
-          # don't need.
-          files: |
-            dist/slicer-wasm-${{ github.ref_name }}.zip
             dist/slicer.js
             dist/slicer.wasm
             dist/slicer.data
             dist/profiles.tar.gz
-          generate_release_notes: true
+            dist/slicer-wasm-*.zip
+          if-no-files-found: warn
+          retention-days: 30
+
+      # ------------------------------------------------------------------
+      # On tag push: publish to GitHub release.
+      # ------------------------------------------------------------------
+      - name: Publish GitHub release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/slicer.js
+            dist/slicer.wasm
+            dist/slicer.data
+            dist/profiles.tar.gz
+            dist/slicer-wasm-*.zip
           fail_on_unmatched_files: false
+          generate_release_notes: true
+          body: |
+            OrcaSlicer WASM build for `${{ github.ref_name }}`.
+
+            Built against the pinned OrcaSlicer submodule with emsdk `${{ env.EMSDK_VERSION }}`.
+
+            Drop `slicer.{js,wasm,data}` into your web app's `public/wasm/orca/`
+            and load `slicer.js` to instantiate `OrcaModule`.
+
+            `profiles.tar.gz` (~70 MB unpacked) is shipped separately so hosts
+            can stage only the vendor JSON(s) they need under
+            `public/wasm/orca/profiles/`, instead of preloading the full
+            profile tree into MEMFS at startup.
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
