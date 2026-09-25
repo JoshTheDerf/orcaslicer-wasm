@@ -145,7 +145,7 @@ set(_link
   # node tests use wasmBinary. csProgress is read at call time via Module[].
   "-sINCOMING_MODULE_JS_API=['locateFile','print','printErr','instantiateWasm','wasmBinary','getPreloadedPackage','onAbort','monitorRunDependencies','setStatus']"
   -sEXIT_RUNTIME=0
-  "-sEXPORTED_FUNCTIONS=['_cs_version','_cs_describe_config','_cs_slice','_cs_eval_condition','_cs_free','_malloc','_free']"
+  "-sEXPORTED_FUNCTIONS=['_cs_version','_cs_describe_config','_cs_slice','_cs_eval_condition','_cs_orient','_cs_free','_malloc','_free']"
   "-sEXPORTED_RUNTIME_METHODS=['HEAPU8','HEAP32','HEAPU32','UTF8ToString','stringToUTF8','lengthBytesUTF8','FS']"
   # libslic3r reads only resources/info (nozzle tables) and resources/flush
   # (MM flush matrices) at slice time — ~40 KB. Profiles are resolved in JS.

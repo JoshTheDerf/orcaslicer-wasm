@@ -17,6 +17,8 @@
 #include <libslic3r/GCode/GCodeProcessor.hpp>
 #include <libslic3r/Layer.hpp>
 #include <libslic3r/Model.hpp>
+#include <libslic3r/Orient.hpp>
+#include <libslic3r/Geometry.hpp>
 #include <libslic3r/PlaceholderParser.hpp>
 #include <libslic3r/Preset.hpp>
 #include <libslic3r/Print.hpp>
@@ -486,6 +488,53 @@ EMSCRIPTEN_KEEPALIVE int cs_eval_condition(const char* expr, int expr_len, const
         std::fprintf(stderr, "cs_eval_condition: %s\n", e.what());
     } catch (...) {}
     return -1;
+}
+
+// Auto-orient (OrcaSlicer's AutoOrienter, same as the desktop "Auto orient").
+// Input: a job JSON with exactly one object whose `transform` should be the
+// object's current rotation*scale (no translation needed). Output JSON:
+//   {"ok":true,"rotation":[r00,r01,r02,r10,...] (row-major 3x3, to be
+//    pre-multiplied onto the object's rotation), "axis":[x,y,z], "angle":rad}
+EMSCRIPTEN_KEEPALIVE int cs_orient(const char* job_json, int job_len, const uint8_t* blob, int blob_len,
+                                   char** out_json, int* out_len)
+{
+    json out = {{"ok", false}, {"error", nullptr}};
+    try {
+        ensure_runtime_dirs();
+        cs::Job job = cs::parse_job(job_json, job_len, blob, blob_len);
+        if (job.objects.size() != 1) throw cs::JobError("cs_orient expects exactly one object");
+        const cs::MeshInput& m = job.objects.front();
+        indexed_triangle_set its;
+        const double* T = m.transform;
+        const size_t nv = m.positions.size() / 3;
+        its.vertices.reserve(nv);
+        for (size_t i = 0; i < nv; ++i) {
+            const double x = m.positions[i * 3], y = m.positions[i * 3 + 1], z = m.positions[i * 3 + 2];
+            its.vertices.emplace_back(float(T[0] * x + T[4] * y + T[8] * z), float(T[1] * x + T[5] * y + T[9] * z),
+                                      float(T[2] * x + T[6] * y + T[10] * z));
+        }
+        for (size_t i = 0; i + 2 < m.indices.size(); i += 3)
+            its.indices.emplace_back(int(m.indices[i]), int(m.indices[i + 1]), int(m.indices[i + 2]));
+        orientation::OrientMeshs items(1);
+        items[0].mesh = TriangleMesh(std::move(its));
+        items[0].name = m.name;
+        orientation::OrientParams params;
+        // _orient() invokes both callbacks unconditionally.
+        params.progressind = [](unsigned, std::string) {};
+        params.stopcondition = [] { return false; };
+        orientation::orient(items, {}, params);
+        const Matrix3d R = items[0].rotation_matrix;
+        const Vec3d axis = items[0].axis;
+        const double angle = items[0].angle;
+        json rot = json::array();
+        for (int r = 0; r < 3; ++r) for (int c = 0; c < 3; ++c) rot.push_back(std::isfinite(R(r, c)) ? R(r, c) : (r == c ? 1.0 : 0.0));
+        out = {{"ok", true}, {"error", nullptr}, {"rotation", rot}, {"axis", {axis.x(), axis.y(), axis.z()}}, {"angle", angle}};
+    } catch (const std::exception& e) {
+        out["error"] = e.what();
+    } catch (...) {
+        out["error"] = "unknown engine exception";
+    }
+    try { return cs::emit(out.dump(), out_json, out_len) == 0 && out["ok"].get<bool>() ? 0 : 1; } catch (...) { return 1; }
 }
 
 EMSCRIPTEN_KEEPALIVE void cs_free(void* p) { std::free(p); }

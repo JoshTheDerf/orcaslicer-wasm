@@ -250,6 +250,32 @@ for (let i = 0; i < 3; i++) {
   checkGcode(`fresh instance #${i + 1}`, slice(m, mk4.config, [{ ...box(20, 20, 5), transform: translate(125, 105, 0) }]), { minLayers: 10 });
 }
 
+{ // auto-orient (Orca AutoOrienter via cs_orient)
+  const orient = (obj) => {
+    const { json, blob } = packJob({}, [obj]);
+    const jp = put(mod, json), bp = put(mod, blob), o = mod._malloc(8) >>> 0;
+    mod.HEAPU32.fill(0, o >>> 2, (o >>> 2) + 2);
+    const rc = mod._cs_orient(jp, json.length, bp, blob.length, o, o + 4);
+    const p = mod.HEAPU32[o >>> 2] >>> 0, n = mod.HEAPU32[(o >>> 2) + 1] >>> 0;
+    const r = JSON.parse(dec.decode(mod.HEAPU8.slice(p, p + n)));
+    mod._cs_free(p); mod._free(jp); mod._free(bp); mod._free(o);
+    return { rc, ...r };
+  };
+  // Box 40x20x5 tilted 30deg about X: best orientation puts a big face down.
+  const c = Math.cos(Math.PI / 6), s = Math.sin(Math.PI / 6);
+  const tilt = [1,0,0,0, 0,c,s,0, 0,-s,c,0, 0,0,0,1]; // column-major
+  const r = orient({ ...box(40, 20, 5), transform: tilt });
+  ok(r.rc === 0 && r.ok && r.rotation?.length === 9, `cs_orient ok (angle ${r.angle?.toFixed?.(3)} rad)`);
+  if (r.ok) {
+    // Apply R (row-major) after the tilt to the box's local +Z face normal; it must end up ±Z.
+    const n0 = [0, -s, c]; // tilt * (0,0,1)
+    const R = r.rotation, n1 = [R[0]*n0[0]+R[1]*n0[1]+R[2]*n0[2], R[3]*n0[0]+R[4]*n0[1]+R[5]*n0[2], R[6]*n0[0]+R[7]*n0[1]+R[8]*n0[2]];
+    ok(Math.abs(Math.abs(n1[2]) - 1) < 1e-3, `auto-orient lays the large face flat (normal z=${n1[2].toFixed(4)})`);
+  }
+  const bad = orient({ ...box(1, 1, 1), transform: tilt });
+  ok(typeof bad.ok === 'boolean', 'cs_orient on a tiny mesh returns a report');
+}
+
 { // conditions
   const ev = (expr, cfg) => { const e = enc.encode(expr), c = enc.encode(JSON.stringify(cfg)); const ep = put(mod, e), cp = put(mod, c);
     const r = mod._cs_eval_condition(ep, e.length, cp, c.length); mod._free(ep); mod._free(cp); return r; };
