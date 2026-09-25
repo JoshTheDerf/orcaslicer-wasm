@@ -1,60 +1,44 @@
 #!/usr/bin/env bash
-# Build the Orca→WASM module and stage artifacts for the web app.
-# Usage: bash scripts/build-wasm.sh
+# Build the OrcaSlicer engine for Cubby Slicer (ABI: cubby-slicer/docs/ENGINE-CONTRACT.md).
+#
+#   bash scripts/build-wasm.sh                  # release → build-wasm/
+#   BUILD_VARIANT=debug bash scripts/build-wasm.sh   # SAFE_HEAP/ASSERTIONS → build-wasm-debug/
+#   NPROC=3 ...                                 # parallel compile jobs (default 3; ~1-2 GB RAM each)
+#
+# Requires ../wasm-deps (shared toolchain + deps: `bash ../wasm-deps/build-deps.sh all`).
 set -euo pipefail
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+cd "$ROOT"
+# shellcheck disable=SC1091
+source "$ROOT/../wasm-deps/env.sh"
 
-# 1) Load Emscripten env if available (repo-local hint first, then system install)
-source wasm/toolchain/emsdk.env 2>/dev/null || source /opt/emsdk/emsdk_env.sh 2>/dev/null || true
+VARIANT="${BUILD_VARIANT:-release}"
+BUILD_DIR="build-wasm"; [[ "$VARIANT" == "debug" ]] && BUILD_DIR="build-wasm-debug"
+NPROC="${NPROC:-3}"
+ORCA_TAG="${ORCA_TAG:-v2.4.2}"
 
-# 2) Ensure Emscripten is actually available
-if ! command -v emcc >/dev/null 2>&1; then
-  echo "❌ Emscripten (emcc) not found. Run: source /opt/emsdk/emsdk_env.sh" >&2
-  exit 1
+# 1) Orca source at the pinned tag with the WASM patch applied (idempotent).
+if [[ ! -d orca/.git && ! -f orca/.git ]]; then
+  git submodule update --init --depth 1 orca
 fi
-
-# 3) Ensure Orca submodule is present (track main, shallow) and patched for WASM
-# Keep .gitmodules aligned
-git config -f .gitmodules submodule.orca.url https://github.com/SoftFever/OrcaSlicer.git >/dev/null || true
-git config -f .gitmodules submodule.orca.branch main >/dev/null || true
-git config -f .gitmodules submodule.orca.shallow true >/dev/null || true
-
-# Update submodule from remote tracked branch with shallow history
-git submodule update --init --depth 1 --remote --progress -- orca || {
-  echo "WARN: Standard submodule update failed; attempting re-add" >&2
-  git submodule deinit -f -- orca || true
-  rm -rf .git/modules/orca orca || true
-  git submodule add -f -b main https://github.com/SoftFever/OrcaSlicer.git orca
-  git submodule update --init --depth 1 --progress -- orca
-}
-
-PATCH_FILE="patches/orca-wasm.patch"
-if [[ -f ${PATCH_FILE} ]]; then
-  pushd orca >/dev/null
-  if git apply --reverse --check "../${PATCH_FILE}" >/dev/null 2>&1; then
-    echo "INFO: Orca WASM patch already applied"
-  else
-    if git apply --check "../${PATCH_FILE}" >/dev/null 2>&1; then
-      git apply "../${PATCH_FILE}"
-      echo "INFO: Applied Orca WASM patch"
-    else
-      echo "WARN: Orca WASM patch did not apply cleanly; continuing with current workspace" >&2
-    fi
-  fi
-  popd >/dev/null
+if ! git -C orca rev-parse -q --verify "refs/tags/$ORCA_TAG" >/dev/null; then
+  git -C orca fetch --depth 1 origin tag "$ORCA_TAG"
 fi
-
-# 4) Configure and build with Emscripten
-emcmake cmake -S wasm -B build-wasm -DCMAKE_BUILD_TYPE=Release
-cmake --build build-wasm -j
-
-# 5) Validate artifacts and stage for the web app
-mkdir -p web/public/wasm
-if [[ -f build-wasm/slicer.js && -f build-wasm/slicer.wasm && -f build-wasm/slicer.data ]]; then
-  cp build-wasm/slicer.js build-wasm/slicer.wasm build-wasm/slicer.data web/public/wasm/
-  echo "✅ WASM build complete"
+if [[ "$(git -C orca rev-parse HEAD)" != "$(git -C orca rev-parse "$ORCA_TAG^{commit}")" ]]; then
+  echo "checking out orca $ORCA_TAG (discarding local changes in orca/)"
+  git -C orca checkout -q -- . && git -C orca clean -fdq && git -C orca checkout -q "$ORCA_TAG"
+fi
+if git -C orca apply --reverse --check ../patches/orca-wasm.patch 2>/dev/null; then
+  echo "orca-wasm.patch already applied"
 else
-  echo "❌ WASM build failed: required build artifacts missing" >&2
-  # Optional: show recent CMake output for quick debugging
-  (tail -n 100 build-wasm/CMakeFiles/CMakeOutput.log 2>/dev/null || true)
-  exit 1
+  git -C orca apply ../patches/orca-wasm.patch
+  echo "applied orca-wasm.patch"
 fi
+
+# 2) Configure + build.
+emcmake cmake -S wasm -B "$BUILD_DIR" -G Ninja -DCMAKE_BUILD_TYPE=Release -DBUILD_VARIANT="$VARIANT"
+cmake --build "$BUILD_DIR" --target slicer -j"$NPROC"
+
+# 3) Schema + version sidecars.
+node scripts/gen-schema.mjs "$BUILD_DIR"
+ls -la "$BUILD_DIR"/slicer.{mjs,wasm,data} "$BUILD_DIR"/{schema,version}.json

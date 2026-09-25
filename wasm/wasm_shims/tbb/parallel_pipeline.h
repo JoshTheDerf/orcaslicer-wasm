@@ -159,6 +159,9 @@ void run_pipeline(flow_control& fc, const Tuple& filters) {
         using first_filter_t = std::decay_t<std::tuple_element_t<0, Tuple>>;
         while (!fc.is_stopped()) {
             auto value = std::get<0>(filters)(fc);
+            // TBB semantics: once the input filter calls fc.stop(), the value it
+            // returned is a dummy and must NOT flow downstream.
+            if (fc.is_stopped()) break;
             if constexpr (std::tuple_size_v<Tuple> > 1) {
                 if constexpr (std::is_void_v<typename first_filter_t::output_type>) {
                     propagate<1>(fc, filters);
@@ -172,6 +175,21 @@ void run_pipeline(flow_control& fc, const Tuple& filters) {
     }
 }
 
+
+// Pipeline composition. Declared inside `detail` so argument-dependent lookup
+// finds them for filter_wrapper / filter_sequence operands (the old generic
+// operator& in oneapi::tbb was invisible to ADL and matched any type).
+template <typename T> struct is_filter_part : std::false_type {};
+template <typename I, typename O, typename F> struct is_filter_part<filter_wrapper<I, O, F>> : std::true_type {};
+template <typename L, typename R> struct is_filter_part<filter_sequence<L, R>> : std::true_type {};
+
+template <typename Left, typename Right,
+          typename = std::enable_if_t<is_filter_part<std::decay_t<Left>>::value && is_filter_part<std::decay_t<Right>>::value>>
+auto operator&(Left&& left, Right&& right) {
+    return filter_sequence<std::decay_t<Left>, std::decay_t<Right>>{
+        std::forward<Left>(left), std::forward<Right>(right)};
+}
+
 } // namespace detail
 
 template <typename Input, typename Output, typename Func>
@@ -179,35 +197,15 @@ auto make_filter(filter_mode mode, Func&& func) {
     return detail::filter_wrapper<Input, Output, std::decay_t<Func>>{mode, std::forward<Func>(func)};
 }
 
-template <typename Left, typename Right>
-auto operator&(Left&& left, Right&& right) {
-    return detail::filter_sequence<std::decay_t<Left>, std::decay_t<Right>>{
-        std::forward<Left>(left), std::forward<Right>(right)};
-}
-
-template <typename LLeft, typename LRight, typename Next>
-auto operator&(detail::filter_sequence<LLeft, LRight>&& seq, Next&& next) {
-    return detail::filter_sequence<detail::filter_sequence<LLeft, LRight>, std::decay_t<Next>>{
-        std::move(seq), std::forward<Next>(next)};
-}
-
-template <typename LLeft, typename LRight, typename Next>
-auto operator&(const detail::filter_sequence<LLeft, LRight>& seq, Next&& next) {
-    return detail::filter_sequence<detail::filter_sequence<LLeft, LRight>, std::decay_t<Next>>{
-        seq, std::forward<Next>(next)};
-}
-
+// One entry point taking the pipeline by const reference. (The previous shim
+// also had a `Pipeline&&` forwarding overload that copied into an lvalue and
+// called itself again -> unbounded recursion -> stack overflow, which in the
+// browser surfaces as "memory access out of bounds".)
 template <typename Pipeline>
 void parallel_pipeline(std::size_t /*max_number_of_live_tokens*/, const Pipeline& pipeline) {
     auto filters = detail::flatten_pipeline(pipeline);
     flow_control fc;
     detail::run_pipeline(fc, filters);
-}
-
-template <typename Pipeline>
-void parallel_pipeline(std::size_t max_tokens, Pipeline&& pipeline) {
-    auto pipeline_copy = std::forward<Pipeline>(pipeline);
-    parallel_pipeline(max_tokens, pipeline_copy);
 }
 
 }} // namespace oneapi::tbb

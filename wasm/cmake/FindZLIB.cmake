@@ -1,16 +1,8 @@
-# Minimal Zlib shim for Emscripten/WASM.
-# Satisfies find_package(ZLIB REQUIRED) without linking real libs.
-
+include(${CMAKE_CURRENT_LIST_DIR}/WasmStub.cmake)
+wasm_port_target(ZLIB::ZLIB -sUSE_ZLIB=1)
 set(ZLIB_FOUND TRUE)
-set(ZLIB_INCLUDE_DIR "")
-set(ZLIB_LIBRARY "")
-# Back-compat vars some Find modules export:
+set(ZLIB_LIBRARIES ZLIB::ZLIB)
+set(ZLIB_LIBRARY ZLIB::ZLIB)
 set(ZLIB_INCLUDE_DIRS "")
-set(ZLIB_LIBRARIES "")
-# Provide the imported target expected by consumers
-if(NOT TARGET ZLIB::ZLIB)
-  add_library(ZLIB::ZLIB INTERFACE IMPORTED)
-  set_target_properties(ZLIB::ZLIB PROPERTIES
-    INTERFACE_INCLUDE_DIRECTORIES ""
-  )
-endif()
+set(ZLIB_INCLUDE_DIR "")
+set(ZLIB_VERSION_STRING "1.3")

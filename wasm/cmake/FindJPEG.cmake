@@ -1,8 +1,6 @@
-# Minimal JPEG shim for Emscripten/WASM
+include(${CMAKE_CURRENT_LIST_DIR}/WasmStub.cmake)
+wasm_port_target(JPEG::JPEG -sUSE_LIBJPEG=1)
 set(JPEG_FOUND TRUE)
+set(JPEG_LIBRARIES JPEG::JPEG)
+set(JPEG_INCLUDE_DIRS "")
 set(JPEG_INCLUDE_DIR "")
-set(JPEG_LIBRARY "")
-set(JPEG_LIBRARIES "")
-if(NOT TARGET JPEG::JPEG)
-  add_library(JPEG::JPEG INTERFACE IMPORTED)
-endif()

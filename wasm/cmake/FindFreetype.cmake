@@ -1,9 +1,6 @@
+include(${CMAKE_CURRENT_LIST_DIR}/WasmStub.cmake)
+wasm_port_target(Freetype::Freetype -sUSE_FREETYPE=1)
 set(FREETYPE_FOUND TRUE)
+set(Freetype_FOUND TRUE)
+set(FREETYPE_LIBRARIES Freetype::Freetype)
 set(FREETYPE_INCLUDE_DIRS "")
-set(FREETYPE_LIBRARY "")
-if(NOT TARGET Freetype::Freetype)
-  add_library(Freetype::Freetype INTERFACE IMPORTED)
-  set_target_properties(Freetype::Freetype PROPERTIES
-    INTERFACE_INCLUDE_DIRECTORIES ""
-  )
-endif()

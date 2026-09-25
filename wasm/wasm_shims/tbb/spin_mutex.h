@@ -8,10 +8,12 @@ class spin_mutex {
 public:
     spin_mutex() : m_flag(ATOMIC_FLAG_INIT) {}
 
+    // Single-threaded build: nobody else can release the lock, so spinning on
+    // a held lock would hang forever. Re-locking is a logic error; abort loudly.
     void lock() {
-        while (m_flag.test_and_set(std::memory_order_acquire)) {
-        }
+        if (m_flag.test_and_set(std::memory_order_acquire)) __builtin_trap();
     }
+    bool try_lock() { return !m_flag.test_and_set(std::memory_order_acquire); }
 
     void unlock() {
         m_flag.clear(std::memory_order_release);
