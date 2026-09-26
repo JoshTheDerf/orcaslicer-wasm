@@ -640,6 +640,99 @@ index 176af4c51..8f0177886 100644
  #if ORCA_CHECK_GCODE_PLACEHOLDERS
      std::map<std::string, std::vector<std::string>> m_placeholder_error_messages;
  #endif
+diff --git a/src/libslic3r/GCode/GCodeProcessor.cpp b/src/libslic3r/GCode/GCodeProcessor.cpp
+index 44cb185ae..0c7935a03 100644
+--- a/src/libslic3r/GCode/GCodeProcessor.cpp
++++ b/src/libslic3r/GCode/GCodeProcessor.cpp
+@@ -21,6 +21,8 @@
+ #include <float.h>
+ #include <assert.h>
+ #include <regex>
++#include <cctype>
++#include <cstring>
+ #include <charconv>
+ #include <string>
+ #include <system_error>
+@@ -5266,46 +5268,54 @@ void GCodeProcessor::process_M205(const GCodeReader::GCodeLine& line)
+     }
+ }
+ 
++// Finds `<whitespace>KEY<ws>=<ws>NUMBER` in a Klipper command line, i.e. the
++// regex `\sKEY\s*=\s*([0-9]*\.*[0-9]*)`, without std::regex (which costs
++// ~3 ms per line under WASM and dominated G-code export on Klipper printers).
++// Returns false when KEY isn't present; an empty number yields 0 like the
++// original stof-in-try/catch did.
++static bool find_klipper_param(const std::string& s, const char* key, float& out)
++{
++    const size_t klen = std::strlen(key);
++    for (size_t pos = s.find(key); pos != std::string::npos; pos = s.find(key, pos + 1)) {
++        if (pos == 0 || !std::isspace(static_cast<unsigned char>(s[pos - 1]))) continue;
++        size_t i = pos + klen;
++        while (i < s.size() && std::isspace(static_cast<unsigned char>(s[i]))) ++i;
++        if (i >= s.size() || s[i] != '=') continue;
++        ++i;
++        while (i < s.size() && std::isspace(static_cast<unsigned char>(s[i]))) ++i;
++        const size_t b = i;
++        while (i < s.size() && std::isdigit(static_cast<unsigned char>(s[i]))) ++i;
++        while (i < s.size() && s[i] == '.') ++i;
++        while (i < s.size() && std::isdigit(static_cast<unsigned char>(s[i]))) ++i;
++        out = 0;
++        try { out = std::stof(s.substr(b, i - b)); } catch (...) {}
++        return true;
++    }
++    return false;
++}
++
+ void GCodeProcessor::process_SET_VELOCITY_LIMIT(const GCodeReader::GCodeLine& line)
+ {
++    const std::string& raw = line.raw();
+     // handle SQUARE_CORNER_VELOCITY
+-    static const std::regex square_corner_velocity_pattern("\\sSQUARE_CORNER_VELOCITY\\s*=\\s*([0-9]*\\.*[0-9]*)");
+-    std::smatch matches;
+-    if (std::regex_search(line.raw(), matches, square_corner_velocity_pattern) && matches.size() == 2) {
+-        float _jerk = 0;
+-        try
+-        {
+-            _jerk = std::stof(matches[1]);
+-        }
+-        catch (...){}
++    float _jerk = 0;
++    if (find_klipper_param(raw, "SQUARE_CORNER_VELOCITY", _jerk)) {
+         for (size_t i = 0; i < static_cast<size_t>(PrintEstimatedStatistics::ETimeMode::Count); ++i) {
+             set_option_value(m_time_processor.machine_limits.machine_max_jerk_x, i, _jerk);
+             set_option_value(m_time_processor.machine_limits.machine_max_jerk_y, i, _jerk);
+         }
+     }
+ 
+-    static const std::regex accel_pattern("\\sACCEL\\s*=\\s*([0-9]*\\.*[0-9]*)");
+-    if (std::regex_search(line.raw(), matches, accel_pattern) && matches.size() == 2) {
+-        float _accl = 0;
+-        try
+-        {
+-            _accl = std::stof(matches[1]);
+-        }
+-        catch (...) {}
++    float _accl = 0;
++    if (find_klipper_param(raw, "ACCEL", _accl)) {
+         for (size_t i = 0; i < static_cast<size_t>(PrintEstimatedStatistics::ETimeMode::Count); ++i) {
+             set_acceleration(static_cast<PrintEstimatedStatistics::ETimeMode>(i), _accl);
+             set_travel_acceleration(static_cast<PrintEstimatedStatistics::ETimeMode>(i), _accl);
+         }
+     }
+ 
+-    static const std::regex velocity_pattern("\\sVELOCITY\\s*=\\s*([0-9]*\\.*[0-9]*)");
+-    if (std::regex_search(line.raw(), matches, velocity_pattern) && matches.size() == 2) {
+-        float _speed = 0;
+-        try
+-        {
+-            _speed = std::stof(matches[1]);
+-        }
+-        catch (...) {}
++    float _speed = 0;
++    if (find_klipper_param(raw, "VELOCITY", _speed)) {
+         for (size_t i = 0; i < static_cast<size_t>(PrintEstimatedStatistics::ETimeMode::Count); ++i) {
+                 set_option_value(m_time_processor.machine_limits.machine_max_speed_x, i, _speed);
+                 set_option_value(m_time_processor.machine_limits.machine_max_speed_y, i, _speed);
 diff --git a/src/libslic3r/GCode/Thumbnails.cpp b/src/libslic3r/GCode/Thumbnails.cpp
 index 526ba8249..e94d51358 100644
 --- a/src/libslic3r/GCode/Thumbnails.cpp

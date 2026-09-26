@@ -117,7 +117,7 @@ if(TARGET mcut)
 endif()
 
 # ---- engine module ------------------------------------------------------------
-add_executable(slicer ../bridge/cs_bridge.cpp)
+add_executable(slicer ../bridge/cs_bridge.cpp ${CMAKE_CURRENT_LIST_DIR}/../../wasm-bridge/cs_fast_strtod.cpp)
 set_target_properties(slicer PROPERTIES OUTPUT_NAME "slicer" SUFFIX ".mjs")
 target_include_directories(slicer PRIVATE
   ../orca/src
@@ -128,6 +128,8 @@ target_link_libraries(slicer PRIVATE libslic3r libslic3r_cgal ${Boost_LIBRARIES}
   "${WASM_DEPS_PREFIX}/lib/libmpfr.a" "${WASM_DEPS_PREFIX}/lib/libgmp.a")
 
 set(_link
+  # musl strtod goes through 128-bit soft-float long double; route it to fast_float.
+  -Wl,--wrap=strtod -Wl,--wrap=strtof
   -sALLOW_MEMORY_GROWTH=1
   -sINITIAL_MEMORY=128MB
   -sMAXIMUM_MEMORY=4GB
