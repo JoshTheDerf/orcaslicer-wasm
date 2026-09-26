@@ -3,6 +3,8 @@
 #
 #   bash scripts/build-wasm.sh                  # release → build-wasm/
 #   BUILD_VARIANT=debug bash scripts/build-wasm.sh   # SAFE_HEAP/ASSERTIONS → build-wasm-debug/
+#   WASM_THREADS=1 bash scripts/build-wasm.sh   # pthreads + oneTBB → build-wasm-mt/
+#                                               #   (needs: WASM_THREADS=1 bash ../wasm-deps/build-deps.sh all-mt)
 #   NPROC=3 ...                                 # parallel compile jobs (default 3; ~1-2 GB RAM each)
 #
 # Requires ../wasm-deps (shared toolchain + deps: `bash ../wasm-deps/build-deps.sh all`).
@@ -14,6 +16,8 @@ source "$ROOT/../wasm-deps/env.sh"
 
 VARIANT="${BUILD_VARIANT:-release}"
 BUILD_DIR="build-wasm"; [[ "$VARIANT" == "debug" ]] && BUILD_DIR="build-wasm-debug"
+THREADS=OFF
+if [[ "${WASM_THREADS:-0}" == "1" ]]; then THREADS=ON; BUILD_DIR="$BUILD_DIR-mt"; fi
 NPROC="${NPROC:-3}"
 ORCA_TAG="${ORCA_TAG:-v2.4.2}"
 
@@ -36,7 +40,7 @@ else
 fi
 
 # 2) Configure + build.
-emcmake cmake -S wasm -B "$BUILD_DIR" -G Ninja -DCMAKE_BUILD_TYPE=Release -DBUILD_VARIANT="$VARIANT"
+emcmake cmake -S wasm -B "$BUILD_DIR" -G Ninja -DCMAKE_BUILD_TYPE=Release -DBUILD_VARIANT="$VARIANT" -DORCA_WASM_THREADS="$THREADS"
 cmake --build "$BUILD_DIR" --target slicer -j"$NPROC"
 
 # 3) Schema + version sidecars.

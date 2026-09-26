@@ -2,6 +2,8 @@
 # Boost.Thread is not built (single-threaded); `thread` resolves to the
 # header-only single-thread shim in wasm_shims/boost_runtime (nothing linked,
 # so no ABI overlap with a real libboost_thread).
+# ORCA_WASM_THREADS: install-mt Boost (threading=multi, -pthread) with the real
+# Boost.Thread/Atomic linked and thread-safe Boost.Log.
 if(NOT WASM_DEPS_PREFIX)
   message(FATAL_ERROR "WASM_DEPS_PREFIX not set")
 endif()
@@ -16,14 +18,23 @@ set(Boost_VERSION_STRING "1.84.0")
 set(Boost_INCLUDE_DIR "${WASM_DEPS_PREFIX}/include")
 set(Boost_INCLUDE_DIRS "${WASM_DEPS_PREFIX}/include")
 set(Boost_LIBRARIES "")
+if(ORCA_WASM_THREADS)
+  set(_bdefs "BOOST_LOG_STATIC_LINK;BOOST_ALL_NO_LIB;BOOST_NO_CXX98_FUNCTION_BASE")
+else()
+  set(_bdefs "BOOST_LOG_NO_THREADS;BOOST_LOG_STATIC_LINK;BOOST_ALL_NO_LIB;BOOST_NO_CXX98_FUNCTION_BASE")
+endif()
 if(NOT TARGET Boost::headers)
   add_library(Boost::headers INTERFACE IMPORTED GLOBAL)
   set_target_properties(Boost::headers PROPERTIES
     INTERFACE_INCLUDE_DIRECTORIES "${WASM_DEPS_PREFIX}/include"
-    INTERFACE_COMPILE_DEFINITIONS "BOOST_LOG_NO_THREADS;BOOST_LOG_STATIC_LINK;BOOST_ALL_NO_LIB;BOOST_NO_CXX98_FUNCTION_BASE")
+    INTERFACE_COMPILE_DEFINITIONS "${_bdefs}")
   add_library(Boost::boost ALIAS Boost::headers)
 endif()
-foreach(_c system filesystem regex chrono date_time iostreams program_options log log_setup)
+set(_bcomps system filesystem regex chrono date_time iostreams program_options log log_setup)
+if(ORCA_WASM_THREADS)
+  list(APPEND _bcomps thread atomic)
+endif()
+foreach(_c ${_bcomps})
   string(TOUPPER ${_c} _C)
   set(_p "${_blib}/libboost_${_c}.a")
   if(EXISTS "${_p}")
@@ -41,7 +52,13 @@ endforeach()
 # log depends on these; order matters for static linking.
 list(APPEND Boost_LIBRARIES "${_blib}/libboost_filesystem.a" "${_blib}/libboost_regex.a"
                             "${_blib}/libboost_date_time.a" "${_blib}/libboost_system.a")
-foreach(_h thread nowide atomic locale)
+if(ORCA_WASM_THREADS)
+  list(APPEND Boost_LIBRARIES "${_blib}/libboost_thread.a" "${_blib}/libboost_chrono.a" "${_blib}/libboost_atomic.a")
+  set(_bheader nowide locale)
+else()
+  set(_bheader thread nowide atomic locale)
+endif()
+foreach(_h ${_bheader})
   string(TOUPPER ${_h} _H)
   set(Boost_${_H}_FOUND TRUE)
   if(NOT TARGET Boost::${_h})

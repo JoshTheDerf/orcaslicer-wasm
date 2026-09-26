@@ -140,6 +140,7 @@ vite.config.ts.timestamp-*
 
 # Build and dist directories
 build-wasm/
+build-wasm-mt/
 web/public/wasm/*.wasm
 web/public/wasm/*.wasm.map
 web/public/wasm/*.js

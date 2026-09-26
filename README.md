@@ -14,7 +14,8 @@ bridge/cs_bridge.cpp        ABI implementation (job → Model/Print → G-code +
 ../wasm-bridge/cs_common.hpp engine-neutral, bounds-checked job parsing (shared with preflight-wasm)
 wasm/CMakeLists.txt         superbuild (emcmake)
 wasm/cmake/                 find-modules: real deps from ../wasm-deps, stubs only for unlinked libs
-wasm/wasm_shims/            sequential TBB, single-thread Boost.Thread, MD5, OpenVDB stub
+wasm/wasm_shims/            sequential TBB, single-thread Boost.Thread, MD5, OpenVDB stub (ST build)
+wasm/mt_pre.js, mt_post.js  pthreads build: thread count, csTerminateThreads, csSyncHeap
 scripts/build-wasm.sh       checkout + patch + build + schema
 scripts/gen-schema.mjs      writes schema.json / version.json next to the build
 tests/cs-slice-test.mjs     end-to-end + robustness suite (node)
@@ -29,6 +30,43 @@ bash scripts/build-wasm.sh                   # → build-wasm/slicer.{mjs,wasm,d
 node tests/cs-slice-test.mjs build-wasm      # must print ALL PASSED
 ```
 
+Multi-threaded variant (Emscripten pthreads + real oneTBB 2022.3.0):
+
+```bash
+WASM_THREADS=1 bash ../wasm-deps/build-deps.sh all-mt   # once: -pthread deps → ../wasm-deps/install-mt
+WASM_THREADS=1 bash scripts/build-wasm.sh               # → build-wasm-mt/ (same outputs)
+node tests/cs-slice-test.mjs build-wasm-mt              # ALL PASSED; CS_THREADS=n / CS_SYNC=1 knobs
+```
+
+## Multi-threaded build (`build-wasm-mt/`)
+
+* Same ABI plus `cs_slice_start(…same args…, int32_t* state)` and
+  `cs_thread_count()`. `cs_slice_start` runs `cs_slice` on its own pthread
+  (64 MB stack) and returns at once; `state[0]` flips to 1 (futex wake) when
+  done, `state[1]` = return code. The host awaits it with `Atomics.waitAsync`
+  — it must NOT block: Emscripten starts a pthread requested by another
+  pthread (TBB's workers spawn each other) only when the main runtime thread
+  is back in its event loop. Plain `cs_slice` / `cs_orient` still work when
+  called on the main runtime thread, but run inside a 1-slot
+  `tbb::task_arena` (serial) — otherwise Orca's TBB warm-up barrier in
+  `Print::process` would deadlock.
+* Threads: `csThreadCount()` = `Module.csThreads` or
+  `navigator.hardwareConcurrency`, clamped to 2..16. The pthread pool
+  (`-sPTHREAD_POOL_SIZE=csThreadCount()`) is created during instantiation and
+  TBB is capped to the same number (`tbb::global_control`), so every TBB
+  worker lands on a pre-loaded Worker.
+* Stacks: slicing thread 64 MB, TBB workers 16 MB (oneTBB's Emscripten
+  default is 64 KB — patched in build-deps.sh), `STACK_OVERFLOW_CHECK=2`.
+* `Module.csSyncHeap()` refreshes `HEAP*` views after another thread grew
+  memory; `Module.csTerminateThreads()` kills the instance's Workers (no
+  teardown otherwise with `EXIT_RUNTIME=0`).
+* Progress from non-main threads is proxied to the main runtime thread
+  (`cs_common.hpp`); the Print status callback is mutex-guarded.
+* Needs a cross-origin-isolated page (COOP `same-origin` + COEP) for
+  SharedArrayBuffer. Deps: separate prefix `../wasm-deps/install-mt`
+  (Boost `threading=multi` + Boost.Thread, thread-safe MPFR, oneTBB with
+  its `-fexceptions` dropped so native Wasm EH is the only model).
+
 Diagnostics (relink-only unless noted):
 
 ```bash
@@ -42,8 +80,10 @@ BUILD_VARIANT=debug bash scripts/build-wasm.sh          # full -O1 -g2 SAFE_HEAP
 
 * One exception model everywhere: `-fwasm-exceptions -sSUPPORT_LONGJMP=wasm`
   (deps included). No `EMULATE_FUNCTION_POINTER_CASTS`, no allocator overrides.
-* Single-threaded: no `-pthread` objects are linked (Boost.Atomic/Locale, which
-  b2 forces to threading=multi, are not linked).
+* Single-threaded (`build-wasm/`): no `-pthread` objects are linked
+  (Boost.Atomic/Locale, which b2 forces to threading=multi, are not linked).
+  The pthreads build (`build-wasm-mt/`) links ONLY `-pthread` objects from
+  `install-mt`; the two prefixes are never mixed (CMake checks WASM_THREADS).
 * No shim shadows a library that is linked. Real: Boost 1.84, CGAL 5.6.3,
   GMP/MPFR, Eigen 5.0.1, cereal, NLopt, libnoise, qhull, expat, zlib/libpng/
   libjpeg/freetype (Emscripten ports).
@@ -69,4 +109,4 @@ BUILD_VARIANT=debug bash scripts/build-wasm.sh          # full -O1 -g2 SAFE_HEAP
 ## Disabled / not available
 
 OCCT (STEP import), OpenVDB (SLA hollowing), OpenCV, Draco, networking/printer
-connectivity, multithreading. Thumbnails are not generated (no renderer).
+connectivity, multithreading in the ST build (see build-wasm-mt). Thumbnails are not generated (no renderer).

@@ -27,12 +27,26 @@
 #include <libslic3r/Utils.hpp>
 #include "libslic3r_version.h"  // generated into orca-build/src/libslic3r
 
+#include <atomic>
 #include <chrono>
 #include <cstdio>
 #include <fstream>
+#include <memory>
+#include <mutex>
 #include <set>
 #include <sys/stat.h>
 #include <unistd.h>
+
+#ifdef CS_ENGINE_THREADS
+// Pthreads engine (build-wasm-mt): real oneTBB. See cs_slice_start().
+#include <climits>
+#include <new>
+#include <pthread.h>
+#include <emscripten/eventloop.h>
+#include <emscripten/threading.h>
+#include <tbb/global_control.h>
+#include <tbb/task_arena.h>
+#endif
 
 using namespace Slic3r;
 using cs::json;
@@ -47,17 +61,59 @@ double now_ms()
 
 void ensure_runtime_dirs()
 {
-    static bool done = false;
-    if (done) return;
-    done = true;
-    ::mkdir("/tmp", 0777);
-    ::mkdir("/data", 0777);
-    // resources/info + resources/flush are preloaded (tiny); profiles are
-    // resolved on the JS side and never read by the engine.
-    set_resources_dir("/resources");
-    set_data_dir("/data");
-    set_temporary_dir("/tmp");
-    set_logging_level(1); // errors only; the log sinks write to stderr
+    static std::once_flag once;
+    std::call_once(once, [] {
+        ::mkdir("/tmp", 0777);
+        ::mkdir("/data", 0777);
+        // resources/info + resources/flush are preloaded (tiny); profiles are
+        // resolved on the JS side and never read by the engine.
+        set_resources_dir("/resources");
+        set_data_dir("/data");
+        set_temporary_dir("/tmp");
+        set_logging_level(1); // errors only; the log sinks write to stderr
+    });
+}
+
+#ifdef CS_ENGINE_THREADS
+// Thread budget = the pthread pool size (csThreadCount() in wasm/mt_pre.js):
+// the slicing thread + (N-1) TBB workers. Capping TBB to it keeps every TBB
+// worker on a pre-created pool Worker. Main runtime thread only.
+EM_JS(int, cs_js_thread_count, (), { return csThreadCount(); });
+int g_engine_threads = 0;
+int engine_threads()
+{
+    if (g_engine_threads == 0) {
+        // With pthreads Emscripten's keepRuntimeAlive() is a counter even with
+        // EXIT_RUNTIME=0: once a proxied call / mailbox callback finishes on the
+        // main runtime thread with the counter at 0, the runtime "exits" and
+        // terminates every pthread (the slice just hangs). The engine lives as
+        // long as its host keeps the instance; hold one keepalive forever.
+        emscripten_runtime_keepalive_push();
+        g_engine_threads = std::max(1, cs_js_thread_count());
+        // Process-wide while alive; intentionally never destroyed.
+        new tbb::global_control(tbb::global_control::max_allowed_parallelism, size_t(g_engine_threads));
+    }
+    return g_engine_threads;
+}
+#endif
+
+// Runs `f` single-threaded when called ON the main runtime thread of a
+// pthreads build. That thread (the host's engine Web Worker) is blocked for
+// the whole call, and Emscripten can only start a pthread whose creation was
+// requested by another pthread once the main runtime thread returns to its
+// event loop — so TBB work that waits for its workers (Orca's thread-pool
+// warm-up barrier in Print::process) would deadlock. Parallel slicing goes
+// through cs_slice_start() instead, which runs on its own pthread.
+template<class F> auto serial_on_main_thread(F&& f)
+{
+#ifdef CS_ENGINE_THREADS
+    if (emscripten_is_main_runtime_thread()) {
+        engine_threads();
+        tbb::task_arena serial(1);
+        return serial.execute(std::forward<F>(f));
+    }
+#endif
+    return f();
 }
 
 // Normalize job config values to the string / string-array shape Orca's JSON
@@ -83,7 +139,7 @@ json normalize_config_json(const json& in)
 void load_config_json(DynamicPrintConfig& cfg, const json& values, json& substitutions)
 {
     if (values.empty()) return;
-    static int seq = 0;
+    static std::atomic<int> seq{0};
     const std::string path = "/tmp/cs_config_" + std::to_string(++seq) + ".json";
     {
         std::ofstream f(path, std::ios::binary | std::ios::trunc);
@@ -163,40 +219,68 @@ json number_or_null(double v)
 // Model from validated job meshes. Each job object becomes one ModelObject
 // with one volume and one instance; the transform is baked into the mesh
 // and the object is re-centred so the instance carries the placement.
+// Mesh-local vertices → bed coordinates (column-major transform). The host
+// already flips the winding of mirrored transforms; an inside-out result is
+// still corrected below via the signed volume.
+TriangleMesh bed_mesh(const std::vector<float>& positions, const std::vector<uint32_t>& indices, const double* T,
+                      const std::string& name)
+{
+    indexed_triangle_set its;
+    const size_t nv = positions.size() / 3;
+    its.vertices.reserve(nv);
+    for (size_t i = 0; i < nv; ++i) {
+        const double x = positions[i * 3], y = positions[i * 3 + 1], z = positions[i * 3 + 2];
+        const double wx = T[0] * x + T[4] * y + T[8] * z + T[12];
+        const double wy = T[1] * x + T[5] * y + T[9] * z + T[13];
+        const double wz = T[2] * x + T[6] * y + T[10] * z + T[14];
+        if (!std::isfinite(wx) || !std::isfinite(wy) || !std::isfinite(wz))
+            throw cs::JobError(name + ": transform produced non-finite coordinates");
+        its.vertices.emplace_back(float(wx), float(wy), float(wz));
+    }
+    its.indices.reserve(indices.size() / 3);
+    for (size_t i = 0; i + 2 < indices.size(); i += 3) {
+        const int a = int(indices[i]), b = int(indices[i + 1]), c = int(indices[i + 2]);
+        if (a == b || b == c || a == c) continue; // degenerate
+        its.indices.emplace_back(a, b, c);
+    }
+    if (its.indices.empty()) throw cs::JobError(name + ": mesh has no valid triangles");
+    TriangleMesh mesh(std::move(its));
+    if (mesh.volume() < 0) mesh.flip_triangles(); // inside-out input
+    return mesh;
+}
+
+ModelVolumeType volume_type(const std::string& t)
+{
+    if (t == "negative") return ModelVolumeType::NEGATIVE_VOLUME;
+    if (t == "modifier") return ModelVolumeType::PARAMETER_MODIFIER;
+    if (t == "support_blocker") return ModelVolumeType::SUPPORT_BLOCKER;
+    if (t == "support_enforcer") return ModelVolumeType::SUPPORT_ENFORCER;
+    return ModelVolumeType::MODEL_PART;
+}
+
 void build_model(Model& model, const cs::Job& job, json& substitutions)
 {
     for (const cs::MeshInput& m : job.objects) {
-        indexed_triangle_set its;
-        const size_t nv = m.positions.size() / 3;
-        its.vertices.reserve(nv);
-        const double* T = m.transform; // column-major
-        for (size_t i = 0; i < nv; ++i) {
-            const double x = m.positions[i * 3], y = m.positions[i * 3 + 1], z = m.positions[i * 3 + 2];
-            const double wx = T[0] * x + T[4] * y + T[8] * z + T[12];
-            const double wy = T[1] * x + T[5] * y + T[9] * z + T[13];
-            const double wz = T[2] * x + T[6] * y + T[10] * z + T[14];
-            if (!std::isfinite(wx) || !std::isfinite(wy) || !std::isfinite(wz))
-                throw cs::JobError(m.name + ": transform produced non-finite coordinates");
-            its.vertices.emplace_back(float(wx), float(wy), float(wz));
-        }
-        its.indices.reserve(m.indices.size() / 3);
-        for (size_t i = 0; i + 2 < m.indices.size(); i += 3) {
-            const int a = int(m.indices[i]), b = int(m.indices[i + 1]), c = int(m.indices[i + 2]);
-            if (a == b || b == c || a == c) continue; // degenerate
-            its.indices.emplace_back(a, b, c);
-        }
-        if (its.indices.empty()) throw cs::JobError(m.name + ": mesh has no valid triangles");
-
-        TriangleMesh mesh(std::move(its));
-        if (mesh.volume() < 0) mesh.flip_triangles(); // inside-out input
         ModelObject* obj = model.add_object();
         obj->name = m.name;
         obj->input_file = m.name;
-        ModelVolume* vol = obj->add_volume(std::move(mesh));
+        ModelVolume* vol = obj->add_volume(bed_mesh(m.positions, m.indices, m.transform, m.name));
         vol->name = m.name;
-        // The mesh is in bed coordinates. Re-centre it on its own origin and move
-        // that offset into the instance (Orca's center_around_origin() shifts
-        // the volumes only, it does not compensate the instances).
+        // Extra volumes (Orca parts / negative parts / modifiers / support
+        // blockers & enforcers), each with its own settings.
+        for (const cs::VolumeInput& p : m.parts) {
+            ModelVolume* pv = obj->add_volume(bed_mesh(p.positions, p.indices, p.transform, p.name), volume_type(p.type));
+            pv->name = p.name;
+            if (!p.config.empty()) {
+                DynamicPrintConfig vc;
+                load_config_json(vc, p.config, substitutions);
+                pv->config.assign_config(vc);
+            }
+        }
+        // The meshes are in bed coordinates. Re-centre them on the object's own
+        // origin and move that offset into the instance (Orca's
+        // center_around_origin() shifts the volumes only, it does not
+        // compensate the instances).
         const Vec3d centre = obj->raw_mesh_bounding_box().center();
         obj->center_around_origin(false);
         ModelInstance* inst = obj->add_instance();
@@ -284,7 +368,9 @@ int slice_impl(const char* job_json, int job_len, const uint8_t* blob, int blob_
     Print print;
     print.set_plate_origin(Vec3d::Zero());
     json& warnings = report["warnings"];
-    print.set_status_callback([&warnings](const PrintBase::SlicingStatus& s) {
+    std::mutex status_mutex; // status may be reported from TBB workers (MT build)
+    print.set_status_callback([&warnings, &status_mutex](const PrintBase::SlicingStatus& s) {
+        std::lock_guard<std::mutex> lock(status_mutex);
         if (s.percent >= 0) cs::progress(int(s.percent * 0.9), s.text);
         if (s.warning_step != -1 && !s.text.empty())
             warnings.push_back({{"code", "slicing"}, {"message", s.text}});
@@ -451,7 +537,7 @@ EMSCRIPTEN_KEEPALIVE int cs_slice(const char* job_json, int job_len, const uint8
     int rc = 1;
     try {
         if (!out_gcode || !out_gcode_len) throw cs::JobError("null output pointers");
-        rc = slice_impl(job_json, job_len, blob, blob_len, out_gcode, out_gcode_len, report);
+        rc = serial_on_main_thread([&] { return slice_impl(job_json, job_len, blob, blob_len, out_gcode, out_gcode_len, report); });
     } catch (const cs::JobError& e) {
         report["error"] = e.what(); rc = 2;
     } catch (const json::exception& e) {
@@ -472,6 +558,59 @@ EMSCRIPTEN_KEEPALIVE int cs_slice(const char* job_json, int job_len, const uint8
     } catch (...) {}
     return rc;
 }
+
+#ifdef CS_ENGINE_THREADS
+// ---- pthreads engine: asynchronous slice -------------------------------------------
+// cs_slice_start(): same arguments as cs_slice plus `state` (2 x int32, 4-byte
+// aligned). Starts cs_slice on a dedicated pthread (64 MB stack, like the
+// single-thread engine's main stack) and returns immediately: 0 = started,
+// -1 = could not start (the host may fall back to cs_slice, which then runs
+// serially). When the slice is finished — out-params written — state[1] holds
+// cs_slice's return code and state[0] flips 0 -> 1 with a futex wake, so the
+// host can Atomics.waitAsync()/poll on it WITHOUT blocking its event loop.
+// The host must not call into the engine again until state[0] == 1.
+struct SliceStart {
+    const char* job; int job_len; const uint8_t* blob; int blob_len;
+    uint8_t** out_gcode; int* out_gcode_len; char** out_report; int* out_report_len;
+    int32_t* state;
+};
+
+static void* slice_thread_main(void* p)
+{
+    std::unique_ptr<SliceStart> a(static_cast<SliceStart*>(p));
+    const int rc = cs_slice(a->job, a->job_len, a->blob, a->blob_len,
+                            a->out_gcode, a->out_gcode_len, a->out_report, a->out_report_len);
+    __atomic_store_n(&a->state[1], rc, __ATOMIC_SEQ_CST);
+    __atomic_store_n(&a->state[0], 1, __ATOMIC_SEQ_CST);
+    emscripten_futex_wake(&a->state[0], INT_MAX);
+    return nullptr;
+}
+
+EMSCRIPTEN_KEEPALIVE int cs_slice_start(const char* job_json, int job_len, const uint8_t* blob, int blob_len,
+                                        uint8_t** out_gcode, int* out_gcode_len,
+                                        char** out_report, int* out_report_len, int32_t* state)
+{
+    if (!state || (reinterpret_cast<uintptr_t>(state) & 3u)) return -1;
+    state[0] = 0;
+    state[1] = -1;
+    engine_threads();
+    auto* a = new (std::nothrow) SliceStart{job_json, job_len, blob, blob_len,
+                                            out_gcode, out_gcode_len, out_report, out_report_len, state};
+    if (!a) return -1;
+    pthread_attr_t attr;
+    pthread_attr_init(&attr);
+    pthread_attr_setstacksize(&attr, size_t(64) << 20);
+    pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED);
+    pthread_t t;
+    const int err = pthread_create(&t, &attr, slice_thread_main, a);
+    pthread_attr_destroy(&attr);
+    if (err != 0) { delete a; return -1; }
+    return 0;
+}
+
+// Threads a slice uses (slicing thread + TBB workers) = pthread pool size.
+EMSCRIPTEN_KEEPALIVE int cs_thread_count(void) { return engine_threads(); }
+#endif
 
 EMSCRIPTEN_KEEPALIVE int cs_eval_condition(const char* expr, int expr_len, const char* config_json, int config_len)
 {
@@ -522,7 +661,7 @@ EMSCRIPTEN_KEEPALIVE int cs_orient(const char* job_json, int job_len, const uint
         // _orient() invokes both callbacks unconditionally.
         params.progressind = [](unsigned, std::string) {};
         params.stopcondition = [] { return false; };
-        orientation::orient(items, {}, params);
+        serial_on_main_thread([&] { orientation::orient(items, {}, params); return 0; });
         const Matrix3d R = items[0].rotation_matrix;
         const Vec3d axis = items[0].axis;
         const double angle = items[0].angle;

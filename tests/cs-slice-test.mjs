@@ -5,6 +5,9 @@
 // several meshes incl. a ~200k-triangle one, multi-object transforms,
 // back-to-back slices on one instance AND on fresh instances, malformed jobs
 // (must return error reports, never trap), cs_eval_condition, schema sanity.
+// Multi-threaded builds (build-wasm-mt: exports cs_slice_start) slice on the
+// engine's own pthread and are awaited without blocking, like the web worker;
+// CS_THREADS=<n> overrides the thread count, CS_SYNC=1 forces plain cs_slice.
 import { readFileSync, existsSync, writeFileSync } from 'node:fs';
 import { resolve, dirname, join } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
@@ -19,16 +22,20 @@ const enc = new TextEncoder(), dec = new TextDecoder();
 let failures = 0;
 const ok = (cond, msg) => { console.log(`${cond ? 'PASS' : 'FAIL'} ${msg}`); if (!cond) failures++; };
 
+const instances = [];
 async function instance() {
   const logs = [];
   const mod = await factory({
     wasmBinary, locateFile: (f) => join(dir, f),
     print: () => {}, printErr: (m) => logs.push(m),
     csProgress: () => {},
+    ...(process.env.CS_THREADS ? { csThreads: +process.env.CS_THREADS } : {}),
   });
   mod.__logs = logs;
+  instances.push(mod);
   return mod;
 }
+const heap = (mod) => { mod.csSyncHeap?.(); return mod; };
 
 // ---- profiles (same algorithm as the web catalog) -------------------------
 const vendorCache = new Map();
@@ -118,19 +125,41 @@ function packJob(config, objects, options = {}) {
     indexOffset: lay[n].i, triangleCount: o.indices.length / 3, transform: o.transform ?? translate(0, 0, 0), config: o.config ?? {} })) };
   return { json: enc.encode(JSON.stringify(job)), blob };
 }
-function put(mod, bytes) { const p = mod._malloc(Math.max(1, bytes.length)) >>> 0; mod.HEAPU8.set(bytes, p); return p; }
-function rawSlice(mod, jsonBytes, blob, blobLenOverride) {
+function put(mod, bytes) { const p = mod._malloc(Math.max(1, bytes.length)) >>> 0; heap(mod).HEAPU8.set(bytes, p); return p; }
+// MT: run cs_slice on the engine's slicing pthread and wait without blocking
+// this (main runtime) thread, which Emscripten needs to start TBB's workers.
+async function sliceCall(mod, args, sync) {
+  if (sync || process.env.CS_SYNC === '1' || typeof mod._cs_slice_start !== 'function') return mod._cs_slice(...args);
+  const st = mod._malloc(8) >>> 0;
+  heap(mod).HEAP32.fill(0, st >>> 2, (st >>> 2) + 2);
+  if (mod._cs_slice_start(...args, st) !== 0) throw new Error('cs_slice_start failed');
+  // Node: pooled pthread Workers are unref'd and a pending waitAsync doesn't
+  // hold the event loop either, so keep the process alive while we wait.
+  const keepAlive = setInterval(() => {}, 1000);
+  try {
+    for (;;) {
+      const H = heap(mod).HEAP32;
+      if (Atomics.load(H, st >>> 2) !== 0) break;
+      const w = Atomics.waitAsync(H, st >>> 2, 0, 500);
+      if (w.async) await w.value;
+    }
+  } finally { clearInterval(keepAlive); }
+  const rc = heap(mod).HEAP32[(st >>> 2) + 1];
+  mod._free(st);
+  return rc;
+}
+async function rawSlice(mod, jsonBytes, blob, blobLenOverride, sync = false) {
   const jp = put(mod, jsonBytes), bp = put(mod, blob), o = mod._malloc(16) >>> 0;
-  mod.HEAPU32.fill(0, o >>> 2, (o >>> 2) + 4);
-  const rc = mod._cs_slice(jp, jsonBytes.length, bp, blobLenOverride ?? blob.length, o, o + 4, o + 8, o + 12);
-  const H = mod.HEAPU32, g = H[o >>> 2] >>> 0, gl = H[(o >>> 2) + 1] >>> 0, r = H[(o >>> 2) + 2] >>> 0, rl = H[(o >>> 2) + 3] >>> 0;
+  heap(mod).HEAPU32.fill(0, o >>> 2, (o >>> 2) + 4);
+  const rc = await sliceCall(mod, [jp, jsonBytes.length, bp, blobLenOverride ?? blob.length, o, o + 4, o + 8, o + 12], sync);
+  const H = heap(mod).HEAPU32, g = H[o >>> 2] >>> 0, gl = H[(o >>> 2) + 1] >>> 0, r = H[(o >>> 2) + 2] >>> 0, rl = H[(o >>> 2) + 3] >>> 0;
   const report = rl ? JSON.parse(dec.decode(mod.HEAPU8.slice(r, r + rl))) : null;
   const gcode = gl ? dec.decode(mod.HEAPU8.slice(g, g + gl)) : '';
   if (g) mod._cs_free(g); if (r) mod._cs_free(r);
   mod._free(jp); mod._free(bp); mod._free(o);
   return { rc, report, gcode };
 }
-const slice = (mod, config, objects, options) => { const { json, blob } = packJob(config, objects, options); return rawSlice(mod, json, blob); };
+const slice = (mod, config, objects, options, sync) => { const { json, blob } = packJob(config, objects, options); return rawSlice(mod, json, blob, undefined, sync); };
 
 function checkGcode(label, res, { minLayers = 5, maxZ } = {}) {
   ok(res.rc === 0 && res.report?.ok, `${label}: rc=${res.rc} ${res.report?.error ?? ''}`);
@@ -151,6 +180,7 @@ function checkGcode(label, res, { minLayers = 5, maxZ } = {}) {
   ok(st && st.printTimeSec > 0 && st.filamentMm[0] > 0, `${label}: stats time=${st?.printTimeSec?.toFixed(0)}s filament=${st?.filamentMm?.[0]?.toFixed(0)}mm layers=${st?.layers} maxZ=${st?.maxZ}`);
   if (maxZ) ok(Math.abs(st.maxZ - maxZ) < 0.6, `${label}: maxZ ${st.maxZ} ≈ ${maxZ}`);
   if (res.report.warnings?.length) console.log('   warnings:', res.report.warnings.map((w) => w.message).join(' | ').slice(0, 300));
+  if (res.report.timings) console.log(`   timings: process ${res.report.timings.processMs.toFixed(0)} ms, export ${res.report.timings.exportMs.toFixed(0)} ms`);
 }
 
 // ---- run ---------------------------------------------------------------------------
@@ -158,6 +188,8 @@ const t0 = Date.now();
 const mod = await instance();
 const version = JSON.parse(mod.UTF8ToString(mod._cs_version()));
 ok(version.engine === 'orca' && version.version.startsWith('2.4'), `version ${JSON.stringify(version)}`);
+const MT = typeof mod._cs_slice_start === 'function';
+console.log(MT ? `multi-threaded build: ${mod._cs_thread_count()} threads${process.env.CS_SYNC === '1' ? ' (CS_SYNC: serial cs_slice)' : ''}` : 'single-threaded build');
 
 { // schema
   const o = mod._malloc(8) >>> 0;
@@ -176,19 +208,19 @@ const bbl = configFor('BBL', 'Bambu Lab P1S 0.4 nozzle');
 const mk4 = configFor('Prusa', 'Prusa MK4 0.4 nozzle');
 console.log('profiles:', bbl.name, '||', mk4.name);
 
-checkGcode('cube 20mm (P1S)', slice(mod, bbl.config, [{ ...box(20, 20, 20), transform: translate(118, 118, 0) }]), { minLayers: 50, maxZ: 20 });
-checkGcode('cylinder (MK4)', slice(mod, mk4.config, [{ ...cylinder(10, 15, 96), transform: translate(125, 105, 0) }]), { minLayers: 40, maxZ: 15 });
-checkGcode('multi-object rotated + per-object override (P1S)', slice(mod, bbl.config, [
+checkGcode('cube 20mm (P1S)', await slice(mod, bbl.config, [{ ...box(20, 20, 20), transform: translate(118, 118, 0) }]), { minLayers: 50, maxZ: 20 });
+checkGcode('cylinder (MK4)', await slice(mod, mk4.config, [{ ...cylinder(10, 15, 96), transform: translate(125, 105, 0) }]), { minLayers: 40, maxZ: 15 });
+checkGcode('multi-object rotated + per-object override (P1S)', await slice(mod, bbl.config, [
   { name: 'a', ...box(15, 30, 10), transform: rotZ(30, 90, 100, 0) },
   { name: 'b', ...cylinder(8, 25, 64), transform: translate(170, 150, 0), config: { wall_loops: '5', sparse_infill_density: '40%' } },
 ]), { minLayers: 60, maxZ: 25 });
-checkGcode('support + brim + gyroid (P1S)', slice(mod, { ...bbl.config, enable_support: '1', brim_type: 'outer_only', brim_width: '5', sparse_infill_pattern: 'gyroid' },
+checkGcode('support + brim + gyroid (P1S)', await slice(mod, { ...bbl.config, enable_support: '1', brim_type: 'outer_only', brim_width: '5', sparse_infill_pattern: 'gyroid' },
   [{ ...torus(25, 8, 96, 48), transform: translate(128, 128, 0) }]), { minLayers: 40 });
 {
   const big = torus(40, 12, 500, 200); // 200k triangles
   const t = Date.now();
-  checkGcode(`large mesh ${big.indices.length / 3} tris (P1S)`, slice(mod, bbl.config, [{ ...big, transform: translate(128, 128, 0) }]), { minLayers: 60 });
-  console.log(`   large mesh slice took ${((Date.now() - t) / 1000).toFixed(1)}s, heap ${(mod.HEAPU8.byteLength / 1048576).toFixed(0)} MB`);
+  checkGcode(`large mesh ${big.indices.length / 3} tris (P1S)`, await slice(mod, bbl.config, [{ ...big, transform: translate(128, 128, 0) }]), { minLayers: 60 });
+  console.log(`   large mesh slice took ${((Date.now() - t) / 1000).toFixed(1)}s, heap ${(heap(mod).HEAPU8.byteLength / 1048576).toFixed(0)} MB`);
 }
 
 // Back-to-back on one instance (the web app uses fresh instances, but the
@@ -196,7 +228,7 @@ checkGcode('support + brim + gyroid (P1S)', slice(mod, { ...bbl.config, enable_s
 {
   let same = true, first = null;
   for (let i = 0; i < 5; i++) {
-    const r = slice(mod, bbl.config, [{ ...box(20, 20, 10), transform: translate(118, 118, 0) }]);
+    const r = await slice(mod, bbl.config, [{ ...box(20, 20, 10), transform: translate(118, 118, 0) }]);
     if (r.rc !== 0) { same = false; console.log('   repeat error', r.report?.error); break; }
     // Object ids come from libslic3r's process-global ObjectID counter, so they
     // legitimately grow between slices on one instance; normalise them.
@@ -237,17 +269,19 @@ checkGcode('support + brim + gyroid (P1S)', slice(mod, { ...bbl.config, enable_s
   cases.push(['NaN vertex', nm.json, nm.blob]);
   for (const [label, j, b, len] of cases) {
     let res, threw = null;
-    try { res = rawSlice(mod, j, b, len); } catch (e) { threw = e; }
+    try { res = await rawSlice(mod, j, b, len); } catch (e) { threw = e; }
     ok(!threw && res.rc !== 0 && typeof res.report?.error === 'string',
        `malformed: ${label} → ${threw ? 'THREW ' + threw : res.report?.error?.slice(0, 90)}`);
   }
-  checkGcode('slice after malformed jobs (same instance)', slice(mod, bbl.config, [{ ...box(20, 20, 5), transform: translate(118, 118, 0) }]), { minLayers: 10 });
+  checkGcode('slice after malformed jobs (same instance)', await slice(mod, bbl.config, [{ ...box(20, 20, 5), transform: translate(118, 118, 0) }]), { minLayers: 10 });
+  // MT: the synchronous cs_slice on the main runtime thread must still work (serially).
+  if (MT) checkGcode('synchronous cs_slice on the main thread (MT, serial)', await slice(mod, bbl.config, [{ ...box(20, 20, 5), transform: translate(118, 118, 0) }], {}, true), { minLayers: 10 });
 }
 
 // Fresh instances (what the web worker does).
 for (let i = 0; i < 3; i++) {
   const m = await instance();
-  checkGcode(`fresh instance #${i + 1}`, slice(m, mk4.config, [{ ...box(20, 20, 5), transform: translate(125, 105, 0) }]), { minLayers: 10 });
+  checkGcode(`fresh instance #${i + 1}`, await slice(m, mk4.config, [{ ...box(20, 20, 5), transform: translate(125, 105, 0) }]), { minLayers: 10 });
 }
 
 { // auto-orient (Orca AutoOrienter via cs_orient)
@@ -256,7 +290,7 @@ for (let i = 0; i < 3; i++) {
     const jp = put(mod, json), bp = put(mod, blob), o = mod._malloc(8) >>> 0;
     mod.HEAPU32.fill(0, o >>> 2, (o >>> 2) + 2);
     const rc = mod._cs_orient(jp, json.length, bp, blob.length, o, o + 4);
-    const p = mod.HEAPU32[o >>> 2] >>> 0, n = mod.HEAPU32[(o >>> 2) + 1] >>> 0;
+    const p = heap(mod).HEAPU32[o >>> 2] >>> 0, n = mod.HEAPU32[(o >>> 2) + 1] >>> 0;
     const r = JSON.parse(dec.decode(mod.HEAPU8.slice(p, p + n)));
     mod._cs_free(p); mod._free(jp); mod._free(bp); mod._free(o);
     return { rc, ...r };
@@ -286,4 +320,5 @@ for (let i = 0; i < 3; i++) {
 }
 
 console.log(`\n${failures ? `${failures} FAILED` : 'ALL PASSED'} in ${((Date.now() - t0) / 1000).toFixed(1)}s`);
+for (const m of instances) m.csTerminateThreads?.();
 process.exit(failures ? 1 : 0);

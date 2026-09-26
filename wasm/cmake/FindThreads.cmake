@@ -1,3 +1,15 @@
+if(ORCA_WASM_THREADS)
+  # Pthreads build: every object and the link already carry -pthread.
+  if(NOT TARGET Threads::Threads)
+    add_library(Threads::Threads INTERFACE IMPORTED GLOBAL)
+    set_target_properties(Threads::Threads PROPERTIES INTERFACE_COMPILE_OPTIONS "-pthread" INTERFACE_LINK_OPTIONS "-pthread")
+  endif()
+  set(Threads_FOUND TRUE)
+  set(CMAKE_THREAD_LIBS_INIT "-pthread")
+  set(CMAKE_USE_PTHREADS_INIT 1)
+  set(CMAKE_HAVE_THREADS_LIBRARY 1)
+  return()
+endif()
 # Single-threaded WASM build: Threads::Threads is an empty target (no -pthread).
 if(NOT TARGET Threads::Threads)
   add_library(Threads::Threads INTERFACE IMPORTED GLOBAL)

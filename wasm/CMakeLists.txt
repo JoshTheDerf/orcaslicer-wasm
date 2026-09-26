@@ -15,6 +15,21 @@ if(NOT EMSCRIPTEN)
 endif()
 
 set(BUILD_VARIANT "release" CACHE STRING "release | debug (SAFE_HEAP + assertions)")
+
+# Threading model. OFF (default): single-threaded engine, sequential TBB shim,
+# deps from wasm-deps/install. ON: Emscripten pthreads + real oneTBB, deps from
+# wasm-deps/install-mt (source env.sh with WASM_THREADS=1). The env var and
+# the option must agree so the two dependency prefixes can never be mixed.
+if("$ENV{WASM_THREADS}" STREQUAL "1")
+  set(_threads_default ON)
+else()
+  set(_threads_default OFF)
+endif()
+option(ORCA_WASM_THREADS "Emscripten pthreads build with real oneTBB" ${_threads_default})
+if((ORCA_WASM_THREADS AND NOT _threads_default) OR (_threads_default AND NOT ORCA_WASM_THREADS))
+  message(FATAL_ERROR "ORCA_WASM_THREADS=${ORCA_WASM_THREADS} but WASM_THREADS='$ENV{WASM_THREADS}' — "
+                      "source wasm-deps/env.sh with the matching WASM_THREADS setting")
+endif()
 set_property(CACHE BUILD_VARIANT PROPERTY STRINGS release debug)
 
 if(NOT CMAKE_BUILD_TYPE)
@@ -29,6 +44,11 @@ if(NOT DEFINED ENV{WASM_DEPS_PREFIX})
   message(FATAL_ERROR "WASM_DEPS_PREFIX not set — source wasm-deps/env.sh")
 endif()
 set(WASM_DEPS_PREFIX "$ENV{WASM_DEPS_PREFIX}" CACHE PATH "" FORCE)
+if(ORCA_WASM_THREADS AND NOT WASM_DEPS_PREFIX MATCHES "/install-mt$")
+  message(FATAL_ERROR "ORCA_WASM_THREADS needs the pthreads prefix; got ${WASM_DEPS_PREFIX} — source wasm-deps/env.sh with WASM_THREADS=1 set BEFORE sourcing")
+elseif(NOT ORCA_WASM_THREADS AND WASM_DEPS_PREFIX MATCHES "/install-mt$")
+  message(FATAL_ERROR "single-threaded build must not use ${WASM_DEPS_PREFIX}")
+endif()
 set(WASM_CGAL_PREFIX "$ENV{WASM_DEPS_ROOT}/cgal-5.6.3" CACHE PATH "" FORCE)   # orca pins CGAL 5.6.3
 set(WASM_SHIMS_DIR "${CMAKE_CURRENT_LIST_DIR}/wasm_shims" CACHE PATH "" FORCE)
 set(EM_EH "$ENV{WASM_EH_FLAGS}")
@@ -48,6 +68,11 @@ separate_arguments(_eh UNIX_COMMAND "${EM_EH}")
 add_compile_options(${_eh} -Wno-unknown-warning-option -Wno-deprecated-declarations
                     -Wno-unused-command-line-argument -Wno-missing-template-arg-list-after-template-kw)
 add_link_options(${_eh})
+if(ORCA_WASM_THREADS)
+  # Every object in a pthreads module needs atomics + bulk-memory (-pthread).
+  add_compile_options(-pthread)
+  add_link_options(-pthread)
+endif()
 if(BUILD_VARIANT STREQUAL "debug")
   add_compile_options(-g2)
 endif()
@@ -59,16 +84,28 @@ if(CCACHE_PROGRAM)
   set(CMAKE_CXX_COMPILER_LAUNCHER "${CCACHE_PROGRAM}")
 endif()
 
-# Shims: TBB (sequential), Boost.Thread (single-thread), unlinked stubs only.
-include_directories(BEFORE SYSTEM
-  "${WASM_SHIMS_DIR}"
-  "${WASM_SHIMS_DIR}/boost_runtime")
+if(NOT ORCA_WASM_THREADS)
+  # Shims: TBB (sequential), Boost.Thread (single-thread), unlinked stubs only.
+  include_directories(BEFORE SYSTEM
+    "${WASM_SHIMS_DIR}"
+    "${WASM_SHIMS_DIR}/boost_runtime")
+  add_compile_definitions(SLIC3R_NO_TBB=1 BOOST_LOG_NO_THREADS)
+else()
+  # MT: real oneTBB + Boost.Thread from install-mt. Only the stubs for libraries
+  # that are not linked at all (OpenSSL MD5, OpenVDB) stay on the include path;
+  # the sequential tbb/ + oneapi/ shims and boost_runtime must NOT shadow the
+  # real headers.
+  set(_mt_shims "${CMAKE_BINARY_DIR}/mt_shims")
+  file(MAKE_DIRECTORY "${_mt_shims}")
+  foreach(_d openssl openvdb)
+    file(CREATE_LINK "${WASM_SHIMS_DIR}/${_d}" "${_mt_shims}/${_d}" SYMBOLIC)
+  endforeach()
+  include_directories(BEFORE SYSTEM "${_mt_shims}")
+endif()
 include_directories(SYSTEM "${WASM_DEPS_PREFIX}/include" "${WASM_DEPS_PREFIX}/include/eigen3")
 
 add_compile_definitions(
   WASM_BUILD=1
-  SLIC3R_NO_TBB=1
-  BOOST_LOG_NO_THREADS
   BOOST_LOG_STATIC_LINK
   BOOST_ALL_NO_LIB
   BOOST_NO_CXX98_FUNCTION_BASE
@@ -88,8 +125,10 @@ set(SLIC3R_WITH_DRACO OFF CACHE BOOL "" FORCE)
 set(BUILD_TESTS OFF CACHE BOOL "" FORCE)
 set(ORCA_TOOLS OFF CACHE BOOL "" FORCE)
 set(ORCA_CHECK_GCODE_PLACEHOLDERS "0" CACHE STRING "" FORCE)
-set(CMAKE_DISABLE_FIND_PACKAGE_TBB ON)
-include(${CMAKE_CURRENT_LIST_DIR}/cmake/FindTBB.cmake)  # header-only TBB::* targets
+if(NOT ORCA_WASM_THREADS)
+  set(CMAKE_DISABLE_FIND_PACKAGE_TBB ON)
+endif()
+include(${CMAKE_CURRENT_LIST_DIR}/cmake/FindTBB.cmake)  # shim or real TBB::* targets
 
 add_subdirectory(../orca ${CMAKE_BINARY_DIR}/orca-build EXCLUDE_FROM_ALL)
 
@@ -126,6 +165,10 @@ target_include_directories(slicer PRIVATE
   ${CMAKE_CURRENT_LIST_DIR}/../../wasm-bridge)
 target_link_libraries(slicer PRIVATE libslic3r libslic3r_cgal ${Boost_LIBRARIES}
   "${WASM_DEPS_PREFIX}/lib/libmpfr.a" "${WASM_DEPS_PREFIX}/lib/libgmp.a")
+if(ORCA_WASM_THREADS)
+  target_link_libraries(slicer PRIVATE TBB::tbb TBB::tbbmalloc)
+  target_compile_definitions(slicer PRIVATE CS_ENGINE_THREADS=1)
+endif()
 
 set(_link
   # musl strtod goes through 128-bit soft-float long double; route it to fast_float.
@@ -145,15 +188,37 @@ set(_link
   # Module hooks the host passes in (anything not listed is silently ignored in
   # release builds): the web worker uses instantiateWasm + getPreloadedPackage,
   # node tests use wasmBinary. csProgress is read at call time via Module[].
-  "-sINCOMING_MODULE_JS_API=['locateFile','print','printErr','instantiateWasm','wasmBinary','getPreloadedPackage','onAbort','monitorRunDependencies','setStatus']"
+  # (INCOMING_MODULE_JS_API / EXPORTED_FUNCTIONS are appended below per variant.)
   -sEXIT_RUNTIME=0
-  "-sEXPORTED_FUNCTIONS=['_cs_version','_cs_describe_config','_cs_slice','_cs_eval_condition','_cs_orient','_cs_free','_malloc','_free']"
   "-sEXPORTED_RUNTIME_METHODS=['HEAPU8','HEAP32','HEAPU32','UTF8ToString','stringToUTF8','lengthBytesUTF8','FS']"
   # libslic3r reads only resources/info (nozzle tables) and resources/flush
   # (MM flush matrices) at slice time — ~40 KB. Profiles are resolved in JS.
   "--preload-file=${CMAKE_CURRENT_LIST_DIR}/../orca/resources/info@/resources/info"
   "--preload-file=${CMAKE_CURRENT_LIST_DIR}/../orca/resources/flush@/resources/flush"
 )
+# Module hooks the host passes in (anything not listed is silently ignored in
+# release builds) and the engine ABI exports — shared by both variants; the
+# pthreads build appends its extras below.
+set(_incoming "'locateFile','print','printErr','instantiateWasm','wasmBinary','getPreloadedPackage','onAbort','monitorRunDependencies','setStatus'")
+set(_exports "'_cs_version','_cs_describe_config','_cs_slice','_cs_eval_condition','_cs_orient','_cs_free','_malloc','_free'")
+if(ORCA_WASM_THREADS)
+  # Worker pool. The host's engine Web Worker is the main runtime thread; it
+  # starts each slice on a dedicated pthread (cs_slice_start) and returns to
+  # its event loop, so Emscripten can hand out pool workers to TBB at any time.
+  # The pool is pre-created (instance startup waits for it) so the first
+  # parallel_for already runs wide: 1 slicing thread + (N-1) TBB workers,
+  # N = csThreadCount() (--pre-js: hardwareConcurrency, capped at 16).
+  list(APPEND _link
+    "--pre-js=${CMAKE_CURRENT_LIST_DIR}/mt_pre.js"
+    "--post-js=${CMAKE_CURRENT_LIST_DIR}/mt_post.js"
+    "-sPTHREAD_POOL_SIZE=csThreadCount()"
+    -sDEFAULT_PTHREAD_STACK_SIZE=16MB)
+  # mainScriptUrlOrBlob: where pthread workers load slicer.mjs from when the
+  # host bundles/relocates it (Module.csThreads is read directly by mt_pre.js).
+  string(APPEND _incoming ",'mainScriptUrlOrBlob'")
+  string(APPEND _exports ",'_cs_slice_start','_cs_thread_count'")
+endif()
+list(APPEND _link "-sINCOMING_MODULE_JS_API=[${_incoming}]" "-sEXPORTED_FUNCTIONS=[${_exports}]")
 if(BUILD_VARIANT STREQUAL "debug")
   list(APPEND _link -O1 -g2 -sASSERTIONS=2 -sSAFE_HEAP=1 -sSTACK_OVERFLOW_CHECK=2)
 else()
