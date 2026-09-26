@@ -14,6 +14,12 @@
 
 #include <libslic3r/libslic3r.h>
 #include <libslic3r/Config.hpp>
+#include <libslic3r/CustomGCode.hpp>
+#include <libslic3r/CutUtils.hpp>
+#include <libslic3r/Slicing.hpp>
+#include <libslic3r/TriangleSelector.hpp>
+#include <libslic3r/calib.hpp>
+#include <libslic3r/BrimEarsPoint.hpp>
 #include <libslic3r/GCode/GCodeProcessor.hpp>
 #include <libslic3r/Layer.hpp>
 #include <libslic3r/Model.hpp>
@@ -223,7 +229,7 @@ json number_or_null(double v)
 // already flips the winding of mirrored transforms; an inside-out result is
 // still corrected below via the signed volume.
 TriangleMesh bed_mesh(const std::vector<float>& positions, const std::vector<uint32_t>& indices, const double* T,
-                      const std::string& name)
+                      const std::string& name, std::vector<int>* tri_map = nullptr)
 {
     indexed_triangle_set its;
     const size_t nv = positions.size() / 3;
@@ -238,15 +244,46 @@ TriangleMesh bed_mesh(const std::vector<float>& positions, const std::vector<uin
         its.vertices.emplace_back(float(wx), float(wy), float(wz));
     }
     its.indices.reserve(indices.size() / 3);
+    if (tri_map) tri_map->assign(indices.size() / 3, -1);
     for (size_t i = 0; i + 2 < indices.size(); i += 3) {
         const int a = int(indices[i]), b = int(indices[i + 1]), c = int(indices[i + 2]);
         if (a == b || b == c || a == c) continue; // degenerate
+        if (tri_map) (*tri_map)[i / 3] = int(its.indices.size());
         its.indices.emplace_back(a, b, c);
     }
     if (its.indices.empty()) throw cs::JobError(name + ": mesh has no valid triangles");
     TriangleMesh mesh(std::move(its));
     if (mesh.volume() < 0) mesh.flip_triangles(); // inside-out input
     return mesh;
+}
+
+// Painted facets (Orca per-triangle hex strings, as in 3MF) onto a volume.
+// `tri_map` maps the host's triangle indices to the engine mesh's (degenerate
+// triangles are dropped); painting of dropped triangles is ignored.
+void apply_paint(ModelVolume* vol, const json& paint, const std::vector<int>& tri_map)
+{
+    if (!paint.is_object() || paint.empty()) return;
+    const int n = int(vol->mesh().its.indices.size());
+    auto load = [&](const char* key, FacetsAnnotation& fa) {
+        auto it = paint.find(key);
+        if (it == paint.end() || !it->is_array() || it->empty()) return;
+        fa.reserve(int(it->size()));
+        for (const json& e : *it) {
+            if (!e.is_array() || e.size() != 2 || !e[0].is_number_integer() || !e[1].is_string()) continue;
+            const long long src = e[0].get<long long>();
+            if (src < 0 || size_t(src) >= tri_map.size()) continue;
+            const int t = tri_map[size_t(src)];
+            const std::string& hex = e[1].get_ref<const std::string&>();
+            if (t < 0 || t >= n || hex.empty() || hex.size() > 1 << 20) continue;
+            if (hex.find_first_not_of("0123456789ABCDEFabcdef") != std::string::npos) continue;
+            fa.set_triangle_from_string(t, hex);
+        }
+        fa.shrink_to_fit();
+    };
+    load("support", vol->supported_facets);
+    load("seam", vol->seam_facets);
+    load("color", vol->mmu_segmentation_facets);
+    load("fuzzy", vol->fuzzy_skin_facets);
 }
 
 ModelVolumeType volume_type(const std::string& t)
@@ -264,13 +301,17 @@ void build_model(Model& model, const cs::Job& job, json& substitutions)
         ModelObject* obj = model.add_object();
         obj->name = m.name;
         obj->input_file = m.name;
-        ModelVolume* vol = obj->add_volume(bed_mesh(m.positions, m.indices, m.transform, m.name));
+        std::vector<int> tri_map;
+        ModelVolume* vol = obj->add_volume(bed_mesh(m.positions, m.indices, m.transform, m.name, &tri_map));
         vol->name = m.name;
+        apply_paint(vol, m.paint, tri_map);
         // Extra volumes (Orca parts / negative parts / modifiers / support
         // blockers & enforcers), each with its own settings.
         for (const cs::VolumeInput& p : m.parts) {
-            ModelVolume* pv = obj->add_volume(bed_mesh(p.positions, p.indices, p.transform, p.name), volume_type(p.type));
+            std::vector<int> ptri_map;
+            ModelVolume* pv = obj->add_volume(bed_mesh(p.positions, p.indices, p.transform, p.name, &ptri_map), volume_type(p.type));
             pv->name = p.name;
+            apply_paint(pv, p.paint, ptri_map);
             if (!p.config.empty()) {
                 DynamicPrintConfig vc;
                 load_config_json(vc, p.config, substitutions);
@@ -286,6 +327,42 @@ void build_model(Model& model, const cs::Job& job, json& substitutions)
         ModelInstance* inst = obj->add_instance();
         inst->set_offset(centre);
         if (job.drop_to_bed) obj->ensure_on_bed();
+
+        // Brim ears: host positions are mesh-local; the mesh was baked to bed
+        // coordinates and re-centred on `centre`.
+        for (const json& bp : m.brim_points) {
+            auto pos = bp.find("pos");
+            if (pos == bp.end() || !pos->is_array() || pos->size() != 3) continue;
+            const double* T = m.transform;
+            const double x = (*pos)[0].get<double>(), y = (*pos)[1].get<double>(), z = (*pos)[2].get<double>();
+            const Vec3d w(T[0] * x + T[4] * y + T[8] * z + T[12], T[1] * x + T[5] * y + T[9] * z + T[13], T[2] * x + T[6] * y + T[10] * z + T[14]);
+            const Vec3d local = w - centre;
+            const float r = bp.value("radius", 0.f);
+            if (r > 0.f && local.allFinite()) obj->brim_points.emplace_back(local.cast<float>(), r);
+        }
+        // Variable layer height + height range modifiers (z from the object's bottom).
+        if (!m.layer_height_profile.empty()) obj->layer_height_profile.set(std::vector<coordf_t>(m.layer_height_profile.begin(), m.layer_height_profile.end()));
+        // Orca's slicing reads "layer_height" from every range (the GUI always
+        // stores it); default it to the print's layer height. Overlapping ranges
+        // are dropped (Orca's object list doesn't allow them).
+        double default_lh = 0.2;
+        if (auto lh = job.config.find("layer_height"); lh != job.config.end()) {
+            try { default_lh = lh->is_string() ? std::stod(lh->get<std::string>()) : lh->get<double>(); } catch (...) {}
+        }
+        std::vector<std::pair<double, double>> taken;
+        for (const json& r : m.layer_ranges) {
+            if (!r.is_object() || !r.contains("min") || !r.contains("max") || !r["min"].is_number() || !r["max"].is_number()) continue;
+            const double lo = r["min"].get<double>(), hi = r["max"].get<double>();
+            if (!(hi > lo) || !std::isfinite(lo) || !std::isfinite(hi) || lo < 0) continue;
+            bool overlap = false;
+            for (auto& t : taken) if (lo < t.second && t.first < hi) overlap = true;
+            if (overlap) continue;
+            taken.emplace_back(lo, hi);
+            DynamicPrintConfig rc;
+            if (auto c = r.find("config"); c != r.end() && c->is_object()) load_config_json(rc, *c, substitutions);
+            if (!rc.has("layer_height") || rc.opt_float("layer_height") <= 0) rc.set_key_value("layer_height", new ConfigOptionFloat(default_lh));
+            obj->layer_config_ranges[{lo, hi}].assign_config(rc);
+        }
 
         if (!m.config.empty()) {
             DynamicPrintConfig oc;
@@ -400,6 +477,50 @@ int slice_impl(const char* job_json, int job_len, const uint8_t* blob, int blob_
                     throw cs::JobError(o->name + " is taller than the printer's maximum print height (" +
                                        std::to_string(int(max_h)) + " mm).");
             }
+    }
+
+    // Plate custom G-code (colour changes / pauses / custom) — Orca keys these per plate.
+    if (!job.custom_gcodes.empty()) {
+        CustomGCode::Info info;
+        info.mode = filament_count > 1 ? CustomGCode::MultiAsSingle : CustomGCode::SingleExtruder;
+        for (const json& g : job.custom_gcodes) {
+            if (!g.is_object() || !g.contains("z")) continue;
+            CustomGCode::Item it;
+            it.print_z = g["z"].get<double>();
+            const std::string t = g.value("type", std::string("color_change"));
+            it.type = t == "pause" ? CustomGCode::PausePrint : t == "custom" ? CustomGCode::Custom
+                    : t == "tool_change" ? CustomGCode::ToolChange : t == "template" ? CustomGCode::Template : CustomGCode::ColorChange;
+            it.extruder = g.value("extruder", 1);
+            it.color = g.value("color", std::string());
+            it.extra = g.value("extra", std::string());
+            info.gcodes.push_back(it);
+        }
+        std::sort(info.gcodes.begin(), info.gcodes.end());
+        model.plates_custom_gcodes[0] = info;
+    }
+    if (!job.calib.empty()) {
+        Calib_Params cp;
+        static const std::map<std::string, CalibMode> modes = {
+            {"pa_line", CalibMode::Calib_PA_Line}, {"pa_pattern", CalibMode::Calib_PA_Pattern}, {"pa_tower", CalibMode::Calib_PA_Tower},
+            {"flow_rate", CalibMode::Calib_Flow_Rate}, {"temp_tower", CalibMode::Calib_Temp_Tower}, {"vol_speed_tower", CalibMode::Calib_Vol_speed_Tower},
+            {"vfa_tower", CalibMode::Calib_VFA_Tower}, {"retraction_tower", CalibMode::Calib_Retraction_tower},
+            {"input_shaping_freq", CalibMode::Calib_Input_shaping_freq}, {"input_shaping_damp", CalibMode::Calib_Input_shaping_damp},
+            {"cornering", CalibMode::Calib_Cornering}};
+        auto mi = modes.find(job.calib.value("mode", std::string()));
+        if (mi == modes.end()) throw cs::JobError("unknown calibration mode");
+        cp.mode = mi->second;
+        cp.start = job.calib.value("start", 0.0);
+        cp.end = job.calib.value("end", 0.0);
+        cp.step = job.calib.value("step", 0.0);
+        cp.print_numbers = job.calib.value("printNumbers", true);
+        cp.extruder_id = job.calib.value("extruderId", 0);
+        cp.freqStartX = job.calib.value("freqStartX", 0.0); cp.freqEndX = job.calib.value("freqEndX", 0.0);
+        cp.freqStartY = job.calib.value("freqStartY", 0.0); cp.freqEndY = job.calib.value("freqEndY", 0.0);
+        cp.test_model = job.calib.value("testModel", 0);
+        cp.shaper_type = job.calib.value("shaperType", std::string());
+        if (auto a = job.calib.find("accelerations"); a != job.calib.end() && a->is_array()) for (const json& v : *a) cp.accelerations.push_back(v.get<double>());
+        if (auto a = job.calib.find("speeds"); a != job.calib.end() && a->is_array()) for (const json& v : *a) cp.speeds.push_back(v.get<double>());
+        print.set_calib_params(cp);
     }
 
     print.apply(model, config);
@@ -677,5 +798,520 @@ EMSCRIPTEN_KEEPALIVE int cs_orient(const char* job_json, int job_len, const uint
 }
 
 EMSCRIPTEN_KEEPALIVE void cs_free(void* p) { std::free(p); }
+
+} // extern "C"
+
+
+// =============================================================================
+// Engine tools (cs_tool): painting sessions (TriangleSelector), model cut with
+// connectors (Cut + GLGizmoCut3D::apply_cut_connectors), variable layer height
+// profiles. One entry point, dispatched by "op":
+//   job  = { op, args, meshes: [{ vertexOffset, vertexCount, indexOffset, triangleCount }] }
+//   blob = mesh data (float32 xyz + uint32 triangles) the mesh entries point into
+//   out  = { ok, error, result, meshes: [...] } + a blob with the result meshes.
+// Painting sessions live across calls (the web worker keeps one instance for
+// tools); every call frees what it allocates.
+// =============================================================================
+namespace {
+
+struct ToolMesh { std::vector<float> positions; std::vector<uint32_t> indices; };
+
+std::vector<ToolMesh> parse_tool_meshes(const json& j, const uint8_t* blob, int blob_len)
+{
+    std::vector<ToolMesh> out;
+    auto ms = j.find("meshes");
+    if (ms == j.end() || !ms->is_array()) return out;
+    if (ms->size() > 4096) throw cs::JobError("too many meshes");
+    const uint64_t len = uint64_t(blob_len < 0 ? 0 : blob_len);
+    for (const json& m : *ms) {
+        if (!m.is_object()) throw cs::JobError("mesh entry must be an object");
+        const uint64_t voff = cs::get_u64(m, "vertexOffset"), vcnt = cs::get_u64(m, "vertexCount");
+        const uint64_t ioff = cs::get_u64(m, "indexOffset"), tcnt = cs::get_u64(m, "triangleCount");
+        if (voff % 4 || ioff % 4) throw cs::JobError("mesh offsets must be 4-byte aligned");
+        if (vcnt < 3 || tcnt < 1 || vcnt > 0x7fffffffu || tcnt > 0x7fffffffu) throw cs::JobError("bad mesh size");
+        if (!cs::checked_range(voff, vcnt, 12, len) || !cs::checked_range(ioff, tcnt, 12, len)) throw cs::JobError("mesh range out of bounds");
+        ToolMesh t;
+        t.positions.resize(vcnt * 3);
+        std::memcpy(t.positions.data(), blob + voff, vcnt * 12);
+        for (float f : t.positions) if (!std::isfinite(f)) throw cs::JobError("non-finite vertex");
+        t.indices.resize(tcnt * 3);
+        std::memcpy(t.indices.data(), blob + ioff, tcnt * 12);
+        for (uint32_t i : t.indices) if (i >= vcnt) throw cs::JobError("triangle index out of range");
+        out.emplace_back(std::move(t));
+    }
+    return out;
+}
+
+// All triangles kept (painting indexes the host's triangles).
+indexed_triangle_set to_its(const ToolMesh& m)
+{
+    indexed_triangle_set its;
+    its.vertices.reserve(m.positions.size() / 3);
+    for (size_t i = 0; i + 2 < m.positions.size(); i += 3) its.vertices.emplace_back(m.positions[i], m.positions[i + 1], m.positions[i + 2]);
+    its.indices.reserve(m.indices.size() / 3);
+    for (size_t i = 0; i + 2 < m.indices.size(); i += 3) its.indices.emplace_back(int(m.indices[i]), int(m.indices[i + 1]), int(m.indices[i + 2]));
+    return its;
+}
+
+Transform3d json_matrix(const json& a, const char* what)
+{
+    if (!a.is_array() || a.size() != 16) throw cs::JobError(std::string(what) + " must be 16 numbers");
+    Transform3d t;
+    for (int i = 0; i < 16; ++i) {
+        const double v = a[i].get<double>();
+        if (!std::isfinite(v)) throw cs::JobError(std::string(what) + " is not finite");
+        t.matrix().data()[i] = v; // column-major, like Eigen
+    }
+    return t;
+}
+
+Vec3f json_vec3f(const json& a, const char* what)
+{
+    if (!a.is_array() || a.size() != 3) throw cs::JobError(std::string(what) + " must be 3 numbers");
+    return Vec3f(a[0].get<float>(), a[1].get<float>(), a[2].get<float>());
+}
+
+// FacetsAnnotation can only live inside a ModelVolume: a throwaway one to
+// (de)serialise paint strings through.
+struct ScratchAnnotation {
+    Model model;
+    ModelVolume* vol = nullptr;
+    ScratchAnnotation() { vol = model.add_object()->add_volume(TriangleMesh(its_make_cube(1., 1., 1.))); }
+    FacetsAnnotation& fa() { return vol->supported_facets; }
+};
+
+struct ToolOut {
+    json result = json::object();
+    std::vector<indexed_triangle_set> meshes;
+};
+
+// Paint strings of one FacetsAnnotation as [[triangle, hex], ...].
+json paint_map(const FacetsAnnotation& fa)
+{
+    json arr = json::array();
+    for (const auto& m : fa.get_data().triangles_to_split)
+        arr.push_back({m.triangle_idx, fa.get_triangle_as_string(m.triangle_idx)});
+    return arr;
+}
+
+void load_paint_map(FacetsAnnotation& fa, const json& arr, int n_tris)
+{
+    if (!arr.is_array()) return;
+    fa.reserve(int(arr.size()));
+    for (const json& e : arr) {
+        if (!e.is_array() || e.size() != 2 || !e[0].is_number_integer() || !e[1].is_string()) continue;
+        const long long t = e[0].get<long long>();
+        const std::string& hex = e[1].get_ref<const std::string&>();
+        if (t < 0 || t >= n_tris || hex.empty() || hex.find_first_not_of("0123456789ABCDEFabcdef") != std::string::npos) continue;
+        fa.set_triangle_from_string(int(t), hex);
+    }
+    fa.shrink_to_fit();
+}
+
+// ---- painting sessions ---------------------------------------------------------
+struct PaintSession {
+    TriangleMesh mesh;
+    std::unique_ptr<TriangleSelector> sel;
+    int max_state = 2;
+};
+std::map<int, std::unique_ptr<PaintSession>> g_paint;
+int g_paint_next = 1;
+
+PaintSession& session(const json& args)
+{
+    const int h = args.value("handle", 0);
+    auto it = g_paint.find(h);
+    if (it == g_paint.end()) throw cs::JobError("unknown painting session");
+    return *it->second;
+}
+
+void emit_facets(PaintSession& ps, ToolOut& out)
+{
+    json states = json::array();
+    for (int st = 1; st <= ps.max_state; ++st) {
+        indexed_triangle_set its = ps.sel->get_facets(EnforcerBlockerType(st));
+        if (its.indices.empty()) continue;
+        states.push_back(st);
+        out.meshes.emplace_back(std::move(its));
+    }
+    out.result["states"] = states;
+}
+
+void op_paint_open(const json& args, std::vector<ToolMesh>& meshes, ToolOut& out)
+{
+    if (meshes.size() != 1) throw cs::JobError("paint_open needs one mesh");
+    if (g_paint.size() > 32) throw cs::JobError("too many painting sessions");
+    auto ps = std::make_unique<PaintSession>();
+    ps->mesh = TriangleMesh(to_its(meshes[0]));
+    ps->sel = std::make_unique<TriangleSelector>(ps->mesh, float(args.value("edgeLimit", 0.6)));
+    ps->max_state = std::clamp(args.value("maxState", 2), 1, int(EnforcerBlockerType::ExtruderMax));
+    if (auto p = args.find("paint"); p != args.end() && p->is_array() && !p->empty()) {
+        ScratchAnnotation sa;
+        load_paint_map(sa.fa(), *p, int(ps->mesh.its.indices.size()));
+        ps->sel->deserialize(sa.fa().get_data(), true);
+    }
+    const int h = g_paint_next++;
+    emit_facets(*ps, out);
+    g_paint[h] = std::move(ps);
+    out.result["handle"] = h;
+}
+
+void op_paint_apply(const json& args, ToolOut& out)
+{
+    PaintSession& ps = session(args);
+    const std::string kind = args.value("kind", std::string("circle"));
+    const int state = std::clamp(args.value("state", 1), 0, ps.max_state);
+    const EnforcerBlockerType st = EnforcerBlockerType(state);
+    const int facet = args.value("facet", -1);
+    const Transform3d trafo = args.contains("trafo") ? json_matrix(args["trafo"], "trafo") : Transform3d::Identity();
+    Transform3d trafo_nt = trafo;
+    trafo_nt.translation() = Vec3d::Zero();
+    TriangleSelector::ClippingPlane clp;
+    if (auto c = args.find("clip"); c != args.end() && c->is_array() && c->size() == 4)
+        clp = TriangleSelector::ClippingPlane({(*c)[0].get<float>(), (*c)[1].get<float>(), (*c)[2].get<float>(), (*c)[3].get<float>()});
+    const float overhang = args.value("overhang", 0.f);
+    const int n = int(ps.mesh.its.indices.size());
+    if (kind == "clear") {
+        ps.sel->reset();
+    } else if (kind != "none") {
+        if (facet < 0 || facet >= n) throw cs::JobError("facet out of range");
+        const Vec3f pt = json_vec3f(args["point"], "point");
+        const Vec3f cam = json_vec3f(args["camera"], "camera");
+        const float radius = std::max(0.05f, args.value("radius", 2.f));
+        if (kind == "circle" || kind == "sphere" || kind == "pointer") {
+            const auto type = kind == "circle" ? TriangleSelector::CIRCLE : kind == "sphere" ? TriangleSelector::SPHERE : TriangleSelector::POINTER;
+            std::unique_ptr<TriangleSelector::Cursor> cursor;
+            if (auto pv = args.find("prev"); pv != args.end() && pv->is_array() && kind != "pointer")
+                cursor = TriangleSelector::DoublePointCursor::cursor_factory(json_vec3f(*pv, "prev"), pt, cam, radius, type, trafo, clp);
+            else
+                cursor = TriangleSelector::SinglePointCursor::cursor_factory(pt, cam, radius, type, trafo, clp);
+            ps.sel->select_patch(facet, std::move(cursor), st, trafo_nt, kind != "pointer", overhang);
+        } else if (kind == "height") {
+            const float z_world = args.value("zWorld", 0.f);
+            auto cursor = TriangleSelector::SinglePointCursor::cursor_factory(z_world, cam, radius, trafo, clp);
+            ps.sel->select_patch(facet, std::move(cursor), st, trafo_nt, true, 0.f);
+        } else if (kind == "fill") {
+            ps.sel->seed_fill_select_triangles(pt, facet, trafo_nt, clp, args.value("angle", 30.f), overhang, true);
+            ps.sel->seed_fill_apply_on_triangles(st);
+        } else if (kind == "bucket") {
+            ps.sel->bucket_fill_select_triangles(pt, facet, clp, args.value("angle", 30.f), true, true);
+            ps.sel->seed_fill_apply_on_triangles(st);
+        } else {
+            throw cs::JobError("unknown paint tool '" + kind + "'");
+        }
+    }
+    emit_facets(ps, out);
+}
+
+void op_paint_get(const json& args, ToolOut& out)
+{
+    PaintSession& ps = session(args);
+    ScratchAnnotation sa;
+    sa.fa().set(*ps.sel);
+    out.result["paint"] = paint_map(sa.fa());
+}
+
+void op_paint_close(const json& args, ToolOut&)
+{
+    g_paint.erase(args.value("handle", 0));
+}
+
+void op_paint_from_states(const json& args, std::vector<ToolMesh>& meshes, ToolOut& out)
+{
+    if (meshes.size() != 1) throw cs::JobError("paint_from_states needs one mesh");
+    TriangleMesh mesh(to_its(meshes[0]));
+    TriangleSelector sel(mesh);
+    const int n = int(mesh.its.indices.size());
+    if (auto sts = args.find("states"); sts != args.end() && sts->is_array())
+        for (const json& e : *sts) {
+            if (!e.is_array() || e.size() != 2) continue;
+            const int t = e[0].get<int>(), s = e[1].get<int>();
+            if (t < 0 || t >= n || s < 0 || s > int(EnforcerBlockerType::ExtruderMax)) continue;
+            sel.set_facet(t, EnforcerBlockerType(s));
+        }
+    ScratchAnnotation sa;
+    sa.fa().set(sel);
+    out.result["paint"] = paint_map(sa.fa());
+}
+
+// ---- variable layer height -----------------------------------------------------
+std::unique_ptr<Model> single_object_model(const ToolMesh& m, const json& args)
+{
+    auto model = std::make_unique<Model>();
+    ModelObject* obj = model->add_object();
+    double T[16];
+    const Transform3d tm = args.contains("transform") ? json_matrix(args["transform"], "transform") : Transform3d::Identity();
+    std::memcpy(T, tm.matrix().data(), sizeof T);
+    obj->add_volume(bed_mesh(m.positions, m.indices, T, "object"));
+    const Vec3d centre = obj->raw_mesh_bounding_box().center();
+    obj->center_around_origin(false);
+    obj->add_instance()->set_offset(centre);
+    obj->ensure_on_bed();
+    return model;
+}
+
+SlicingParameters tool_slicing_params(const ModelObject& obj, const json& args)
+{
+    DynamicPrintConfig cfg = DynamicPrintConfig::full_print_config();
+    json subs = json::array();
+    if (auto c = args.find("config"); c != args.end() && c->is_object()) load_config_json(cfg, *c, subs);
+    const float max_z = float(obj.instance_bounding_box(0).max.z());
+    return PrintObject::slicing_parameters(cfg, obj, max_z, Vec3d::Ones());
+}
+
+void op_layer_profile(const json& args, std::vector<ToolMesh>& meshes, ToolOut& out, bool smooth)
+{
+    if (meshes.size() != 1) throw cs::JobError("layer profile needs one mesh");
+    auto model = single_object_model(meshes[0], args);
+    const ModelObject& obj = *model->objects.front();
+    const SlicingParameters sp = tool_slicing_params(obj, args);
+    std::vector<double> profile;
+    if (!smooth) {
+        profile = layer_height_profile_adaptive(sp, obj, std::clamp(args.value("quality", 0.5f), 0.f, 1.f));
+    } else {
+        std::vector<double> in;
+        if (auto p = args.find("profile"); p != args.end() && p->is_array()) for (const json& v : *p) in.push_back(v.get<double>());
+        if (in.size() < 4 || in.size() % 2) throw cs::JobError("profile must be [z, h] pairs");
+        profile = smooth_height_profile(in, sp, HeightProfileSmoothingParams(unsigned(std::clamp(args.value("radius", 5), 1, 10)), args.value("keepMin", false)));
+    }
+    out.result["profile"] = profile;
+}
+
+// ---- cut --------------------------------------------------------------------------
+indexed_triangle_set connector_mesh(const CutConnectorAttributes& a, float snap_space, float snap_bulge)
+{
+    int sectors = 1;
+    switch (a.shape) {
+    case CutConnectorShape::Triangle: sectors = 3; break;
+    case CutConnectorShape::Square: sectors = 4; break;
+    case CutConnectorShape::Circle: sectors = 360; break;
+    case CutConnectorShape::Hexagon: sectors = 6; break;
+    default: break;
+    }
+    if (a.type == CutConnectorType::Snap) return its_make_snap(1.0, 1.0, snap_space, snap_bulge);
+    if (a.style == CutConnectorStyle::Prism) return its_make_cylinder(1.0, 1.0, 2 * PI / sectors);
+    if (a.type == CutConnectorType::Plug) return its_make_frustum(1.0, 1.0, 2 * PI / sectors);
+    return its_make_frustum_dowel(1.0, 1.0, sectors);
+}
+
+// GLGizmoCut3D's update_object_cut_id.
+void update_cut_id(CutObjectBase& cut_id, ModelObjectCutAttributes attributes, int dowels_count)
+{
+    if (!attributes.has(ModelObjectCutAttribute::KeepUpper) || !attributes.has(ModelObjectCutAttribute::KeepLower) ||
+        attributes.has(ModelObjectCutAttribute::InvalidateCutInfo))
+        return;
+    if (cut_id.id().invalid()) cut_id.init();
+    int n = -1;
+    if (attributes.has(ModelObjectCutAttribute::KeepUpper)) n++;
+    if (attributes.has(ModelObjectCutAttribute::KeepLower)) n++;
+    if (attributes.has(ModelObjectCutAttribute::CreateDowels)) n += dowels_count;
+    if (n > 0) cut_id.increase_check_sum(size_t(n));
+}
+
+void op_cut(const json& args, std::vector<ToolMesh>& meshes, ToolOut& out)
+{
+    const json vols = args.value("volumes", json::array());
+    if (!vols.is_array() || vols.empty() || vols.size() != meshes.size()) throw cs::JobError("cut: one volume entry per mesh");
+    Model model;
+    ModelObject* mo = model.add_object();
+    mo->name = args.value("name", std::string("Object"));
+    for (size_t i = 0; i < vols.size(); ++i) {
+        const json& v = vols[i];
+        TriangleMesh mesh(to_its(meshes[i]));
+        if (mesh.volume() < 0) mesh.flip_triangles();
+        ModelVolume* mv = mo->add_volume(std::move(mesh), volume_type(v.value("type", std::string("part"))), false);
+        mv->name = v.value("name", std::string("Part"));
+        mv->set_transformation(json_matrix(v.at("transform"), "volume transform"));
+        std::vector<int> ident(mv->mesh().its.indices.size());
+        for (size_t k = 0; k < ident.size(); ++k) ident[k] = int(k);
+        if (auto p = v.find("paint"); p != v.end()) apply_paint(mv, *p, ident);
+        if (auto c = v.find("config"); c != v.end() && c->is_object() && !c->empty()) {
+            DynamicPrintConfig vc; json subs = json::array();
+            load_config_json(vc, *c, subs);
+            mv->config.assign_config(vc);
+        }
+    }
+    ModelInstance* inst = mo->add_instance();
+    if (auto off = args.find("offset"); off != args.end()) {
+        const Vec3f o = json_vec3f(*off, "offset");
+        inst->set_offset(o.cast<double>());
+    }
+    const json cut = args.value("cut", json::object());
+    const Transform3d cut_matrix = json_matrix(cut.at("matrix"), "cut matrix"); // object space (world minus instance offset)
+    Transform3d rotation_m = Transform3d::Identity();
+    rotation_m.linear() = cut_matrix.linear();
+    const Vec3d normal = (rotation_m * Vec3d::UnitZ()).normalized();
+
+    // Connectors (GLGizmoCut3D::apply_connectors_in_model + apply_cut_connectors).
+    int dowels = 0;
+    const json cons = cut.value("connectors", json::array());
+    const bool groove = cut.value("mode", std::string("plane")) == "groove";
+    if (!groove && cons.is_array() && !cons.empty()) {
+        mo->cut_id.init();
+        size_t id = mo->cut_id.connectors_cnt();
+        for (const json& c : cons) {
+            CutConnector cc;
+            cc.pos = json_vec3f(c.at("pos"), "connector pos").cast<double>();
+            cc.rotation_m = rotation_m;
+            cc.radius = c.value("radius", 5.f);
+            cc.height = c.value("height", 10.f);
+            cc.radius_tolerance = c.value("radiusTolerance", 0.f);
+            cc.height_tolerance = c.value("heightTolerance", 0.1f);
+            cc.z_angle = c.value("zAngle", 0.f);
+            const std::string t = c.value("type", std::string("plug")), st = c.value("style", std::string("prism")), sh = c.value("shape", std::string("circle"));
+            cc.attribs.type = t == "dowel" ? CutConnectorType::Dowel : t == "snap" ? CutConnectorType::Snap : CutConnectorType::Plug;
+            cc.attribs.style = st == "frustum" ? CutConnectorStyle::Frustum : CutConnectorStyle::Prism;
+            cc.attribs.shape = sh == "triangle" ? CutConnectorShape::Triangle : sh == "square" ? CutConnectorShape::Square
+                             : sh == "hexagon" ? CutConnectorShape::Hexagon : CutConnectorShape::Circle;
+            if (cc.attribs.type == CutConnectorType::Dowel) {
+                if (cc.attribs.style == CutConnectorStyle::Prism) cc.height *= 2;
+                dowels++;
+            } else {
+                cc.pos += normal * 0.5 * double(cc.height);
+            }
+            TriangleMesh cm(connector_mesh(cc.attribs, c.value("snapSpace", 0.3f), c.value("snapBulge", 0.15f)));
+            ModelVolume* nv = mo->add_volume(std::move(cm), ModelVolumeType::NEGATIVE_VOLUME);
+            nv->set_transformation(Geometry::translation_transform(cc.pos) * cc.rotation_m *
+                                   Geometry::rotation_transform(-cc.z_angle * Vec3d::UnitZ()) *
+                                   Geometry::scale_transform(Vec3d(cc.radius, cc.radius, cc.height)));
+            nv->cut_info = { cc.attribs.type, cc.radius_tolerance, cc.height_tolerance };
+            nv->name = "Connector-" + std::to_string(++id);
+        }
+        mo->cut_id.increase_connectors_cnt(cons.size());
+    }
+    const bool has_connectors = !groove && cons.is_array() && !cons.empty();
+    auto flag = [&](const char* k, bool d = false) { return cut.value(k, d); };
+    ModelObjectCutAttributes attrs =
+        only_if(has_connectors || flag("keepUpper", true), ModelObjectCutAttribute::KeepUpper) |
+        only_if(has_connectors || flag("keepLower", true), ModelObjectCutAttribute::KeepLower) |
+        only_if(!has_connectors && flag("keepAsParts"), ModelObjectCutAttribute::KeepAsParts) |
+        only_if(flag("placeOnCutUpper"), ModelObjectCutAttribute::PlaceOnCutUpper) |
+        only_if(flag("placeOnCutLower"), ModelObjectCutAttribute::PlaceOnCutLower) |
+        only_if(flag("flipUpper"), ModelObjectCutAttribute::FlipUpper) |
+        only_if(flag("flipLower"), ModelObjectCutAttribute::FlipLower) |
+        only_if(dowels > 0, ModelObjectCutAttribute::CreateDowels) |
+        only_if(!has_connectors && !groove, ModelObjectCutAttribute::InvalidateCutInfo) |
+        only_if(flag("keepPaint", true), ModelObjectCutAttribute::KeepPaint);
+    update_cut_id(mo->cut_id, attrs, dowels);
+
+    Cut cutter(mo, 0, cut_matrix, attrs);
+    const ModelObjectPtrs* result = nullptr;
+    if (groove) {
+        const json g = cut.value("groove", json::object());
+        Cut::Groove gr;
+        gr.depth = g.value("depth", 5.f); gr.width = g.value("width", 5.f);
+        gr.flaps_angle = g.value("flapsAngle", float(PI / 3)); gr.angle = g.value("angle", 0.f);
+        gr.depth_tolerance = g.value("depthTolerance", 0.1f); gr.width_tolerance = g.value("widthTolerance", 0.1f);
+        result = &cutter.perform_with_groove(gr, rotation_m, std::max(1, g.value("count", 1)), g.value("gap", 0.f),
+                                             g.value("radius", 50.f), flag("keepAsParts"));
+    } else {
+        result = &cutter.perform_with_plane();
+    }
+    json objs = json::array();
+    for (const ModelObject* no : *result) {
+        json jo;
+        jo["name"] = no->name;
+        const Transform3d it = no->instances.empty() ? Transform3d::Identity() : no->instances.front()->get_transformation().get_matrix();
+        jo["instance"] = std::vector<double>(it.matrix().data(), it.matrix().data() + 16);
+        json jv = json::array();
+        for (const ModelVolume* v : no->volumes) {
+            json e;
+            e["name"] = v->name;
+            const ModelVolumeType t = v->type();
+            e["type"] = t == ModelVolumeType::NEGATIVE_VOLUME ? "negative" : t == ModelVolumeType::PARAMETER_MODIFIER ? "modifier"
+                      : t == ModelVolumeType::SUPPORT_BLOCKER ? "support_blocker" : t == ModelVolumeType::SUPPORT_ENFORCER ? "support_enforcer" : "part";
+            const Transform3d vt = v->get_matrix();
+            e["transform"] = std::vector<double>(vt.matrix().data(), vt.matrix().data() + 16);
+            e["connector"] = v->cut_info.is_connector;
+            json paint = json::object();
+            if (!v->supported_facets.empty()) paint["support"] = paint_map(v->supported_facets);
+            if (!v->seam_facets.empty()) paint["seam"] = paint_map(v->seam_facets);
+            if (!v->mmu_segmentation_facets.empty()) paint["color"] = paint_map(v->mmu_segmentation_facets);
+            if (!v->fuzzy_skin_facets.empty()) paint["fuzzy"] = paint_map(v->fuzzy_skin_facets);
+            if (!paint.empty()) e["paint"] = paint;
+            e["mesh"] = int(out.meshes.size());
+            out.meshes.push_back(v->mesh().its);
+            jv.push_back(e);
+        }
+        jo["volumes"] = jv;
+        objs.push_back(jo);
+    }
+    out.result["objects"] = objs;
+}
+
+int tool_impl(const char* job_json, int job_len, const uint8_t* blob, int blob_len, std::string& out_json, std::string& out_blob)
+{
+    ToolOut out;
+    json rep = {{"ok", false}, {"error", nullptr}};
+    try {
+        if (!job_json || job_len <= 0) throw cs::JobError("empty request");
+        const json j = json::parse(job_json, job_json + job_len);
+        const std::string op = j.value("op", std::string());
+        const json args = j.value("args", json::object());
+        std::vector<ToolMesh> meshes = parse_tool_meshes(j, blob, blob_len);
+        if (op == "paint_open") op_paint_open(args, meshes, out);
+        else if (op == "paint_apply") op_paint_apply(args, out);
+        else if (op == "paint_get") op_paint_get(args, out);
+        else if (op == "paint_close") op_paint_close(args, out);
+        else if (op == "paint_from_states") op_paint_from_states(args, meshes, out);
+        else if (op == "layer_profile_adaptive") op_layer_profile(args, meshes, out, false);
+        else if (op == "layer_profile_smooth") op_layer_profile(args, meshes, out, true);
+        else if (op == "cut") op_cut(args, meshes, out);
+        else throw cs::JobError("unknown tool '" + op + "'");
+        rep["ok"] = true;
+    } catch (const std::bad_alloc&) {
+        rep["error"] = "out of memory";
+    } catch (const std::exception& e) {
+        rep["error"] = e.what();
+    }
+    // Pack result meshes: float32 positions then uint32 indices, 4-aligned.
+    json mj = json::array();
+    size_t size = 0;
+    for (const auto& m : out.meshes) size += m.vertices.size() * 12 + m.indices.size() * 12;
+    out_blob.assign(size, '\0');
+    size_t off = 0;
+    for (const auto& m : out.meshes) {
+        const size_t vb = m.vertices.size() * 12, ib = m.indices.size() * 12;
+        if (vb) std::memcpy(out_blob.data() + off, m.vertices.data(), vb);
+        if (ib) std::memcpy(out_blob.data() + off + vb, m.indices.data(), ib);
+        mj.push_back({{"vertexOffset", off}, {"vertexCount", m.vertices.size()}, {"indexOffset", off + vb}, {"triangleCount", m.indices.size()}});
+        off += vb + ib;
+    }
+    rep["result"] = out.result;
+    rep["meshes"] = mj;
+    out_json = rep.dump();
+    return rep["ok"].get<bool>() ? 0 : 1;
+}
+
+} // namespace
+
+extern "C" {
+
+EMSCRIPTEN_KEEPALIVE
+int cs_tool(const char* job_json, int job_len, const uint8_t* blob, int blob_len,
+            char** out_json, int* out_json_len, uint8_t** out_blob, int* out_blob_len)
+{
+    if (out_json) *out_json = nullptr;
+    if (out_json_len) *out_json_len = 0;
+    if (out_blob) *out_blob = nullptr;
+    if (out_blob_len) *out_blob_len = 0;
+    std::string js, bl;
+    int rc = 1;
+    try {
+        rc = serial_on_main_thread([&] { return tool_impl(job_json, job_len, blob, blob_len, js, bl); });
+    } catch (...) {
+        js = R"({"ok":false,"error":"engine error"})";
+        rc = 1;
+    }
+    if (cs::emit(js, out_json, out_json_len) != 0) return -1;
+    if (!bl.empty() && out_blob && out_blob_len) {
+        uint8_t* p = static_cast<uint8_t*>(std::malloc(bl.size()));
+        if (!p) return -1;
+        std::memcpy(p, bl.data(), bl.size());
+        *out_blob = p;
+        *out_blob_len = int(bl.size());
+    }
+    return rc;
+}
 
 } // extern "C"

@@ -200,7 +200,7 @@ set(_link
 # release builds) and the engine ABI exports — shared by both variants; the
 # pthreads build appends its extras below.
 set(_incoming "'locateFile','print','printErr','instantiateWasm','wasmBinary','getPreloadedPackage','onAbort','monitorRunDependencies','setStatus'")
-set(_exports "'_cs_version','_cs_describe_config','_cs_slice','_cs_eval_condition','_cs_orient','_cs_free','_malloc','_free'")
+set(_exports "'_cs_version','_cs_describe_config','_cs_slice','_cs_eval_condition','_cs_orient','_cs_tool','_cs_free','_malloc','_free'")
 if(ORCA_WASM_THREADS)
   # Worker pool. The host's engine Web Worker is the main runtime thread; it
   # starts each slice on a dedicated pthread (cs_slice_start) and returns to
