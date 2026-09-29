@@ -8,7 +8,7 @@
 // Multi-threaded builds (build-wasm-mt: exports cs_slice_start) slice on the
 // engine's own pthread and are awaited without blocking, like the web worker;
 // CS_THREADS=<n> overrides the thread count, CS_SYNC=1 forces plain cs_slice.
-import { readFileSync, existsSync, writeFileSync } from 'node:fs';
+import { readFileSync, existsSync } from 'node:fs';
 import { resolve, dirname, join } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 
@@ -202,7 +202,6 @@ const mixId = mf.result.filaments[0]?.id ?? 3;
 const mixed = await slice(mod, { ...cfg, mixed_filament_definitions: '' }, [{ ...box(20, 20, 10), transform: translate(130, 130, 0), config: { extruder: String(mixId) } }]);
 const t0 = (mixed.gcode.match(/^T0\b/gm) || []).length, t1 = (mixed.gcode.match(/^T1\b/gm) || []).length;
 ok(mixed.rc === 0 && t0 > 3 && t1 > 3, `object on mixed filament ${mixId} alternates tools (T0 ×${t0}, T1 ×${t1}) ${mixed.report?.error ?? ''}`);
-writeFileSync('/tmp/claude-1000/fs-mixed.gcode', mixed.gcode);
 
 // Gradient: red → blue along Z, and a 3-colour gradient; manual pattern.
 const cols3 = ['#FF0000', '#FFFF00', '#0000FF'];

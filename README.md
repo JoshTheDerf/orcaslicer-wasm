@@ -1,7 +1,7 @@
 # OrcaSlicer → WebAssembly (Cubby Slicer engine)
 
 OrcaSlicer **v2.4.2**'s `libslic3r` compiled to WebAssembly for
-[Cubby Slicer](https://github.com/JoshTheDerf/cubbyslicer). The engine exposes the Cubby Slicer ABI v1
+[Cubby Slicer](https://github.com/JoshTheDerf/cubbyslicer), the browser slicer that goes with the [CubbyCAD editor](https://cubbycad.com/editor). The engine exposes the Cubby Slicer ABI v1
 (`cs_version`, `cs_describe_config`, `cs_slice`, `cs_eval_condition`,
 `cs_orient`, `cs_tool`, `cs_free`), specified in `cubby-slicer/docs/ENGINE-CONTRACT.md`.
 
