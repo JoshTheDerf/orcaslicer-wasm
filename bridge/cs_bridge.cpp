@@ -618,6 +618,25 @@ std::string scope_of(const std::string& key)
     return "other";
 }
 
+// A default's text. Enum-list defaults are spelled from the definition's key
+// map: some forks build them without one (nothing to look names up in).
+std::string default_text(const ConfigOptionDef& def)
+{
+    if (!def.default_value) return std::string();
+    if (def.type == coEnums && def.enum_keys_map) {
+        const auto* v = dynamic_cast<const ConfigOptionInts*>(def.default_value.get());
+        if (v) {
+            std::string out;
+            for (size_t i = 0; i < v->values.size(); ++i) {
+                if (i) out += ',';
+                for (const auto& kv : *def.enum_keys_map) if (kv.second == v->values[i]) { out += kv.first; break; }
+            }
+            return out;
+        }
+    }
+    return def.default_value->serialize();
+}
+
 std::string describe_impl()
 {
     json opts = json::object();
@@ -633,7 +652,7 @@ std::string describe_impl()
         o["mode"] = mode_name(def.mode);
         o["min"] = number_or_null(def.min);
         o["max"] = number_or_null(def.max);
-        o["default"] = def.default_value ? def.default_value->serialize() : std::string();
+        o["default"] = default_text(def);
         if (!def.enum_values.empty()) {
             o["enumValues"] = def.enum_values;
             o["enumLabels"] = def.enum_labels.empty() ? def.enum_values : def.enum_labels;

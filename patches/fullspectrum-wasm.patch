@@ -315,6 +315,28 @@ index cd1e82d..8b03150 100644
  #include <vector>
  #include <string>
  #include <array>
+diff --git a/src/libslic3r/Config.hpp b/src/libslic3r/Config.hpp
+index cc2d686..a40bef6 100644
+--- a/src/libslic3r/Config.hpp
++++ b/src/libslic3r/Config.hpp
+@@ -1663,7 +1663,7 @@ class ConfigOptionEnumsGenericTempl : public ConfigOptionInts
+ public:
+     ConfigOptionEnumsGenericTempl(const t_config_enum_values *keys_map = nullptr) : keys_map(keys_map) {}
+     explicit ConfigOptionEnumsGenericTempl(const t_config_enum_values *keys_map, size_t size, int value) : ConfigOptionInts(size, value), keys_map(keys_map) {}
+-    explicit ConfigOptionEnumsGenericTempl(std::initializer_list<int> il) : ConfigOptionInts(std::move(il)), keys_map(keys_map) {}
++    explicit ConfigOptionEnumsGenericTempl(std::initializer_list<int> il) : ConfigOptionInts(std::move(il)) {}
+     explicit ConfigOptionEnumsGenericTempl(const std::vector<int> &vec) : ConfigOptionInts(vec) {}
+     explicit ConfigOptionEnumsGenericTempl(std::vector<int> &&vec) : ConfigOptionInts(std::move(vec)) {}
+ 
+@@ -1746,7 +1746,7 @@ private:
+             else
+                 throw ConfigurationError("Serializing NaN");
+         }
+-        else {
++        else if (this->keys_map != nullptr) {
+             for (const auto& kvp : *this->keys_map)
+                 if (kvp.second == v)
+                     ss << kvp.first;
 diff --git a/src/libslic3r/Feature/FuzzySkin/FuzzySkin.cpp b/src/libslic3r/Feature/FuzzySkin/FuzzySkin.cpp
 index 66fc90d..af7a61c 100644
 --- a/src/libslic3r/Feature/FuzzySkin/FuzzySkin.cpp
