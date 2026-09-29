@@ -1,9 +1,12 @@
 # OrcaSlicer → WebAssembly (Cubby Slicer engine)
 
 OrcaSlicer **v2.4.2**'s `libslic3r` compiled to WebAssembly for
-[Cubby Slicer](../../cubby-slicer). The engine exposes the Cubby Slicer ABI v1
+[Cubby Slicer](https://github.com/JoshTheDerf/cubby-slicer). The engine exposes the Cubby Slicer ABI v1
 (`cs_version`, `cs_describe_config`, `cs_slice`, `cs_eval_condition`,
-`cs_free`), specified in `cubby-slicer/docs/ENGINE-CONTRACT.md`.
+`cs_orient`, `cs_tool`, `cs_free`), specified in `cubby-slicer/docs/ENGINE-CONTRACT.md`.
+
+The same bridge and CMake also build **[Full Spectrum](#full-spectrum)**, the
+Snapmaker Orca fork with mixed filaments.
 
 ## Layout
 
@@ -11,21 +14,26 @@ OrcaSlicer **v2.4.2**'s `libslic3r` compiled to WebAssembly for
 orca/                       submodule, checked out at v2.4.2 + patches/orca-wasm.patch
 patches/orca-wasm.patch     everything changed in orca/ (regenerate: git -C orca diff > patches/orca-wasm.patch)
 bridge/cs_bridge.cpp        ABI implementation (job → Model/Print → G-code + report)
-../wasm-bridge/cs_common.hpp engine-neutral, bounds-checked job parsing (shared with preflight-wasm)
-wasm/CMakeLists.txt         superbuild (emcmake)
-wasm/cmake/                 find-modules: real deps from ../wasm-deps, stubs only for unlinked libs
+bridge/common/              engine-neutral, bounds-checked job parsing + fast strtod (same files in preflight-wasm)
+toolchain/                  bootstrap (emsdk/CMake/Ninja/m4) + dependency build, see toolchain/README.md
+wasm/CMakeLists.txt         superbuild (emcmake); ORCA_SRC_DIR / CS_ENGINE_ID select the tree
+wasm/cmake/                 find-modules: real deps from the toolchain prefix, stubs only for unlinked libs
 wasm/wasm_shims/            sequential TBB, single-thread Boost.Thread, MD5, OpenVDB stub (ST build)
 wasm/mt_pre.js, mt_post.js  pthreads build: thread count, csTerminateThreads, csSyncHeap
 scripts/build-wasm.sh       checkout + patch + build + schema
+scripts/build-fullspectrum.sh  the same for the FullSpectrum fork (fullspectrum/, patches/fullspectrum-wasm.patch)
 scripts/gen-schema.mjs      writes schema.json / version.json next to the build
 tests/cs-slice-test.mjs     end-to-end + robustness suite (node)
+tests/cs-tool-test.mjs      cs_tool: painting, layer profiles, cut + connectors / groove
+tests/cs-fs-test.mjs        FullSpectrum: U1 profile, mixed filaments, gradients, patterns
 wasm/tests/md5_selftest.cpp native check of the MD5 shim against md5sum
 ```
 
 ## Build
 
 ```bash
-bash ../wasm-deps/build-deps.sh all          # once: Emscripten 6.0.10 toolchain deps
+bash toolchain/bootstrap.sh                  # once: emsdk 6.0.10, CMake, Ninja, m4 (skip with a shared ../wasm-deps)
+bash toolchain/build-deps.sh all             # once: Boost, GMP, MPFR, CGAL, Eigen, … (same flags for every archive)
 bash scripts/build-wasm.sh                   # → build-wasm/slicer.{mjs,wasm,data} + schema.json + version.json
 node tests/cs-slice-test.mjs build-wasm      # must print ALL PASSED
 ```
@@ -33,7 +41,7 @@ node tests/cs-slice-test.mjs build-wasm      # must print ALL PASSED
 Multi-threaded variant (Emscripten pthreads + real oneTBB 2022.3.0):
 
 ```bash
-WASM_THREADS=1 bash ../wasm-deps/build-deps.sh all-mt   # once: -pthread deps → ../wasm-deps/install-mt
+WASM_THREADS=1 bash toolchain/build-deps.sh all-mt      # once: -pthread deps → toolchain/install-mt
 WASM_THREADS=1 bash scripts/build-wasm.sh               # → build-wasm-mt/ (same outputs)
 node tests/cs-slice-test.mjs build-wasm-mt              # ALL PASSED; CS_THREADS=n / CS_SYNC=1 knobs
 ```
@@ -110,3 +118,26 @@ BUILD_VARIANT=debug bash scripts/build-wasm.sh          # full -O1 -g2 SAFE_HEAP
 
 OCCT (STEP import), OpenVDB (SLA hollowing), OpenCV, Draco, networking/printer
 connectivity, multithreading in the ST build (see build-wasm-mt). Thumbnails are not generated (no renderer).
+
+## Full Spectrum
+
+[ratdoux/OrcaSlicer-FullSpectrum](https://github.com/ratdoux/OrcaSlicer-FullSpectrum)
+(Snapmaker Orca 2.3.6 + mixed filaments: virtual colours from alternating thin
+layers, Local-Z sublayers, gradients, image maps) builds from the same bridge
+with `ORCA_SRC_DIR` pointing at the fork:
+
+```bash
+bash scripts/build-fullspectrum.sh           # clones v0.9.14 → fullspectrum/, applies patches/fullspectrum-wasm.patch → build-fs/
+node tests/cs-fs-test.mjs build-fs
+```
+
+`patches/fullspectrum-wasm.patch` is `orca-wasm.patch` rebased onto the fork
+plus: MQTT / installer disabled headless, OpenCV and Assimp optional (photo
+calibration reader and extra mesh formats stubbed), libigl's removed
+`Eigen::DynamicSparseMatrix` replaced by triplets, missing includes, and a fix
+for `ConfigOptionEnumsGeneric`'s self-initialised `keys_map` (undefined
+behaviour; crashed `cs_describe_config`). The bridge detects the fork's older
+libslic3r API (`CS_ORCA_LEGACY_API`) and adds the `cs_tool` op
+`mixed_filaments` (list / add / edit / remove virtual filaments through the
+fork's own `MixedFilamentManager`, including gradients, multi-colour recipes,
+manual patterns, Local-Z caps and surface bias).

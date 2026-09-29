@@ -11,8 +11,12 @@
 set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT"
-# shellcheck disable=SC1091
-source "$ROOT/../wasm-deps/env.sh"
+# Toolchain: a shared ../wasm-deps checkout when present, else ./toolchain (see toolchain/README.md).
+if [[ -z "${WASM_DEPS_ENV:-}" ]]; then
+  if [[ -f "$ROOT/../wasm-deps/env.sh" ]]; then WASM_DEPS_ENV="$ROOT/../wasm-deps/env.sh"; else WASM_DEPS_ENV="$ROOT/toolchain/env.sh"; fi
+fi
+# shellcheck disable=SC1090
+source "$WASM_DEPS_ENV"
 
 VARIANT="${BUILD_VARIANT:-release}"
 BUILD_DIR="build-wasm"; [[ "$VARIANT" == "debug" ]] && BUILD_DIR="build-wasm-debug"

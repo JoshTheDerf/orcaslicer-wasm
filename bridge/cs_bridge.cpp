@@ -10,7 +10,7 @@
 //    into a trap at the JS boundary and leave the instance unusable).
 //  * Config goes through Orca's own ConfigBase::load_from_json(), so legacy
 //    key renames / value substitutions behave exactly like the desktop app.
-#include "../../wasm-bridge/cs_common.hpp"
+#include "common/cs_common.hpp"
 
 #include <libslic3r/libslic3r.h>
 #include <libslic3r/Config.hpp>

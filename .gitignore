@@ -182,3 +182,19 @@ web/public/wasm/tmp*
 /fullspectrum/
 /build-fs/
 /build-fs*.log
+
+# toolchain build products
+/toolchain/emsdk/
+/toolchain/cmake/
+/toolchain/cmake.app/
+/toolchain/tools/
+/toolchain/downloads/
+/toolchain/install/
+/toolchain/install-mt/
+/toolchain/src/
+/toolchain/src-mt/
+/toolchain/logs-mt/
+/toolchain/ccache-cache/
+/toolchain/*.log
+/deps/emsdk/
+/deps/boost-wasm/install/
