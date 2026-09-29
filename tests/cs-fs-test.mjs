@@ -203,4 +203,30 @@ const mixed = await slice(mod, { ...cfg, mixed_filament_definitions: '' }, [{ ..
 const t0 = (mixed.gcode.match(/^T0\b/gm) || []).length, t1 = (mixed.gcode.match(/^T1\b/gm) || []).length;
 ok(mixed.rc === 0 && t0 > 3 && t1 > 3, `object on mixed filament ${mixId} alternates tools (T0 ×${t0}, T1 ×${t1}) ${mixed.report?.error ?? ''}`);
 writeFileSync('/tmp/claude-1000/fs-mixed.gcode', mixed.gcode);
+
+// Gradient: red → blue along Z, and a 3-colour gradient; manual pattern.
+const cols3 = ['#FF0000', '#FFFF00', '#0000FF'];
+const g2 = tool(mod, 'mixed_filaments', { colors: cfg.filament_colour, definitions: '', edits: [{ op: 'add_definition', definition: {
+  components: [{ id: 1, percent: 50 }, { id: 2, percent: 50 }], gradient: { enabled: true, start: 1, end: 0 } } }] });
+const gf = g2.result?.filaments?.find((f) => f.gradient?.enabled);
+ok(g2.ok && gf && gf.custom, `add 2-colour gradient → ${JSON.stringify(gf ?? g2.error)}`);
+const g2b = tool(mod, 'mixed_filaments', { colors: cfg.filament_colour, definitions: g2.result.definitions });
+ok(g2b.ok && g2b.result.filaments.some((f) => f.gradient?.enabled && f.gradient.start > 0.95 && f.gradient.end < 0.05), 'gradient round-trips through definitions');
+const g3 = tool(mod, 'mixed_filaments', { colors: cols3, definitions: '', edits: [{ op: 'add_definition', definition: {
+  components: [{ id: 1, percent: 34 }, { id: 2, percent: 33 }, { id: 3, percent: 33 }], gradient: { enabled: true, stops: [0, 0.25, 0.5, 0.75, 1] } } }] });
+const g3f = g3.result?.filaments?.find((f) => f.components.length === 3);
+ok(g3.ok && g3f && g3f.gradient.enabled && g3f.gradient.stops.length === 5, `3-colour gradient → ${JSON.stringify(g3f?.gradient ?? g3.error)}`);
+const setp = tool(mod, 'mixed_filaments', { colors: cfg.filament_colour, definitions: g2.result.definitions, edits: [{ op: 'set', stableId: gf.stableId, definition: { gradient: { enabled: false }, localZMax: 3, distribution: 'layer_cycle', cadence: { a: 2, b: 1 } } }] });
+const sf = setp.result?.filaments?.find((f) => f.stableId === gf.stableId);
+ok(setp.ok && sf && !sf.gradient.enabled && sf.localZMax === 3 && sf.distribution === 'layer_cycle' && sf.cadence.a === 2, `set edits behaviour → ${JSON.stringify(sf ?? setp.error)}`);
+const pat = tool(mod, 'mixed_filaments', { colors: cfg.filament_colour, definitions: '', edits: [{ op: 'add_definition', definition: { kind: 'pattern', pattern: [[1, 1, 2]] } }] });
+ok(pat.ok && pat.result.filaments.some((f) => f.kind === 'pattern'), `manual pattern → ${pat.error ?? 'ok'}`);
+
+// Slice a gradient object: tool use should shift from T0 (bottom) to T1 (top).
+const gid = gf.id;
+const gs = await slice(mod, { ...cfg, mixed_filament_definitions: g2.result.definitions }, [{ ...box(20, 20, 20), transform: translate(130, 130, 0), config: { extruder: String(gid) } }]);
+const lines = gs.gcode.split('\n'); let z = 0, tool_ = 0; const lo = [0, 0], hi = [0, 0];
+for (const l of lines) { const m = /^;Z:([\d.]+)/.exec(l); if (m) z = +m[1]; const t = /^T(\d)\b/.exec(l); if (t) tool_ = +t[1];
+  if (/^G1 .*E\d/.test(l) && tool_ < 2) (z < 6 ? lo : z > 14 ? hi : [0, 0])[tool_]++; }
+ok(gs.rc === 0 && lo[0] > lo[1] && hi[1] > hi[0], `gradient slice: bottom T0/T1 moves ${lo}, top ${hi} ${gs.report?.error ?? ''}`);
 process.exit(failures ? 1 : 0);

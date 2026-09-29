@@ -1159,9 +1159,109 @@ void update_cut_id(CutObjectBase& cut_id, ModelObjectCutAttributes attributes, i
 #define CS_HAS_MIXED_FILAMENTS 1
 // FullSpectrum mixed (virtual) filaments: the same regeneration Print::apply
 // runs (auto pairs from the physical colours + the user's custom rows), plus
-// edits. args: { colors:[hex], definitions:"<mixed_filament_definitions>",
-// edits:[{op:"add",a,b,percent} | {op:"remove",stableId} | {op:"percent",stableId,percent}] }.
-// result: { definitions, filaments:[{id, stableId, custom, a, b, percent, components, color}] }.
+// edits, through the manager's typed definitions.
+//   args: { colors:[hex], definitions:"<mixed_filament_definitions>", edits:[...] }
+//   edits: {op:"add", a, b, percent} | {op:"add_definition", definition}
+//        | {op:"set", stableId, definition} | {op:"remove", stableId} | {op:"percent", stableId, percent}
+//   result: { definitions, filaments:[{id, stableId, custom, a, b, percent, color, kind,
+//             components:[{id, percent}], distribution, cadence:{a,b}, localZMax,
+//             gradient:{enabled, start, end, stops[], solidWidths[]}, offsets[], perimeterModulation,
+//             pattern:[[id...]...]}] }
+json mixed_definition_json(const MixedFilamentDefinition& d)
+{
+    json comps = json::array();
+    for (const auto& c : d.recipe.blend.components) comps.push_back({{"id", c.filament.id}, {"percent", c.percent}});
+    json pattern = json::array();
+    if (d.recipe.manual_pattern)
+        for (const auto& g : d.recipe.manual_pattern->groups) {
+            json grp = json::array();
+            for (const auto& r : g) grp.push_back(r.id);
+            pattern.push_back(grp);
+        }
+    const auto& gb = d.behavior.gradient;
+    return {
+        {"stableId", d.identity.stable_id},
+        {"custom", d.source.kind == MixedFilamentSourceKind::Custom},
+        {"kind", d.recipe.kind == MixedFilamentRecipeKind::ManualPattern ? "pattern" : "blend"},
+        {"components", comps},
+        {"distribution", d.behavior.distribution == MixedFilamentDistributionMode::LayerCycle ? "layer_cycle" : "simple"},
+        {"cadence", {{"a", d.behavior.layer_cadence.component_a_layers}, {"b", d.behavior.layer_cadence.component_b_layers}}},
+        {"localZMax", d.behavior.local_z.max_sublayers},
+        {"gradient", {{"enabled", gb.enabled}, {"start", gb.component_a_start}, {"end", gb.component_a_end},
+                      {"stops", gb.stop_positions}, {"solidWidths", gb.solid_widths}}},
+        {"offsets", d.behavior.surface_bias.component_offsets_mm},
+        {"offsetA", d.behavior.surface_bias.component_a_offset_mm},
+        {"offsetB", d.behavior.surface_bias.component_b_offset_mm},
+        {"perimeterModulation", d.behavior.surface_bias.perimeter_modulation},
+        {"pattern", pattern},
+        {"color", d.presentation.display_color},
+    };
+}
+
+// Apply the (partial) JSON onto a definition. Physical ids are clamped to 1..n.
+void apply_mixed_definition(MixedFilamentDefinition& d, const json& j, size_t n)
+{
+    if (!j.is_object()) throw cs::JobError("mixed filament: definition must be an object");
+    auto clampi = [](int v, int lo, int hi) { return std::max(lo, std::min(hi, v)); };
+    auto clampf = [](float v, float lo, float hi) { return std::isfinite(v) ? std::max(lo, std::min(hi, v)) : lo; };
+    if (auto c = j.find("components"); c != j.end() && c->is_array()) {
+        std::vector<MixedFilamentWeightedComponent> comps;
+        for (const json& e : *c) {
+            if (!e.is_object()) continue;
+            MixedFilamentWeightedComponent w;
+            w.filament.id = unsigned(clampi(e.value("id", 1), 1, int(n)));
+            w.percent = clampi(e.value("percent", 0), 0, 100);
+            comps.push_back(w);
+        }
+        if (comps.size() < 2 || comps.size() > n) throw cs::JobError("mixed filament: needs 2.." + std::to_string(n) + " components");
+        d.recipe.blend.components = std::move(comps);
+    }
+    if (auto k = j.find("kind"); k != j.end() && k->is_string())
+        d.recipe.kind = *k == "pattern" ? MixedFilamentRecipeKind::ManualPattern : MixedFilamentRecipeKind::WeightedBlend;
+    if (auto p = j.find("pattern"); p != j.end() && p->is_array()) {
+        MixedFilamentManualPattern mp;
+        for (const json& g : *p) {
+            if (!g.is_array()) continue;
+            std::vector<MixedFilamentPhysicalRef> grp;
+            for (const json& id : g) if (id.is_number_integer()) grp.push_back({unsigned(clampi(id.get<int>(), 1, int(n)))});
+            if (!grp.empty()) mp.groups.push_back(std::move(grp));
+        }
+        if (mp.groups.empty()) d.recipe.manual_pattern.reset(); else d.recipe.manual_pattern = std::move(mp);
+    }
+    if (d.recipe.kind == MixedFilamentRecipeKind::ManualPattern && !d.recipe.manual_pattern)
+        throw cs::JobError("mixed filament: a pattern needs at least one filament");
+    if (auto v = j.find("distribution"); v != j.end() && v->is_string())
+        d.behavior.distribution = *v == "layer_cycle" ? MixedFilamentDistributionMode::LayerCycle : MixedFilamentDistributionMode::Simple;
+    if (auto c = j.find("cadence"); c != j.end() && c->is_object()) {
+        d.behavior.layer_cadence.component_a_layers = clampi(c->value("a", 1), 1, 100);
+        d.behavior.layer_cadence.component_b_layers = clampi(c->value("b", 1), 1, 100);
+    }
+    if (auto v = j.find("localZMax"); v != j.end() && v->is_number()) d.behavior.local_z.max_sublayers = clampi(v->get<int>(), 0, 64);
+    if (auto g = j.find("gradient"); g != j.end() && g->is_object()) {
+        auto& gb = d.behavior.gradient;
+        gb.enabled = g->value("enabled", gb.enabled);
+        gb.component_a_start = clampf(g->value("start", gb.component_a_start), 0.f, 1.f);
+        gb.component_a_end = clampf(g->value("end", gb.component_a_end), 0.f, 1.f);
+        auto floats = [&](const char* key, std::vector<float>& out, float hi) {
+            if (auto a = g->find(key); a != g->end() && a->is_array()) {
+                out.clear();
+                for (const json& x : *a) if (x.is_number()) out.push_back(clampf(x.get<float>(), 0.f, hi));
+            }
+        };
+        floats("stops", gb.stop_positions, 1.f);
+        floats("solidWidths", gb.solid_widths, 1.f);
+        std::sort(gb.stop_positions.begin(), gb.stop_positions.end());
+    }
+    auto& sb = d.behavior.surface_bias;
+    if (auto o = j.find("offsets"); o != j.end() && o->is_array()) {
+        sb.component_offsets_mm.clear();
+        for (const json& x : *o) if (x.is_number()) sb.component_offsets_mm.push_back(clampf(x.get<float>(), -2.f, 2.f));
+    }
+    if (auto v = j.find("offsetA"); v != j.end() && v->is_number()) sb.component_a_offset_mm = clampf(v->get<float>(), -2.f, 2.f);
+    if (auto v = j.find("offsetB"); v != j.end() && v->is_number()) sb.component_b_offset_mm = clampf(v->get<float>(), -2.f, 2.f);
+    if (auto v = j.find("perimeterModulation"); v != j.end() && v->is_boolean()) sb.perimeter_modulation = v->get<bool>();
+}
+
 void op_mixed_filaments(const json& args, ToolOut& out)
 {
     std::vector<std::string> colors;
@@ -1173,12 +1273,28 @@ void op_mixed_filaments(const json& args, ToolOut& out)
     mgr.auto_generate(colors);
     mgr.load_custom_entries(args.value("definitions", std::string()), colors);
     auto clampi = [](int v, int lo, int hi) { return std::max(lo, std::min(hi, v)); };
+    auto index_of = [&](uint64_t id) -> int {
+        const auto defs = mgr.mixed_filament_definitions(n);
+        for (size_t i = 0; i < defs.size(); ++i) if (defs[i].identity.stable_id == id) return int(i);
+        return -1;
+    };
     for (const json& e : args.value("edits", json::array())) {
         const std::string op = e.value("op", std::string());
         if (op == "add") {
             const unsigned a = unsigned(e.value("a", 1)), b = unsigned(e.value("b", 2));
             if (a < 1 || b < 1 || a > n || b > n || a == b) throw cs::JobError("mixed filament: components must be two different physical filaments");
             mgr.add_custom_filament(a, b, clampi(e.value("percent", 50), 0, 100), colors);
+        } else if (op == "add_definition") {
+            MixedFilamentDefinition d;
+            d.recipe.blend.components = {{{1}, 50}, {{2}, 50}};
+            apply_mixed_definition(d, e.value("definition", json::object()), n);
+            mgr.add_custom_filament_definition(std::move(d), colors);
+        } else if (op == "set") {
+            const int i = index_of(e.value("stableId", uint64_t(0)));
+            if (i < 0) throw cs::JobError("mixed filament: unknown id");
+            MixedFilamentDefinition d = mgr.mixed_filament_definitions(n)[size_t(i)];
+            apply_mixed_definition(d, e.value("definition", json::object()), n);
+            mgr.set_mixed_filament_definition(size_t(i), d, colors);
         } else if (op == "remove" || op == "percent") {
             const uint64_t id = e.value("stableId", uint64_t(0));
             auto& rows = mgr.mixed_filaments();
@@ -1192,20 +1308,23 @@ void op_mixed_filaments(const json& args, ToolOut& out)
         }
     }
     mgr.refresh_display_colors(colors);
-    json list = json::array();
+    const std::string serialized = mgr.serialize_custom_entries();
+    const auto defs = mgr.mixed_filament_definitions(n);
     const auto& rows = mgr.mixed_filament_legacy_rows();
-    for (unsigned id = unsigned(n) + 1; id <= unsigned(n + rows.size()); ++id) {
+    json list = json::array();
+    for (unsigned id = unsigned(n) + 1; id <= unsigned(n + defs.size()); ++id) {
         const int idx = mgr.mixed_index_from_filament_id(id, n);
-        if (idx < 0 || size_t(idx) >= rows.size()) continue;
-        const MixedFilamentLegacyRow& r = rows[size_t(idx)];
-        if (r.deleted) continue;
-        json comps = json::array();
-        for (unsigned c : MixedFilamentManager::decode_gradient_component_ids(r.gradient_component_ids, n)) comps.push_back(c);
-        if (comps.empty()) comps = json::array({r.component_a, r.component_b});
-        list.push_back({{"id", id}, {"stableId", r.stable_id}, {"custom", r.custom}, {"a", r.component_a}, {"b", r.component_b},
-                        {"percent", r.mix_b_percent}, {"components", comps}, {"color", r.display_color}});
+        if (idx < 0 || size_t(idx) >= defs.size() || defs[size_t(idx)].visibility.tombstoned) continue;
+        json f = mixed_definition_json(defs[size_t(idx)]);
+        f["id"] = id;
+        if (size_t(idx) < rows.size()) {
+            const MixedFilamentLegacyRow& r = rows[size_t(idx)];
+            f["a"] = r.component_a; f["b"] = r.component_b; f["percent"] = r.mix_b_percent;
+            if (!r.display_color.empty()) f["color"] = r.display_color;
+        }
+        list.push_back(f);
     }
-    out.result["definitions"] = mgr.serialize_custom_entries();
+    out.result["definitions"] = serialized;
     out.result["filaments"] = list;
 }
 #endif
