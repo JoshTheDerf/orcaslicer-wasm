@@ -23,6 +23,7 @@
 #include <libslic3r/GCode/GCodeProcessor.hpp>
 #include <libslic3r/Layer.hpp>
 #include <libslic3r/Model.hpp>
+#include <libslic3r/Format/bbs_3mf.hpp>
 #if __has_include(<libslic3r/MixedFilament.hpp>)
 #include <libslic3r/MixedFilament.hpp>
 #endif
@@ -1467,6 +1468,111 @@ void op_cut(const json& args, std::vector<ToolMesh>& meshes, ToolOut& out)
     out.result["objects"] = objs;
 }
 
+#ifndef CS_ORCA_LEGACY_API
+// Load a 3MF with OrcaSlicer's own project loader (Format/bbs_3mf.cpp) and
+// describe what it read: lets hosts check that files they write open in
+// desktop Orca the same way. The raw 3MF bytes are the request blob.
+void op_inspect_3mf(const uint8_t* blob, int blob_len, ToolOut& out)
+{
+    if (!blob || blob_len <= 0) throw cs::JobError("inspect_3mf: empty file");
+    const std::string path = "/tmp/cs_inspect.3mf";
+    {
+        FILE* f = std::fopen(path.c_str(), "wb");
+        if (!f) throw cs::JobError("inspect_3mf: cannot write temp file");
+        std::fwrite(blob, 1, size_t(blob_len), f);
+        std::fclose(f);
+    }
+    DynamicPrintConfig config;
+    ConfigSubstitutionContext ctxt(ForwardCompatibilitySubstitutionRule::Enable);
+    Model model;
+    // The loader gives the model a backup dir (Model::get_backup_path). With
+    // one set, ~Model calls remove_backup(), whose _BBS_Backup_Manager singleton
+    // starts its worker with boost::thread; the single-threaded shim runs that
+    // loop inline and it never returns (timed_wait/wait are no-ops, and nothing
+    // can ever push Exit). Drop the dir and clear the path before ~Model, on
+    // every exit path, so the manager is never touched.
+    struct BackupDirGuard {
+        Model& m;
+        ~BackupDirGuard() { try { m.remove_backup_path_if_exist(); } catch (...) {} }
+    } backup_guard{model};
+    PlateDataPtrs plates;
+    std::vector<Preset*> presets;
+    bool is_bbl = false, is_orca = false;
+    Semver version;
+    const bool ok = load_bbs_3mf(path.c_str(), &config, &ctxt, &model, &plates, &presets, &is_bbl, &is_orca, &version, nullptr,
+                                 LoadStrategy::LoadModel | LoadStrategy::LoadConfig | LoadStrategy::Silence);
+    ::unlink(path.c_str());
+    if (!ok) throw cs::JobError("OrcaSlicer's 3MF loader rejected the file");
+    auto volume_type = [](ModelVolumeType t) {
+        return t == ModelVolumeType::NEGATIVE_VOLUME ? "negative" : t == ModelVolumeType::PARAMETER_MODIFIER ? "modifier"
+             : t == ModelVolumeType::SUPPORT_BLOCKER ? "support_blocker" : t == ModelVolumeType::SUPPORT_ENFORCER ? "support_enforcer" : "part";
+    };
+    auto trafo_of = [](const Geometry::Transformation& t) {
+        const Vec3d off = t.get_offset(), rot = t.get_rotation(), sc = t.get_scaling_factor();
+        return json{{"offset", {off.x(), off.y(), off.z()}}, {"rotation", {rot.x(), rot.y(), rot.z()}}, {"scale", {sc.x(), sc.y(), sc.z()}},
+                    {"mirror", t.is_left_handed()}};
+    };
+    json objs = json::array();
+    for (const ModelObject* o : model.objects) {
+        json vols = json::array();
+        for (const ModelVolume* v : o->volumes) {
+            json vc = json::object();
+            for (const std::string& k : v->config.keys()) vc[k] = v->config.opt_serialize(k);
+            vols.push_back({{"name", v->name}, {"type", volume_type(v->type())}, {"triangles", v->mesh().its.indices.size()},
+                            {"paint", {{"support", !v->supported_facets.empty()}, {"seam", !v->seam_facets.empty()},
+                                       {"color", !v->mmu_segmentation_facets.empty()}, {"fuzzy", !v->fuzzy_skin_facets.empty()}}},
+                            {"transform", trafo_of(v->get_transformation())}, {"config", vc}});
+        }
+        json oc = json::object();
+        for (const std::string& k : o->config.keys()) oc[k] = o->config.opt_serialize(k);
+        json inst = json::array();
+        for (const ModelInstance* i : o->instances) {
+            json ji = trafo_of(i->get_transformation());
+            ji["printable"] = i->printable;
+            inst.push_back(ji);
+        }
+        objs.push_back({{"name", o->name}, {"volumes", vols}, {"config", oc}, {"instances", inst},
+                        {"layerHeightProfile", o->layer_height_profile.get().size()}, {"layerRanges", o->layer_config_ranges.size()}});
+    }
+    json pl = json::array();
+    for (const PlateData* p : plates) {
+        json members = json::array();
+        for (const auto& oi : p->objects_and_instances) members.push_back({oi.first, oi.second});
+        // obj_inst_map: 3MF object id -> (instance index, identify_id), as model_settings.config lists them.
+        json map = json::array();
+        for (const auto& kv : p->obj_inst_map) map.push_back({kv.first, kv.second.first, kv.second.second});
+        json pcfg = json::object();
+        for (const std::string& k : p->config.keys()) pcfg[k] = p->config.opt_serialize(k);
+        pl.push_back({{"index", p->plate_index}, {"name", p->plate_name}, {"locked", p->locked}, {"instances", members},
+                      {"objInstMap", map}, {"config", pcfg}, {"thumbnail", p->thumbnail_file}, {"gcode", p->gcode_file}});
+    }
+    for (PlateData* p : plates) delete p;
+    for (Preset* p : presets) delete p;
+    out.result["isOrca"] = is_bbl || is_orca;
+    out.result["isBbl"] = is_bbl;
+    out.result["hasOrcaTag"] = is_orca; // desktop Orca: From_Orca only when set, else From_BBS
+    json cg = json::object();
+    for (const auto& [plate, info] : model.plates_custom_gcodes) {
+        json items = json::array();
+        for (const CustomGCode::Item& it : info.gcodes)
+            items.push_back({{"z", it.print_z}, {"type", int(it.type)}, {"extruder", it.extruder}, {"color", it.color}, {"extra", it.extra}});
+        cg[std::to_string(plate)] = {{"mode", int(info.mode)}, {"items", items}};
+    }
+    out.result["customGcodes"] = cg;
+    out.result["objects"] = objs;
+    out.result["plates"] = pl;
+    auto get = [&](const char* k) { return config.has(k) ? config.opt_serialize(k) : std::string(); };
+    out.result["settings"] = {{"printer", get("printer_settings_id")}, {"process", get("print_settings_id")}, {"filaments", get("filament_settings_id")},
+                              {"filament_colour", get("filament_colour")}, {"sparse_infill_density", get("sparse_infill_density")},
+                              {"layer_height", get("layer_height")}, {"keys", config.keys().size()}};
+    json pc = json::object();
+    for (const std::string& k : config.keys()) pc[k] = config.opt_serialize(k);
+    out.result["config"] = pc;
+    out.result["version"] = version.to_string();
+    out.result["substitutions"] = ctxt.substitutions.size();
+}
+#endif
+
 int tool_impl(const char* job_json, int job_len, const uint8_t* blob, int blob_len, std::string& out_json, std::string& out_blob)
 {
     ToolOut out;
@@ -1476,7 +1582,7 @@ int tool_impl(const char* job_json, int job_len, const uint8_t* blob, int blob_l
         const json j = json::parse(job_json, job_json + job_len);
         const std::string op = j.value("op", std::string());
         const json args = j.value("args", json::object());
-        std::vector<ToolMesh> meshes = parse_tool_meshes(j, blob, blob_len);
+        std::vector<ToolMesh> meshes = op == "inspect_3mf" ? std::vector<ToolMesh>{} : parse_tool_meshes(j, blob, blob_len);
         if (op == "paint_open") op_paint_open(args, meshes, out);
         else if (op == "paint_apply") op_paint_apply(args, out);
         else if (op == "paint_get") op_paint_get(args, out);
@@ -1485,6 +1591,9 @@ int tool_impl(const char* job_json, int job_len, const uint8_t* blob, int blob_l
         else if (op == "layer_profile_adaptive") op_layer_profile(args, meshes, out, false);
         else if (op == "layer_profile_smooth") op_layer_profile(args, meshes, out, true);
         else if (op == "cut") op_cut(args, meshes, out);
+#ifndef CS_ORCA_LEGACY_API
+        else if (op == "inspect_3mf") op_inspect_3mf(blob, blob_len, out);
+#endif
 #ifdef CS_HAS_MIXED_FILAMENTS
         else if (op == "mixed_filaments") op_mixed_filaments(args, out);
 #endif
