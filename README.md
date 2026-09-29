@@ -52,11 +52,11 @@ node tests/cs-slice-test.mjs build-wasm-mt              # ALL PASSED; CS_THREADS
   `cs_thread_count()`. `cs_slice_start` runs `cs_slice` on its own pthread
   (64 MB stack) and returns at once; `state[0]` flips to 1 (futex wake) when
   done, `state[1]` = return code. The host awaits it with `Atomics.waitAsync`
-  — it must NOT block: Emscripten starts a pthread requested by another
-  pthread (TBB's workers spawn each other) only when the main runtime thread
-  is back in its event loop. Plain `cs_slice` / `cs_orient` still work when
+  and must not block, because Emscripten only starts a pthread requested by
+  another pthread (TBB's workers spawn each other) once the main runtime
+  thread is back in its event loop. Plain `cs_slice` / `cs_orient` still work when
   called on the main runtime thread, but run inside a 1-slot
-  `tbb::task_arena` (serial) — otherwise Orca's TBB warm-up barrier in
+  `tbb::task_arena` (serial). Otherwise Orca's TBB warm-up barrier in
   `Print::process` would deadlock.
 * Threads: `csThreadCount()` = `Module.csThreads` or
   `navigator.hardwareConcurrency`, clamped to 2..16. The pthread pool
@@ -64,7 +64,7 @@ node tests/cs-slice-test.mjs build-wasm-mt              # ALL PASSED; CS_THREADS
   TBB is capped to the same number (`tbb::global_control`), so every TBB
   worker lands on a pre-loaded Worker.
 * Stacks: slicing thread 64 MB, TBB workers 16 MB (oneTBB's Emscripten
-  default is 64 KB — patched in build-deps.sh), `STACK_OVERFLOW_CHECK=2`.
+  default is 64 KB, patched in build-deps.sh), `STACK_OVERFLOW_CHECK=2`.
 * `Module.csSyncHeap()` refreshes `HEAP*` views after another thread grew
   memory; `Module.csTerminateThreads()` kills the instance's Workers (no
   teardown otherwise with `EXIT_RUNTIME=0`).
@@ -101,13 +101,13 @@ BUILD_VARIANT=debug bash scripts/build-wasm.sh          # full -O1 -g2 SAFE_HEAP
 
 ## Fixes carried in the patch (beyond build gating)
 
-* `Arachne/SkeletalTrapezoidation.cpp` — `interpolate()` computed
+* `Arachne/SkeletalTrapezoidation.cpp`: `interpolate()` computed
   `left.toolpath_locations.size() - 1` into a 64-bit `coord_t`; with wasm32's
   32-bit `size_t` an empty vector gives 4294967295 → out-of-bounds read (the
   "memory access out of bounds" crash seen in the browser on concentric infill).
-* `GCode/Thumbnails.cpp` — plain libjpeg has no RGBA input (convert), and the
+* `GCode/Thumbnails.cpp`: plain libjpeg has no RGBA input (convert), and the
   JPEG buffer was copied from the wrong pointer when `jpeg_mem_dest` reallocated.
-* `utils.cpp` — Boost.Log single-thread sink type; Boost.Locale NFC normalisation
+* `utils.cpp`: Boost.Log single-thread sink type; Boost.Locale NFC normalisation
   (a no-op without ICU) skipped.
 * Removed from the old v2.3.2 port: stubbed CGAL Voronoi planarity check
   (always "valid" → invalid diagrams reached Arachne), hand-rolled G-code layer
@@ -121,23 +121,19 @@ connectivity, multithreading in the ST build (see build-wasm-mt). Thumbnails are
 
 ## Full Spectrum
 
-[ratdoux/OrcaSlicer-FullSpectrum](https://github.com/ratdoux/OrcaSlicer-FullSpectrum)
-(Snapmaker Orca 2.3.6 + mixed filaments: virtual colours from alternating thin
-layers, Local-Z sublayers, gradients, image maps) builds from the same bridge
-with `ORCA_SRC_DIR` pointing at the fork:
+[Full Spectrum](https://github.com/ratdoux/OrcaSlicer-FullSpectrum) is a fork of Snapmaker Orca (2.3.6) that adds mixed filaments. It makes new colours by alternating very thin layers of the physical filaments, and supports gradients along Z. It shares enough of libslic3r with OrcaSlicer that the same bridge and CMake build it, with `ORCA_SRC_DIR` pointed at the fork:
 
 ```bash
-bash scripts/build-fullspectrum.sh           # clones v0.9.14 → fullspectrum/, applies patches/fullspectrum-wasm.patch → build-fs/
+bash scripts/build-fullspectrum.sh    # clones v0.9.14 into fullspectrum/, patches it, builds build-fs/
 node tests/cs-fs-test.mjs build-fs
 ```
 
-`patches/fullspectrum-wasm.patch` is `orca-wasm.patch` rebased onto the fork
-plus: MQTT / installer disabled headless, OpenCV and Assimp optional (photo
-calibration reader and extra mesh formats stubbed), libigl's removed
-`Eigen::DynamicSparseMatrix` replaced by triplets, missing includes, and a fix
-for `ConfigOptionEnumsGeneric`'s self-initialised `keys_map` (undefined
-behaviour; crashed `cs_describe_config`). The bridge detects the fork's older
-libslic3r API (`CS_ORCA_LEGACY_API`) and adds the `cs_tool` op
-`mixed_filaments` (list / add / edit / remove virtual filaments through the
-fork's own `MixedFilamentManager`, including gradients, multi-colour recipes,
-manual patterns, Local-Z caps and surface bias).
+`patches/fullspectrum-wasm.patch` is `orca-wasm.patch` rebased onto the fork, plus a few fork-specific changes:
+
+- MQTT and the Windows installer bits are skipped in headless builds.
+- OpenCV and Assimp are optional. Without them the photo calibration reader and the extra mesh formats are stubbed out.
+- libigl still used `Eigen::DynamicSparseMatrix`, which current Eigen removed. It builds from triplets now.
+- `ConfigOptionEnumsGeneric` initialised `keys_map` from itself (undefined behaviour, which crashed `cs_describe_config`). Fixed the same way Orca 2.4 fixed it.
+- A couple of missing includes the desktop build got from its precompiled header.
+
+The fork's libslic3r API is a bit older, so the bridge checks for it (`CS_ORCA_LEGACY_API`). It also adds a `cs_tool` op, `mixed_filaments`, that lists and edits virtual filaments through the fork's own `MixedFilamentManager` (blends, gradients, patterns, Local-Z caps and surface bias).
