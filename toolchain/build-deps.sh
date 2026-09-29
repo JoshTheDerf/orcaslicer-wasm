@@ -203,8 +203,9 @@ build_expat() {
 # heatshrink has no build system; use the CMakeLists PrusaSlicer/preFlight ship for it.
 build_heatshrink() {
   [[ -f "$PREFIX/lib/libheatshrink_dynalloc.a" ]] && { echo "heatshrink: up to date"; return; }
+  # CMake glue from preFlight's deps/+heatshrink (a copy ships in heatshrink/).
   local pf="${PREFLIGHT_SRC:-$HERE/../preflight}/deps/+heatshrink"
-  [[ -f "$pf/CMakeLists.txt" ]] || { echo "heatshrink: need preFlight checkout at $pf" >&2; exit 1; }
+  [[ -f "$pf/CMakeLists.txt" ]] || pf="$HERE/heatshrink"
   fetch "heatshrink-0.4.1.zip" "https://github.com/atomicobject/heatshrink/archive/refs/tags/v0.4.1.zip"
   rm -rf "$SRC/heatshrink-0.4.1"; unzip_to "$DL/heatshrink-0.4.1.zip" "$SRC"
   cp "$pf/CMakeLists.txt" "$pf/Config.cmake.in" "$SRC/heatshrink-0.4.1/"
