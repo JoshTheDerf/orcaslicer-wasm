@@ -177,3 +177,8 @@ web/public/wasm/*.data
 web/public/wasm/*.sym
 web/public/wasm/*.wat
 web/public/wasm/tmp*
+
+# FullSpectrum fork checkout + build (see scripts/build-fullspectrum.sh)
+/fullspectrum/
+/build-fs/
+/build-fs*.log

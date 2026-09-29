@@ -1,0 +1,1188 @@
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index dfcffa0..278d9dd 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -535,12 +535,22 @@ target_include_directories(boost_headeronly SYSTEM INTERFACE ${Boost_INCLUDE_DIR
+ target_link_libraries(boost_libs INTERFACE boost_headeronly ${Boost_LIBRARIES})
+ 
+ # Find and configure intel-tbb
++# TBB is optional when building for WASM; fall back to shims when disabled.
++set(TBB_FOUND FALSE)
+ if(SLIC3R_STATIC)
+     set(TBB_STATIC 1)
+ endif()
+ set(TBB_DEBUG 1)
+ set(CMAKE_MAP_IMPORTED_CONFIG_RELWITHDEBINFO RelWithDebInfo Release "")
+-find_package(TBB REQUIRED)
++if(NOT DEFINED CMAKE_DISABLE_FIND_PACKAGE_TBB OR NOT CMAKE_DISABLE_FIND_PACKAGE_TBB)
++    find_package(TBB)
++endif()
++if(TBB_FOUND)
++    add_compile_definitions(SLIC3R_USE_TBB=1)
++else()
++    set(TBB_FOUND FALSE)
++    add_compile_definitions(SLIC3R_USE_TBB=0)
++endif()
+ # include_directories(SYSTEM ${TBB_INCLUDE_DIRS})
+ # add_definitions(${TBB_DEFINITIONS})
+ # if(MSVC)
+@@ -1011,8 +1021,8 @@ SnapmakerOrcaPre_uninst_launch_failed:
+ 
+ SnapmakerOrcaPre_finish:
+ ]=])
+-file(READ "${CMAKE_SOURCE_DIR}/cmake/nsis/SnapmakerURLProtocols_install.nsh" CPACK_NSIS_EXTRA_INSTALL_COMMANDS)
+-file(READ "${CMAKE_SOURCE_DIR}/cmake/nsis/SnapmakerURLProtocols_uninstall.nsh" CPACK_NSIS_EXTRA_UNINSTALL_COMMANDS)
++file(READ "${CMAKE_CURRENT_SOURCE_DIR}/cmake/nsis/SnapmakerURLProtocols_install.nsh" CPACK_NSIS_EXTRA_INSTALL_COMMANDS)
++file(READ "${CMAKE_CURRENT_SOURCE_DIR}/cmake/nsis/SnapmakerURLProtocols_uninstall.nsh" CPACK_NSIS_EXTRA_UNINSTALL_COMMANDS)
+ set(CPACK_NSIS_CREATE_ICONS_EXTRA [=[
+   SetShellVarContext current
+   CreateShortCut "$DESKTOP\SnapmakerOrca-FullSpectrum.lnk" "$INSTDIR\snapmaker-orca.exe" "" "$INSTDIR\snapmaker-orca.exe" 0
+diff --git a/deps_src/hidapi/CMakeLists.txt b/deps_src/hidapi/CMakeLists.txt
+index efb7f62..3f2fc36 100644
+--- a/deps_src/hidapi/CMakeLists.txt
++++ b/deps_src/hidapi/CMakeLists.txt
+@@ -1,3 +1,10 @@
++if (CMAKE_SYSTEM_NAME STREQUAL "Emscripten" OR EMSCRIPTEN)
++    add_library(hidapi INTERFACE)
++    target_include_directories(hidapi INTERFACE
++        ${CMAKE_CURRENT_SOURCE_DIR}/include
++    )
++    return()
++endif()
+ 
+ if (WIN32)
+     set(HIDAPI_IMPL win/hid.c)
+diff --git a/deps_src/libigl/igl/slice.cpp b/deps_src/libigl/igl/slice.cpp
+index df3a8e9..b00e7f7 100644
+--- a/deps_src/libigl/igl/slice.cpp
++++ b/deps_src/libigl/igl/slice.cpp
+@@ -50,28 +50,21 @@ IGL_INLINE void igl::slice(
+   {
+     CI[C(i)].push_back(i);
+   }
+-  // Resize output
+-  Eigen::DynamicSparseMatrix<TY, Eigen::RowMajor> dyn_Y(ym,yn);
+-  // Take a guess at the number of nonzeros (this assumes uniform distribution
+-  // not banded or heavily diagonal)
+-  dyn_Y.reserve((X.nonZeros()/(X.rows()*X.cols())) * (ym*yn));
+-  // Iterate over outside
++  // Eigen::DynamicSparseMatrix is gone from current Eigen: build from triplets
++  // (each output entry is written once, so summing duplicates is moot).
++  std::vector<Eigen::Triplet<TY>> entries;
++  entries.reserve((X.nonZeros()/(X.rows()*X.cols())) * (ym*yn));
+   for(int k=0; k<X.outerSize(); ++k)
+   {
+-    // Iterate over inside
+     for(typename Eigen::SparseMatrix<TX>::InnerIterator it (X,k); it; ++it)
+     {
+-      std::vector<int>::iterator rit, cit;
+-      for(rit = RI[it.row()].begin();rit != RI[it.row()].end(); rit++)
+-      {
+-        for(cit = CI[it.col()].begin();cit != CI[it.col()].end(); cit++)
+-        {
+-          dyn_Y.coeffRef(*rit,*cit) = it.value();
+-        }
+-      }
++      for(auto rit = RI[it.row()].begin();rit != RI[it.row()].end(); rit++)
++        for(auto cit = CI[it.col()].begin();cit != CI[it.col()].end(); cit++)
++          entries.emplace_back(*rit, *cit, it.value());
+     }
+   }
+-  Y = Eigen::SparseMatrix<TY>(dyn_Y);
++  Y.resize(ym, yn);
++  Y.setFromTriplets(entries.begin(), entries.end());
+ #else
+ 
+   // Alec: This is _not_ valid for arbitrary R,C since they don't necessary
+diff --git a/src/CMakeLists.txt b/src/CMakeLists.txt
+index 8f1b474..c3067d7 100644
+--- a/src/CMakeLists.txt
++++ b/src/CMakeLists.txt
+@@ -9,8 +9,10 @@ add_subdirectory(dev-utils)
+ # add_subdirectory(avrdude)
+ # Note: semver and hints are now included from deps_src/CMakeLists.txt
+ 
+-# Add MQTT library
+-add_subdirectory(mqtt)
++# Add MQTT library (printer networking; GUI only — not built headless / WASM)
++if (SLIC3R_GUI)
++    add_subdirectory(mqtt)
++endif ()
+ 
+ # Set MQTT paths for use in slic3r GUI
+ set(PAHO_MQTT_CPP_PATH "${CMAKE_CURRENT_SOURCE_DIR}/mqtt" CACHE PATH "Paho MQTT C++ path")
+diff --git a/src/libslic3r/AABBTreeLines.hpp b/src/libslic3r/AABBTreeLines.hpp
+index 55cf328..2a2efb5 100644
+--- a/src/libslic3r/AABBTreeLines.hpp
++++ b/src/libslic3r/AABBTreeLines.hpp
+@@ -32,7 +32,9 @@ namespace AABBTreeLines {
+             {
+                 Vec<LineType::Dim, typename LineType::Scalar> nearest_point;
+                 const LineType& line = lines[primitive_index];
+-                squared_distance = line_alg::distance_to_squared(line, origin.template cast<typename LineType::Scalar>(), &nearest_point);
++                const Vec<LineType::Dim, typename LineType::Scalar> origin_cast =
++                    origin.template cast<typename LineType::Scalar>();
++                squared_distance = line_alg::distance_to_squared(line, origin_cast, &nearest_point);
+                 return nearest_point.template cast<ScalarType>();
+             }
+         };
+diff --git a/src/libslic3r/Arachne/SkeletalTrapezoidation.cpp b/src/libslic3r/Arachne/SkeletalTrapezoidation.cpp
+index 2d2cf98..5ecd019 100644
+--- a/src/libslic3r/Arachne/SkeletalTrapezoidation.cpp
++++ b/src/libslic3r/Arachne/SkeletalTrapezoidation.cpp
+@@ -1668,7 +1668,10 @@ SkeletalTrapezoidation::Beading SkeletalTrapezoidation::interpolate(const Beadin
+     // TODO: don't use toolpath locations past the middle!
+     // TODO: stretch bead widths and locations of the higher bead count beading to fit in the left over space
+     coord_t next_inset_idx;
+-    for (next_inset_idx = left.toolpath_locations.size() - 1; next_inset_idx >= 0; next_inset_idx--)
++    // Cast before subtracting: with a 32-bit size_t (wasm32) `size() - 1` on an
++    // empty vector wraps to 4294967295, which stays positive in the 64-bit
++    // coord_t and indexes far out of bounds (on LP64 it happens to wrap to -1).
++    for (next_inset_idx = coord_t(left.toolpath_locations.size()) - 1; next_inset_idx >= 0; next_inset_idx--)
+     {
+         if (switching_radius > left.toolpath_locations[next_inset_idx])
+         {
+diff --git a/src/libslic3r/CMakeLists.txt b/src/libslic3r/CMakeLists.txt
+index 4a59c50..8e8dc00 100644
+--- a/src/libslic3r/CMakeLists.txt
++++ b/src/libslic3r/CMakeLists.txt
+@@ -18,6 +18,9 @@ endif()
+ 
+ option(BUILD_SHARED_LIBS "Build shared libs" OFF)
+ 
++option(SLIC3R_WITH_OCCT "Enable OCCT CAD features" ON)
++option(SLIC3R_WITH_OPENCV "Enable OpenCV-powered color utilities" ON)
++
+ set(lisbslic3r_sources
+     AABBMesh.cpp
+     AABBMesh.hpp
+@@ -529,6 +532,19 @@ set(lisbslic3r_sources
+     Zipper.hpp
+ )
+ 
++# Headless WASM: no OpenCV (ObjColorUtils is GUI/CLI-only; SimplePmCalibration
++# guards its photo reader), no Assimp (stubbed), see ../../../patches.
++option(SLIC3R_WITH_OPENCV "Build with OpenCV" ON)
++option(SLIC3R_WITH_ASSIMP "Build with Assimp mesh import" ON)
++option(SLIC3R_WITH_OCCT "Build with OpenCASCADE (STEP)" ON)
++if (NOT SLIC3R_WITH_OPENCV)
++    list(REMOVE_ITEM lisbslic3r_sources ObjColorUtils.cpp ObjColorUtils.hpp)
++endif()
++if (NOT SLIC3R_WITH_ASSIMP)
++    list(REMOVE_ITEM lisbslic3r_sources Format/Assimp.cpp)
++    list(APPEND lisbslic3r_sources Format/AssimpStub.cpp)
++endif()
++
+ if (APPLE)
+     list(APPEND lisbslic3r_sources
+             MacUtils.mm
+@@ -549,8 +565,12 @@ set(CGAL_DO_NOT_WARN_ABOUT_CMAKE_BUILD_TYPE ON CACHE BOOL "" FORCE)
+ cmake_policy(PUSH)
+ cmake_policy(SET CMP0011 NEW)
+ find_package(CGAL REQUIRED)
+-find_package(OpenCV REQUIRED core)
+-find_package(assimp CONFIG REQUIRED)
++if (SLIC3R_WITH_OPENCV)
++    find_package(OpenCV REQUIRED core)
++endif()
++if (SLIC3R_WITH_ASSIMP)
++    find_package(assimp CONFIG REQUIRED)
++endif()
+ cmake_policy(POP)
+ 
+ add_library(libslic3r_cgal STATIC 
+@@ -591,42 +611,27 @@ target_compile_definitions(libslic3r PUBLIC -DUSE_TBB -DTBB_USE_CAPTURED_EXCEPTI
+ target_include_directories(libslic3r PUBLIC ${CMAKE_CURRENT_SOURCE_DIR} ${CMAKE_CURRENT_BINARY_DIR})
+ target_include_directories(libslic3r SYSTEM PUBLIC ${EXPAT_INCLUDE_DIRS})
+ 
+-# Find the OCCT and related libraries
+-set(OpenCASCADE_DIR "${CMAKE_PREFIX_PATH}/lib/cmake/occt")
+-find_package(OpenCASCADE REQUIRED)
+-target_include_directories(libslic3r SYSTEM PUBLIC ${OpenCASCADE_INCLUDE_DIR})
+ target_link_libraries(libslic3r PUBLIC nlohmann_json)
+ 
+-find_package(JPEG REQUIRED)
+-
+-set(OCCT_LIBS
+-    TKXDESTEP
+-    TKSTEP
+-    TKSTEP209
+-    TKSTEPAttr
+-    TKSTEPBase
+-    TKXCAF
+-    TKXSBase
+-    TKVCAF
+-    TKCAF
+-    TKLCAF
+-    TKCDF
+-    TKV3d
+-    TKService
+-    TKMesh
+-    TKBO
+-    TKPrim
+-    TKHLR
+-    TKShHealing
+-    TKTopAlgo
+-    TKGeomAlgo
+-    TKBRep
+-    TKGeomBase
+-    TKG3d
+-    TKG2d
+-    TKMath
+-    TKernel
+-)
++set(OCCT_PRIVATE_LIBS)
++if(SLIC3R_WITH_OCCT)
++    set(OpenCASCADE_DIR "${CMAKE_PREFIX_PATH}/lib/cmake/occt")
++    find_package(OpenCASCADE REQUIRED)
++    target_include_directories(libslic3r SYSTEM PUBLIC ${OpenCASCADE_INCLUDE_DIR})
++    find_package(JPEG REQUIRED)
++    set(OCCT_LIBS
++        TKXDESTEP TKSTEP TKSTEP209 TKSTEPAttr TKSTEPBase TKXCAF TKXSBase TKVCAF TKCAF TKLCAF TKCDF TKV3d TKService
++        TKMesh TKBO TKPrim TKHLR TKShHealing TKTopAlgo TKGeomAlgo TKBRep TKGeomBase TKG3d TKG2d TKMath TKernel)
++    list(APPEND OCCT_PRIVATE_LIBS ${OCCT_LIBS} JPEG::JPEG)
++    if(NOT WIN32)
++        list(APPEND OCCT_PRIVATE_LIBS ${FREETYPE_LIBRARIES} OpenSSL::Crypto)
++        if (NOT APPLE)
++            list(APPEND OCCT_PRIVATE_LIBS fontconfig)
++        endif()
++    endif()
++else()
++    target_compile_definitions(libslic3r PUBLIC SLIC3R_NO_OCCT)
++endif()
+ 
+ find_package(libnoise REQUIRED)
+ target_link_libraries(libslic3r
+@@ -635,18 +640,14 @@ target_link_libraries(libslic3r
+         libigl
+         libnest2d
+         miniz
+-        opencv_world
+     PRIVATE
+         ${CMAKE_DL_LIBS}
+         ${EXPAT_LIBRARIES}
+-        ${OCCT_LIBS}
+-        assimp::assimp
+         boost_libs
+         cereal::cereal
+         clipper
+         eigen
+         glu-libtess
+-        JPEG::JPEG
+         libslic3r_cgal
+         mcut
+         noise::noise
+@@ -654,18 +655,21 @@ target_link_libraries(libslic3r
+         qhull
+         qoi
+         semver
+-        TBB::tbb
+-        TBB::tbbmalloc
+         ZLIB::ZLIB
++        ${OCCT_PRIVATE_LIBS}
+     )
+ 
+-if(NOT WIN32)
+-    # Link freetype for OCCT dependency (CAD operations need font rendering)
+-    target_link_libraries(libslic3r PRIVATE ${FREETYPE_LIBRARIES})
+-    target_link_libraries(libslic3r PRIVATE OpenSSL::Crypto)
+-    if (NOT APPLE)
+-        target_link_libraries(libslic3r PRIVATE fontconfig)
+-    endif()
++if (SLIC3R_WITH_ASSIMP)
++    target_link_libraries(libslic3r PRIVATE assimp::assimp)
++endif()
++if (TBB_FOUND)
++    target_link_libraries(libslic3r PRIVATE TBB::tbb TBB::tbbmalloc)
++endif()
++if (SLIC3R_WITH_OPENCV)
++    target_link_libraries(libslic3r PUBLIC opencv_world)
++    target_compile_definitions(libslic3r PUBLIC SLIC3R_WITH_OPENCV=1)
++else()
++    target_compile_definitions(libslic3r PUBLIC SLIC3R_WITH_OPENCV=0)
+ endif()
+ 
+ if (APPLE)
+diff --git a/src/libslic3r/Color.hpp b/src/libslic3r/Color.hpp
+index cd1e82d..8b03150 100644
+--- a/src/libslic3r/Color.hpp
++++ b/src/libslic3r/Color.hpp
+@@ -1,6 +1,7 @@
+ #ifndef slic3r_Color_hpp_
+ #define slic3r_Color_hpp_
+ 
++#include <cassert>
+ #include <vector>
+ #include <string>
+ #include <array>
+diff --git a/src/libslic3r/Feature/FuzzySkin/FuzzySkin.cpp b/src/libslic3r/Feature/FuzzySkin/FuzzySkin.cpp
+index 66fc90d..af7a61c 100644
+--- a/src/libslic3r/Feature/FuzzySkin/FuzzySkin.cpp
++++ b/src/libslic3r/Feature/FuzzySkin/FuzzySkin.cpp
+@@ -1,4 +1,7 @@
+ #include <random>
++#ifndef __EMSCRIPTEN__
++#    include <thread>
++#endif
+ 
+ #include "libslic3r/Algorithm/LineSplit.hpp"
+ #include "libslic3r/Arachne/utils/ExtrusionJunction.hpp"
+@@ -21,10 +24,16 @@ using namespace Slic3r;
+ namespace Slic3r::Feature::FuzzySkin {
+ 
+ // Produces a random value between 0 and 1. Thread-safe.
+-static double random_value() {
++static double random_value()
++{
+     thread_local std::random_device rd;
+-    // Hash thread ID for random number seed if no hardware rng seed is available
++#ifndef __EMSCRIPTEN__
++    // Hash thread ID for random number seed if no hardware rng seed is available.
+     thread_local std::mt19937 gen(rd.entropy() > 0 ? rd() : std::hash<std::thread::id>()(std::this_thread::get_id()));
++#else
++    // Emscripten builds are effectively single-threaded, fall back to device entropy.
++    thread_local std::mt19937 gen(rd());
++#endif
+     thread_local std::uniform_real_distribution<double> dist(0.0, 1.0);
+     return dist(gen);
+ }
+diff --git a/src/libslic3r/Feature/Interlocking/InterlockingGenerator.hpp b/src/libslic3r/Feature/Interlocking/InterlockingGenerator.hpp
+index 6f331fb..3ba7432 100644
+--- a/src/libslic3r/Feature/Interlocking/InterlockingGenerator.hpp
++++ b/src/libslic3r/Feature/Interlocking/InterlockingGenerator.hpp
+@@ -7,6 +7,8 @@
+ #include "libslic3r/Print.hpp"
+ #include "VoxelUtils.hpp"
+ 
++#include <unordered_set>
++
+ namespace Slic3r {
+ 
+ /*!
+diff --git a/src/libslic3r/Fill/Fill.cpp b/src/libslic3r/Fill/Fill.cpp
+index 49b7b60..1d01b1c 100644
+--- a/src/libslic3r/Fill/Fill.cpp
++++ b/src/libslic3r/Fill/Fill.cpp
+@@ -1,6 +1,7 @@
+ #include <assert.h>
+ #include <stdio.h>
+ #include <memory>
++#include <unordered_set>
+ 
+ #include "../ClipperUtils.hpp"
+ #include "../Geometry.hpp"
+diff --git a/src/libslic3r/Fill/FillAdaptive.cpp b/src/libslic3r/Fill/FillAdaptive.cpp
+index 3ec9ec3..3bee953 100644
+--- a/src/libslic3r/Fill/FillAdaptive.cpp
++++ b/src/libslic3r/Fill/FillAdaptive.cpp
+@@ -1393,8 +1393,8 @@ void Filler::_fill_surface_single(
+     }
+ #endif /* ADAPTIVE_CUBIC_INFILL_DEBUG_OUTPUT */
+ 
+-    const auto hook_length     = coordf_t(std::min<float>(std::numeric_limits<coord_t>::max(), scale_(params.anchor_length)));
+-    const auto hook_length_max = coordf_t(std::min<float>(std::numeric_limits<coord_t>::max(), scale_(params.anchor_length_max)));
++    const auto hook_length     = coordf_t(std::min<coordf_t>(static_cast<coordf_t>(std::numeric_limits<coord_t>::max()), scale_(params.anchor_length)));
++    const auto hook_length_max = coordf_t(std::min<coordf_t>(static_cast<coordf_t>(std::numeric_limits<coord_t>::max()), scale_(params.anchor_length_max)));
+ 
+     Polylines all_polylines_with_hooks = all_polylines.size() > 1 ? connect_lines_using_hooks(std::move(all_polylines), expolygon, this->spacing, hook_length, hook_length_max) : std::move(all_polylines);
+ 
+diff --git a/src/libslic3r/Format/AssimpStub.cpp b/src/libslic3r/Format/AssimpStub.cpp
+new file mode 100644
+index 0000000..271d1f6
+--- /dev/null
++++ b/src/libslic3r/Format/AssimpStub.cpp
+@@ -0,0 +1,16 @@
++// Headless / WASM builds without Assimp: extra textured mesh formats are not
++// importable (STL / OBJ / 3MF still are). Replaces Format/Assimp.cpp when
++// SLIC3R_WITH_ASSIMP=OFF.
++#include "Assimp.hpp"
++
++namespace Slic3r {
++
++bool is_assimp_color_mesh_file(const std::string&) { return false; }
++
++bool load_assimp_color_mesh(const char*, Model*, ObjInfo&, std::string& message, const char*, const ObjImageMapProgressFn&)
++{
++    message = "This mesh format is not available in this build.";
++    return false;
++}
++
++} // namespace Slic3r
+diff --git a/src/libslic3r/Format/STEP.cpp b/src/libslic3r/Format/STEP.cpp
+index 5105d26..669ebd4 100644
+--- a/src/libslic3r/Format/STEP.cpp
++++ b/src/libslic3r/Format/STEP.cpp
+@@ -4,6 +4,81 @@
+ 
+ #include "STEP.hpp"
+ 
++#ifdef SLIC3R_NO_OCCT
++
++#include <string>
++#include <utility>
++
++namespace Slic3r {
++
++bool StepPreProcessor::preprocess(const char* path, std::string &output_path)
++{
++    output_path = path ? std::string(path) : std::string();
++    return true;
++}
++
++bool StepPreProcessor::isUtf8File(const char* /*path*/)
++{
++    return true;
++}
++
++bool StepPreProcessor::isUtf8(const std::string /*str*/)
++{
++    return true;
++}
++
++Step::Step(fs::path path, ImportStepProgressFn stepFn, StepIsUtf8Fn isUtf8Fn)
++    : Step(std::move(path.string()), std::move(stepFn), std::move(isUtf8Fn))
++{
++}
++
++Step::Step(std::string path, ImportStepProgressFn stepFn, StepIsUtf8Fn isUtf8Fn)
++    : m_path(std::move(path))
++    , m_stepFn(std::move(stepFn))
++    , m_utf8Fn(std::move(isUtf8Fn))
++{
++}
++
++bool Step::load()
++{
++    return false;
++}
++
++unsigned int Step::get_triangle_num(double /*linear_defletion*/, double /*angle_defletion*/)
++{
++    return 0;
++}
++
++unsigned int Step::get_triangle_num_tbb(double /*linear_defletion*/, double /*angle_defletion*/)
++{
++    return 0;
++}
++
++void Step::clean_mesh_data()
++{
++}
++
++bool load_step(const char * /*path*/, Model * /*model*/, bool& is_cancel,
++               double /*linear_defletion*/, double /*angle_defletion*/,
++               bool /*isSplitCompound*/, ImportStepProgressFn proFn,
++               StepIsUtf8Fn /*isUtf8Fn*/, long& mesh_face_num)
++{
++    if (proFn) {
++        bool dummy_cancel = false;
++        proFn(LOAD_STEP_STAGE_READ_FILE, 0, 1, dummy_cancel);
++        proFn(LOAD_STEP_STAGE_GET_SOLID, 0, 0, dummy_cancel);
++        proFn(LOAD_STEP_STAGE_GET_MESH, 0, 0, dummy_cancel);
++    }
++
++    is_cancel = false;
++    mesh_face_num = 0;
++    return false;
++}
++
++} // namespace Slic3r
++
++#else
++
+ #include <string>
+ #include <boost/nowide/cstdio.hpp>
+ #include <boost/nowide/iostream.hpp>
+@@ -518,3 +593,5 @@ unsigned int Step::get_triangle_num_tbb(double linear_defletion, double angle_de
+ }
+ 
+ }; // namespace Slic3r
++
++#endif // SLIC3R_NO_OCCT
+diff --git a/src/libslic3r/Format/STEP.hpp b/src/libslic3r/Format/STEP.hpp
+index 85c8f65..8142e94 100644
+--- a/src/libslic3r/Format/STEP.hpp
++++ b/src/libslic3r/Format/STEP.hpp
+@@ -1,18 +1,26 @@
+ #ifndef slic3r_Format_STEP_hpp_
+ #define slic3r_Format_STEP_hpp_
++#include <atomic>
++#include <functional>
++#include <string>
++#include <vector>
++
++#include <boost/filesystem/path.hpp>
++#include <boost/filesystem.hpp>
++
++#ifndef SLIC3R_NO_OCCT
+ #include "XCAFDoc_DocumentTool.hxx"
+ #include "XCAFApp_Application.hxx"
+ #include "XCAFDoc_ShapeTool.hxx"
+-#include <boost/filesystem/path.hpp>
+-#include <boost/filesystem.hpp>
+ #include <Message_ProgressIndicator.hxx>
+-#include <atomic>
++#endif
+ 
+ namespace fs = boost::filesystem;
+ 
+ namespace Slic3r {
+ 
+ class TriangleMesh;
++class Model;
+ class ModelObject;
+ 
+ // load step stage
+@@ -25,6 +33,8 @@ const int LOAD_STEP_STAGE_UNIT_NUM           = 5;
+ typedef std::function<void(int load_stage, int current, int total, bool& cancel)> ImportStepProgressFn;
+ typedef std::function<void(bool isUtf8)> StepIsUtf8Fn;
+ 
++#ifndef SLIC3R_NO_OCCT
++
+ struct NamedSolid
+ {
+     NamedSolid(const TopoDS_Shape& s,
+@@ -105,6 +115,34 @@ private:
+     std::vector<NamedSolid> m_name_solids;
+ };
+ 
++#else // SLIC3R_NO_OCCT
++
++class StepPreProcessor {
++public:
++    bool preprocess(const char* path, std::string &output_path);
++    static bool isUtf8File(const char* path);
++    static bool isUtf8(const std::string str);
++};
++
++class Step
++{
++public:
++    Step(fs::path path, ImportStepProgressFn stepFn = nullptr, StepIsUtf8Fn isUtf8Fn = nullptr);
++    Step(std::string path, ImportStepProgressFn stepFn = nullptr, StepIsUtf8Fn isUtf8Fn = nullptr);
++    bool load();
++    unsigned int get_triangle_num(double linear_defletion, double angle_defletion);
++    unsigned int get_triangle_num_tbb(double linear_defletion, double angle_defletion);
++    void clean_mesh_data();
++
++    std::atomic<bool> m_stop_mesh{false};
++private:
++    std::string m_path;
++    ImportStepProgressFn m_stepFn;
++    StepIsUtf8Fn m_utf8Fn;
++};
++
++#endif // SLIC3R_NO_OCCT
++
+ }; // namespace Slic3r
+ 
+ #endif /* slic3r_Format_STEP_hpp_ */
+diff --git a/src/libslic3r/Format/svg.cpp b/src/libslic3r/Format/svg.cpp
+index 4a96274..43d64bf 100644
+--- a/src/libslic3r/Format/svg.cpp
++++ b/src/libslic3r/Format/svg.cpp
+@@ -9,6 +9,7 @@
+ 
+ #include <boost/log/trivial.hpp>
+ 
++#ifndef SLIC3R_NO_OCCT
+ #include "BRepBuilderAPI_MakeWire.hxx"
+ #include "BRepBuilderAPI_MakeEdge.hxx"
+ #include "BRepBuilderAPI_MakeFace.hxx"
+@@ -20,6 +21,9 @@
+ #include "TopoDS.hxx"
+ #include "BRepExtrema_SelfIntersection.hxx"
+ #include "clipper/clipper.hpp"
++#endif
++
++#ifndef SLIC3R_NO_OCCT
+ 
+ using namespace ClipperLib;
+ 
+@@ -400,3 +404,17 @@ bool load_svg(const char *path, Model *model, std::string &message)
+     return true;
+ }
+ } // namespace Slic3r
++
++#else // SLIC3R_NO_OCCT
++
++namespace Slic3r {
++
++bool load_svg(const char * /*path*/, Model * /*model*/, std::string &message)
++{
++    message = "SVG import is not available in this build.";
++    return false;
++}
++
++} // namespace Slic3r
++
++#endif // SLIC3R_NO_OCCT
+diff --git a/src/libslic3r/GCode.hpp b/src/libslic3r/GCode.hpp
+index fbf3bc6..c5224b0 100644
+--- a/src/libslic3r/GCode.hpp
++++ b/src/libslic3r/GCode.hpp
+@@ -185,7 +185,7 @@ struct LayerResult {
+     // It is used for the pressure equalizer because it needs to buffer one layer back.
+     bool        nop_layer_result { false };
+ 
+-    static LayerResult make_nop_layer_result() { return {"", std::numeric_limits<coord_t>::max(), false, false, true}; }
++    static LayerResult make_nop_layer_result() { return {"", std::numeric_limits<size_t>::max(), false, false, true}; }
+ };
+ 
+ class GCode {
+@@ -590,7 +590,7 @@ private:
+ #endif // ENABLE_GCODE_VIEWER_DATA_CHECKING
+ 
+     // Always check gcode placeholders when building in debug mode.
+-#if !defined(NDEBUG)
++#if !defined(NDEBUG) && !defined(ORCA_CHECK_GCODE_PLACEHOLDERS)
+ #define ORCA_CHECK_GCODE_PLACEHOLDERS 1
+ #endif
+     
+diff --git a/src/libslic3r/GCode/GCodeProcessor.cpp b/src/libslic3r/GCode/GCodeProcessor.cpp
+index 923e2d0..689caef 100644
+--- a/src/libslic3r/GCode/GCodeProcessor.cpp
++++ b/src/libslic3r/GCode/GCodeProcessor.cpp
+@@ -20,6 +20,8 @@
+ #include <float.h>
+ #include <assert.h>
+ #include <regex>
++#include <cctype>
++#include <cstring>
+ #include <charconv>
+ #include <string>
+ #include <system_error>
+diff --git a/src/libslic3r/GCode/Thumbnails.cpp b/src/libslic3r/GCode/Thumbnails.cpp
+index 526ba82..e94d513 100644
+--- a/src/libslic3r/GCode/Thumbnails.cpp
++++ b/src/libslic3r/GCode/Thumbnails.cpp
+@@ -78,8 +78,22 @@ std::unique_ptr<CompressedImageBuffer> compress_thumbnail_jpg(const ThumbnailDat
+ 
+     info.image_width = data.width;
+     info.image_height = data.height;
++#ifdef JCS_EXTENSIONS
+     info.input_components = 4;
+     info.in_color_space = JCS_EXT_RGBA;
++#else
++    // Plain IJG libjpeg (e.g. the Emscripten port) has no RGBA input: drop alpha.
++    std::vector<unsigned char> rgb_pixels(size_t(data.width) * data.height * 3);
++    for (size_t i = 0, n = size_t(data.width) * data.height; i < n; ++i) {
++        rgb_pixels[i * 3 + 0] = rgba_pixels[i * 4 + 0];
++        rgb_pixels[i * 3 + 1] = rgba_pixels[i * 4 + 1];
++        rgb_pixels[i * 3 + 2] = rgba_pixels[i * 4 + 2];
++    }
++    for (unsigned int y = 0; y < data.height; ++y)
++        rows_ptrs[y] = &rgb_pixels[size_t(y) * data.width * 3];
++    info.input_components = 3;
++    info.in_color_space = JCS_RGB;
++#endif
+ 
+     jpeg_set_defaults(&info);
+     jpeg_set_quality(&info, 85, TRUE);
+@@ -94,7 +108,11 @@ std::unique_ptr<CompressedImageBuffer> compress_thumbnail_jpg(const ThumbnailDat
+     auto out = std::make_unique<CompressedJPG>();
+     out->data = malloc(compressed_data_size);
+     out->size = size_t(compressed_data_size);
+-    ::memcpy(out->data, (const void*)compressed_data.data(), out->size);
++    // jpeg_mem_dest() may replace the buffer with its own (larger) allocation;
++    // copy from wherever the data actually is, then release libjpeg's buffer.
++    ::memcpy(out->data, (const void*)compressed_data_ptr, out->size);
++    if (compressed_data_ptr != compressed_data.data())
++        ::free(compressed_data_ptr);
+     return out;
+ }
+ 
+diff --git a/src/libslic3r/ImageMap/SimplePmCalibration.cpp b/src/libslic3r/ImageMap/SimplePmCalibration.cpp
+index 0e6cad9..f9d39a3 100644
+--- a/src/libslic3r/ImageMap/SimplePmCalibration.cpp
++++ b/src/libslic3r/ImageMap/SimplePmCalibration.cpp
+@@ -18,7 +18,9 @@
+ #include <boost/filesystem.hpp>
+ #include <boost/nowide/fstream.hpp>
+ #include <nlohmann/json.hpp>
++#if SLIC3R_WITH_OPENCV
+ #include <opencv2/imgproc.hpp>
++#endif
+ 
+ namespace Slic3r::ImageMap {
+ namespace {
+@@ -414,6 +416,7 @@ std::optional<SimplePmCalibrationProfile> matching_profile(uint64_t signature)
+     return loaded;
+ }
+ 
++#if SLIC3R_WITH_OPENCV
+ cv::Mat top_down_rgba(const std::vector<uint8_t>& rgba, uint32_t width, uint32_t height)
+ {
+     cv::Mat image(int(height), int(width), CV_8UC4);
+@@ -653,6 +656,7 @@ bool header_matches(const cv::Mat& warped,
+     return mismatches <= 8;
+ }
+ 
++#endif // SLIC3R_WITH_OPENCV
+ } // namespace
+ 
+ bool SimplePmCalibrationChart::valid() const
+@@ -805,6 +809,10 @@ SimplePmPhotoAnalysis analyze_simple_pm_calibration_photo(const std::vector<uint
+         return result;
+     }
+ 
++#if !SLIC3R_WITH_OPENCV
++    result.error = "Calibration photo analysis is not available in this build.";
++    return result;
++#else
+     const cv::Mat source = top_down_rgba(photo_rgba, photo_width, photo_height);
+     float finder_confidence = 0.f;
+     const std::vector<cv::Point2f> source_points = detect_finders(source, finder_confidence);
+@@ -875,6 +883,7 @@ SimplePmPhotoAnalysis analyze_simple_pm_calibration_photo(const std::vector<uint
+     }
+     result.success = true;
+     return result;
++#endif
+ }
+ 
+ bool save_simple_pm_calibration_profile(const SimplePmCalibrationProfile& profile, std::string* saved_path, std::string* error)
+diff --git a/src/libslic3r/MixedFilament/Manager.cpp b/src/libslic3r/MixedFilament/Manager.cpp
+index c4f2f61..1ea9bbf 100644
+--- a/src/libslic3r/MixedFilament/Manager.cpp
++++ b/src/libslic3r/MixedFilament/Manager.cpp
+@@ -1,3 +1,4 @@
++#include "../libslic3r.h"
+ #include "../MixedFilament.hpp"
+ #include "Internal.hpp"
+ 
+diff --git a/src/libslic3r/Model.cpp b/src/libslic3r/Model.cpp
+index 8270393..ac5c5bf 100644
+--- a/src/libslic3r/Model.cpp
++++ b/src/libslic3r/Model.cpp
+@@ -181,6 +181,7 @@ Model::~Model()
+         Slic3r::remove_backup(*this, true);
+ }
+ 
++#ifndef SLIC3R_NO_OCCT
+ Model Model::read_from_step(const std::string&                                      input_file,
+                             LoadStrategy                                            options,
+                             ImportStepProgressFn                                    stepFn,
+@@ -226,6 +227,19 @@ Model Model::read_from_step(const std::string&
+ 
+     return model;
+ }
++#else
++Model Model::read_from_step(const std::string&                                      input_file,
++                            LoadStrategy                                            /*options*/,
++                            ImportStepProgressFn                                    /*stepFn*/,
++                            StepIsUtf8Fn                                            /*stepIsUtf8Fn*/,
++                            std::function<int(Slic3r::Step&, double&, double&, bool&)>     /*step_mesh_fn*/,
++                            double                                                  /*linear_defletion*/,
++                            double                                                  /*angle_defletion*/,
++                            bool                                                   /*is_split_compound*/)
++{
++    throw Slic3r::RuntimeError(_L("STEP support is not available in this build."));
++}
++#endif
+ 
+ // BBS: add part plate related logic
+ // BBS: backup & restore
+diff --git a/src/libslic3r/MultiPoint.hpp b/src/libslic3r/MultiPoint.hpp
+index 0dfb98f..7ef6c20 100644
+--- a/src/libslic3r/MultiPoint.hpp
++++ b/src/libslic3r/MultiPoint.hpp
+@@ -22,6 +22,7 @@ public:
+     MultiPoint(MultiPoint &&other) : points(std::move(other.points)) {}
+     MultiPoint(std::initializer_list<Point> list) : points(list) {}
+     explicit MultiPoint(const Points &_points) : points(_points) {}
++    virtual ~MultiPoint() = default;
+     MultiPoint& operator=(const MultiPoint &other) { points = other.points; return *this; }
+     MultiPoint& operator=(MultiPoint &&other) { points = std::move(other.points); return *this; }
+     void scale(double factor);
+diff --git a/src/libslic3r/OpenVDBUtils.cpp b/src/libslic3r/OpenVDBUtils.cpp
+index 72c7668..ad77a85 100644
+--- a/src/libslic3r/OpenVDBUtils.cpp
++++ b/src/libslic3r/OpenVDBUtils.cpp
+@@ -1,6 +1,29 @@
+ #define NOMINMAX
+ #include "OpenVDBUtils.hpp"
+ 
++#if defined(__EMSCRIPTEN__) && defined(ORCA_DISABLE_OPENVDB)
++
++namespace Slic3r {
++
++openvdb::FloatGrid::Ptr mesh_to_grid(const indexed_triangle_set &, const openvdb::math::Transform &, float, float, float, int)
++{
++    return {};
++}
++
++indexed_triangle_set grid_to_mesh(const openvdb::FloatGrid &, double, double, bool)
++{
++    return {};
++}
++
++openvdb::FloatGrid::Ptr redistance_grid(const openvdb::FloatGrid &, double, double, double)
++{
++    return {};
++}
++
++} // namespace Slic3r
++
++#else
++
+ #ifdef _MSC_VER
+ // Suppress warning C4146 in OpenVDB: unary minus operator applied to unsigned type, result still unsigned 
+ #pragma warning(push)
+@@ -134,3 +157,5 @@ openvdb::FloatGrid::Ptr redistance_grid(const openvdb::FloatGrid &grid,
+ }
+ 
+ } // namespace Slic3r
++
++#endif // defined(__EMSCRIPTEN__) && defined(ORCA_DISABLE_OPENVDB)
+diff --git a/src/libslic3r/OpenVDBUtils.hpp b/src/libslic3r/OpenVDBUtils.hpp
+index f4441ba..5c439ee 100644
+--- a/src/libslic3r/OpenVDBUtils.hpp
++++ b/src/libslic3r/OpenVDBUtils.hpp
+@@ -3,6 +3,45 @@
+ 
+ #include <libslic3r/TriangleMesh.hpp>
+ 
++#if defined(__EMSCRIPTEN__) && defined(ORCA_DISABLE_OPENVDB)
++
++#include <memory>
++
++namespace openvdb {
++class FloatGrid {
++public:
++    using Ptr = std::shared_ptr<FloatGrid>;
++};
++
++namespace math {
++struct Transform {};
++} // namespace math
++
++} // namespace openvdb
++
++namespace Slic3r {
++
++openvdb::FloatGrid::Ptr mesh_to_grid(const indexed_triangle_set &    mesh,
++                                     const openvdb::math::Transform &tr = {},
++                                     float voxel_scale                  = 1.f,
++                                     float exteriorBandWidth = 3.0f,
++                                     float interiorBandWidth = 3.0f,
++                                     int   flags             = 0);
++
++indexed_triangle_set grid_to_mesh(const openvdb::FloatGrid &grid,
++                                  double                    isovalue   = 0.0,
++                                  double                    adaptivity = 0.0,
++                                  bool relaxDisorientedTriangles = true);
++
++openvdb::FloatGrid::Ptr redistance_grid(const openvdb::FloatGrid &grid,
++                                        double                    iso,
++                                        double ext_range = 3.,
++                                        double int_range = 3.);
++
++} // namespace Slic3r
++
++#else // defined(__EMSCRIPTEN__) && defined(ORCA_DISABLE_OPENVDB)
++
+ #ifdef _MSC_VER
+ // Suppress warning C4146 in include/gmp.h(2177,31): unary minus operator applied to unsigned type, result still unsigned 
+ #pragma warning(push)
+@@ -45,4 +84,8 @@ openvdb::FloatGrid::Ptr redistance_grid(const openvdb::FloatGrid &grid,
+ 
+ } // namespace Slic3r
+ 
++#endif // defined(__EMSCRIPTEN__) && defined(ORCA_DISABLE_OPENVDB)
++
+ #endif // OPENVDBUTILS_HPP
++
++
+diff --git a/src/libslic3r/PNGReadWrite.cpp b/src/libslic3r/PNGReadWrite.cpp
+index 32b9a8f..023a78f 100644
+--- a/src/libslic3r/PNGReadWrite.cpp
++++ b/src/libslic3r/PNGReadWrite.cpp
+@@ -2,6 +2,7 @@
+ 
+ #include <memory>
+ 
++#include <cassert>
+ #include <cstdio>
+ #include <png.h>
+ 
+diff --git a/src/libslic3r/Platform.cpp b/src/libslic3r/Platform.cpp
+index 3387521..1f1e09a 100644
+--- a/src/libslic3r/Platform.cpp
++++ b/src/libslic3r/Platform.cpp
+@@ -55,6 +55,10 @@ void detect_platform()
+             }
+         }
+     }
++#elif defined(__EMSCRIPTEN__)
++    BOOST_LOG_TRIVIAL(info) << "Platform: Emscripten";
++    s_platform        = Platform::Linux;
++    s_platform_flavor = PlatformFlavor::GenericLinux;
+ #elif defined(__linux__)
+     BOOST_LOG_TRIVIAL(info) << "Platform: Linux";
+ 	s_platform 		  = Platform::Linux;
+diff --git a/src/libslic3r/Print.hpp b/src/libslic3r/Print.hpp
+index 2dfec7e..e54c93e 100644
+--- a/src/libslic3r/Print.hpp
++++ b/src/libslic3r/Print.hpp
+@@ -937,8 +937,8 @@ public:
+     // If preview_data is not null, the preview_data is filled in for the G-code visualization (not used by the command line Slic3r).
+     std::string         export_gcode(const std::string& path_template, GCodeProcessorResult* result, ThumbnailsGeneratorCallback thumbnail_cb = nullptr);
+     //return 0 means successful
+-    int                 export_cached_data(const std::string& dir_path, bool with_space=false);
+-    int                 load_cached_data(const std::string& directory);
++    int                 export_cached_data(const std::string& dir_path, bool with_space=false) override;
++    int                 load_cached_data(const std::string& directory) override;
+ 
+     // methods for handling state
+     bool                is_step_done(PrintStep step) const { return Inherited::is_step_done(step); }
+diff --git a/src/libslic3r/SLA/Hollowing.cpp b/src/libslic3r/SLA/Hollowing.cpp
+index df62127..ed3a1a2 100644
+--- a/src/libslic3r/SLA/Hollowing.cpp
++++ b/src/libslic3r/SLA/Hollowing.cpp
+@@ -19,6 +19,53 @@
+ //! return same string
+ #define L(s) Slic3r::I18N::translate(s)
+ 
++#if defined(__EMSCRIPTEN__) && defined(ORCA_DISABLE_OPENVDB)
++
++namespace Slic3r {
++namespace sla {
++
++struct Interior {
++    indexed_triangle_set mesh;
++};
++
++void InteriorDeleter::operator()(Interior *p)
++{
++    delete p;
++}
++
++indexed_triangle_set &get_mesh(Interior &interior)
++{
++    return interior.mesh;
++}
++
++const indexed_triangle_set &get_mesh(const Interior &interior)
++{
++    return interior.mesh;
++}
++
++InteriorPtr generate_interior(const TriangleMesh &, const HollowingConfig &, const JobController &)
++{
++    return {};
++}
++
++void hollow_mesh(TriangleMesh &, const HollowingConfig &, int) {}
++
++void hollow_mesh(TriangleMesh &, const Interior &, int) {}
++
++void remove_inside_triangles(TriangleMesh &, const Interior &, const std::vector<bool> &) {}
++
++double get_distance(const Vec3f &, const Interior &)
++{
++    return 0.0;
++}
++
++void cut_drainholes(std::vector<ExPolygons> &, const std::vector<float> &, float, const DrainHoles &, std::function<void(void)>) {}
++
++} // namespace sla
++} // namespace Slic3r
++
++#else
++
+ namespace Slic3r {
+ namespace sla {
+ 
+@@ -561,3 +608,5 @@ void remove_inside_triangles(TriangleMesh &mesh, const Interior &interior,
+ }
+ 
+ }} // namespace Slic3r::sla
++
++#endif // defined(__EMSCRIPTEN__) && defined(ORCA_DISABLE_OPENVDB)
+diff --git a/src/libslic3r/Shape/TextShape.cpp b/src/libslic3r/Shape/TextShape.cpp
+index dce731a..95047f4 100644
+--- a/src/libslic3r/Shape/TextShape.cpp
++++ b/src/libslic3r/Shape/TextShape.cpp
+@@ -6,7 +6,9 @@
+ 
+ #include <string>
+ #include <vector>
++#include <map>
+ 
++#ifndef SLIC3R_NO_OCCT
+ #include "Standard_TypeDef.hxx"
+ #include "STEPCAFControl_Reader.hxx"
+ #include "BRepMesh_IncrementalMesh.hxx"
+@@ -27,9 +29,12 @@
+ #include "Font_BRepTextBuilder.hxx"
+ #include "BRepPrimAPI_MakePrism.hxx"
+ #include "Font_FontMgr.hxx"
++#endif
+ 
+ #include <boost/log/trivial.hpp>
+ 
++#ifndef SLIC3R_NO_OCCT
++
+ namespace Slic3r {
+ 
+ static std::map<std::string, std::string> g_occt_fonts_maps; //map<font_name, font_path>
+@@ -270,3 +275,27 @@ void load_text_shape(const char*text, const char* font, const float text_height,
+ }
+ 
+ }; // namespace Slic3r
++
++#else // SLIC3R_NO_OCCT
++
++namespace Slic3r {
++
++std::vector<std::string> init_occt_fonts()
++{
++    return {};
++}
++
++std::map<std::string, std::string> get_occt_fonts_maps()
++{
++    return {};
++}
++
++void load_text_shape(const char * /*text*/, const char * /*font*/, const float /*text_height*/, const float /*thickness*/, bool /*is_bold*/, bool /*is_italic*/, TextResult &text_result)
++{
++    text_result.text_mesh = TriangleMesh{};
++    text_result.text_width = 0.0;
++}
++
++} // namespace Slic3r
++
++#endif // SLIC3R_NO_OCCT
+diff --git a/src/libslic3r/Support/SupportMaterial.cpp b/src/libslic3r/Support/SupportMaterial.cpp
+index 7580976..7866e2a 100644
+--- a/src/libslic3r/Support/SupportMaterial.cpp
++++ b/src/libslic3r/Support/SupportMaterial.cpp
+@@ -1587,7 +1587,7 @@ static inline std::tuple<Polygons, Polygons, double> detect_contacts(
+ 
+         // Cache support trimming polygons derived from lower layer polygons, possible merged with "on build plate only" trimming polygons.
+         auto slices_margin_update =
+-            [&slices_margin, &layer, &lower_layer, &lower_layer_polygons, buildplate_only, has_enforcer, &annotations, layer_id]
++            [&slices_margin, &lower_layer, &lower_layer_polygons, buildplate_only, has_enforcer, &annotations, layer_id]
+         (float slices_margin_offset, float no_interface_offset) {
+             if (slices_margin.offset != slices_margin_offset) {
+                 slices_margin.offset = slices_margin_offset;
+diff --git a/src/libslic3r/Thread.cpp b/src/libslic3r/Thread.cpp
+index 3030b6d..52d25a4 100644
+--- a/src/libslic3r/Thread.cpp
++++ b/src/libslic3r/Thread.cpp
+@@ -34,7 +34,7 @@ static bool WindowsGetSetThreadNameAPIInitialize()
+ {
+ 	if (! s_SetGetThreadDescriptionInitialized) {
+ 		// Not thread safe! It is therefore a good idea to name the main thread before spawning worker threads
+-		// to initialize 
++		// to initialize
+ 		s_hKernel32 = LoadLibraryW(L"Kernel32.dll");
+ 		if (s_hKernel32) {
+ 			s_fnSetThreadDescription = (SetThreadDescriptionType)::GetProcAddress(s_hKernel32, "SetThreadDescription");
+@@ -137,7 +137,7 @@ bool set_thread_name(std::thread &thread, const char *thread_name)
+ 
+ bool set_thread_name(boost::thread &thread, const char *thread_name)
+ {
+-// not supported	
++// not supported
+ //   	pthread_setname_np(thread.native_handle(), thread_name);
+ 	return false;
+ }
+@@ -150,7 +150,7 @@ bool set_current_thread_name(const char *thread_name)
+ 
+ std::optional<std::string> get_current_thread_name()
+ {
+-// not supported	
++// not supported
+ //	char buf[16];
+ //	return std::string(thread_getname_np(buf, 16) == 0 ? buf : "");
+ 	return std::nullopt;
+@@ -158,6 +158,28 @@ std::optional<std::string> get_current_thread_name()
+ 
+ #else
+ 
++#if defined(__EMSCRIPTEN__)
++// Emscripten runs single-threaded; pthread naming APIs are unavailable.
++bool set_thread_name(std::thread &, const char *)
++{
++	return false;
++}
++
++bool set_thread_name(boost::thread &, const char *)
++{
++	return false;
++}
++
++bool set_current_thread_name(const char *)
++{
++	return false;
++}
++
++std::optional<std::string> get_current_thread_name()
++{
++	return std::nullopt;
++}
++#else
+ // posix
+ bool set_thread_name(std::thread &thread, const char *thread_name)
+ {
+@@ -182,6 +204,7 @@ std::optional<std::string> get_current_thread_name()
+ 	char buf[16];
+ 	return std::string(pthread_getname_np(pthread_self(), buf, 16) == 0 ? buf : "");
+ }
++#endif
+ 
+ #endif
+ 
+diff --git a/src/libslic3r/utils.cpp b/src/libslic3r/utils.cpp
+index 455c19c..5470152 100644
+--- a/src/libslic3r/utils.cpp
++++ b/src/libslic3r/utils.cpp
+@@ -49,6 +49,7 @@
+ #include <boost/log/trivial.hpp>
+ #include <boost/log/expressions.hpp>
+ #include <boost/log/sinks/text_file_backend.hpp>
++#include <boost/log/sinks/unlocked_frontend.hpp>
+ #include <boost/log/utility/setup/file.hpp>
+ #include <boost/log/utility/setup/common_attributes.hpp>
+ #include <boost/log/sources/severity_logger.hpp>
+@@ -162,7 +163,13 @@ unsigned get_logging_level()
+     }
+ }
+ 
+-boost::shared_ptr<boost::log::sinks::synchronous_sink<boost::log::sinks::text_file_backend>> g_log_sink;
++#ifdef BOOST_LOG_NO_THREADS
++// Single-threaded Boost.Log (WASM): add_file_log() yields an unlocked_sink.
++using orca_log_sink_t = boost::log::sinks::unlocked_sink<boost::log::sinks::text_file_backend>;
++#else
++using orca_log_sink_t = boost::log::sinks::synchronous_sink<boost::log::sinks::text_file_backend>;
++#endif
++boost::shared_ptr<orca_log_sink_t> g_log_sink;
+ 
+ // Force set_logging_level(<=error) after loading of the DLL.
+ // This is currently only needed if libslic3r is loaded as a shared library into Perl interpreter
+@@ -364,7 +371,9 @@ void set_log_path_and_level(const std::string& file, unsigned int level)
+ 			expr::stream
+ 			<< "[" << expr::attr< logging::trivial::severity_level >("Severity") << "]\t"
+ 			<< expr::format_date_time< boost::posix_time::ptime >("TimeStamp", "%Y-%m-%d %H:%M:%S.%f")
++#ifndef BOOST_LOG_NO_THREADS
+ 			<<"[Thread " << expr::attr<attrs::current_thread_id::value_type>("ThreadID") << "]"
++#endif
+ 			<< ":" << expr::smessage
+ 		)
+ 	);
+@@ -1134,6 +1143,12 @@ std::string decode_path(const char *src)
+ 
+ std::string normalize_utf8_nfc(const char *src)
+ {
++#ifdef __EMSCRIPTEN__
++    // Boost.Locale is not linked in the single-threaded WASM build (b2 forces
++    // threading=multi for it). Without ICU its posix backend performs no
++    // normalization either, so returning the input is behaviour-identical.
++    return src;
++#endif
+     static std::locale locale_utf8(boost::locale::generator().generate(""));
+     return boost::locale::normalize(src, boost::locale::norm_nfc, locale_utf8);
+ }

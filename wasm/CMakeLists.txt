@@ -114,6 +114,12 @@ add_compile_definitions(
   _LIBCPP_DISABLE_DEPRECATION_WARNINGS=1)
 
 # ---- orca configuration ------------------------------------------------------
+# ORCA_SRC_DIR: the OrcaSlicer tree to build (default ../orca). Forks with the
+# same libslic3r layout build the same way, e.g. ../fullspectrum (engine id
+# CS_ENGINE_ID=fullspectrum).
+set(ORCA_SRC_DIR "${CMAKE_CURRENT_LIST_DIR}/../orca" CACHE PATH "OrcaSlicer source tree")
+set(CS_ENGINE_ID "orca" CACHE STRING "Engine id reported by cs_version")
+set(SLIC3R_WITH_ASSIMP OFF CACHE BOOL "" FORCE)
 set(SLIC3R_STATIC ON CACHE BOOL "" FORCE)
 set(SLIC3R_GUI OFF CACHE BOOL "" FORCE)
 set(SLIC3R_PCH OFF CACHE BOOL "" FORCE)
@@ -130,19 +136,19 @@ if(NOT ORCA_WASM_THREADS)
 endif()
 include(${CMAKE_CURRENT_LIST_DIR}/cmake/FindTBB.cmake)  # shim or real TBB::* targets
 
-add_subdirectory(../orca ${CMAKE_BINARY_DIR}/orca-build EXCLUDE_FROM_ALL)
+add_subdirectory(${ORCA_SRC_DIR} ${CMAKE_BINARY_DIR}/orca-build EXCLUDE_FROM_ALL)
 
 # VoronoiUtilsCgal.cpp lives in libslic3r but needs the (real) CGAL headers;
 # scope the include to that one file so the rest of libslic3r is unaffected.
 set_source_files_properties(
-  ${CMAKE_CURRENT_LIST_DIR}/../orca/src/libslic3r/Geometry/VoronoiUtilsCgal.cpp
-  DIRECTORY ${CMAKE_CURRENT_LIST_DIR}/../orca/src/libslic3r
+  ${ORCA_SRC_DIR}/src/libslic3r/Geometry/VoronoiUtilsCgal.cpp
+  DIRECTORY ${ORCA_SRC_DIR}/src/libslic3r
   PROPERTIES COMPILE_OPTIONS "-isystem;${WASM_CGAL_PREFIX}/include;-frounding-math")
 
 set(ORCA_WASM_ASSERT_DIRS "" CACHE STRING "libslic3r subdirs (e.g. Arachne) compiled with assert() enabled")
 foreach(_d ${ORCA_WASM_ASSERT_DIRS})
-  file(GLOB _asrc ${CMAKE_CURRENT_LIST_DIR}/../orca/src/libslic3r/${_d}/*.cpp)
-  set_source_files_properties(${_asrc} DIRECTORY ${CMAKE_CURRENT_LIST_DIR}/../orca/src/libslic3r
+  file(GLOB _asrc ${ORCA_SRC_DIR}/src/libslic3r/${_d}/*.cpp)
+  set_source_files_properties(${_asrc} DIRECTORY ${ORCA_SRC_DIR}/src/libslic3r
     PROPERTIES COMPILE_OPTIONS "-UNDEBUG;-g")
 endforeach()
 
@@ -159,12 +165,13 @@ endif()
 add_executable(slicer ../bridge/cs_bridge.cpp ${CMAKE_CURRENT_LIST_DIR}/../../wasm-bridge/cs_fast_strtod.cpp)
 set_target_properties(slicer PROPERTIES OUTPUT_NAME "slicer" SUFFIX ".mjs")
 target_include_directories(slicer PRIVATE
-  ../orca/src
-  ../orca/deps_src
+  ${ORCA_SRC_DIR}/src
+  ${ORCA_SRC_DIR}/deps_src
   ${CMAKE_BINARY_DIR}/orca-build/src/libslic3r
   ${CMAKE_CURRENT_LIST_DIR}/../../wasm-bridge)
 target_link_libraries(slicer PRIVATE libslic3r libslic3r_cgal ${Boost_LIBRARIES}
   "${WASM_DEPS_PREFIX}/lib/libmpfr.a" "${WASM_DEPS_PREFIX}/lib/libgmp.a")
+target_compile_definitions(slicer PRIVATE CS_ENGINE_ID="${CS_ENGINE_ID}")
 if(ORCA_WASM_THREADS)
   target_link_libraries(slicer PRIVATE TBB::tbb TBB::tbbmalloc)
   target_compile_definitions(slicer PRIVATE CS_ENGINE_THREADS=1)
@@ -193,9 +200,11 @@ set(_link
   "-sEXPORTED_RUNTIME_METHODS=['HEAPU8','HEAP32','HEAPU32','UTF8ToString','stringToUTF8','lengthBytesUTF8','FS']"
   # libslic3r reads only resources/info (nozzle tables) and resources/flush
   # (MM flush matrices) at slice time — ~40 KB. Profiles are resolved in JS.
-  "--preload-file=${CMAKE_CURRENT_LIST_DIR}/../orca/resources/info@/resources/info"
-  "--preload-file=${CMAKE_CURRENT_LIST_DIR}/../orca/resources/flush@/resources/flush"
+  "--preload-file=${ORCA_SRC_DIR}/resources/info@/resources/info"
 )
+if(EXISTS "${ORCA_SRC_DIR}/resources/flush")  # not in every fork (FullSpectrum has none)
+  list(APPEND _link "--preload-file=${ORCA_SRC_DIR}/resources/flush@/resources/flush")
+endif()
 # Module hooks the host passes in (anything not listed is silently ignored in
 # release builds) and the engine ABI exports — shared by both variants; the
 # pthreads build appends its extras below.

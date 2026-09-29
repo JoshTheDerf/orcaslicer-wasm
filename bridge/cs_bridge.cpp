@@ -23,6 +23,9 @@
 #include <libslic3r/GCode/GCodeProcessor.hpp>
 #include <libslic3r/Layer.hpp>
 #include <libslic3r/Model.hpp>
+#if __has_include(<libslic3r/MixedFilament.hpp>)
+#include <libslic3r/MixedFilament.hpp>
+#endif
 #include <libslic3r/Orient.hpp>
 #include <libslic3r/Geometry.hpp>
 #include <libslic3r/PlaceholderParser.hpp>
@@ -31,7 +34,21 @@
 #include <libslic3r/PrintConfig.hpp>
 #include <libslic3r/TriangleMesh.hpp>
 #include <libslic3r/Utils.hpp>
+#if __has_include("libslic3r_version.h")
 #include "libslic3r_version.h"  // generated into orca-build/src/libslic3r
+#else
+#include "common_func/common_func.hpp"  // Snapmaker Orca forks (e.g. FullSpectrum) keep versions here
+#endif
+#ifndef CS_ENGINE_ID
+#define CS_ENGINE_ID "orca"
+#endif
+#if defined(FULLSPECTRUM_VERSION)
+#define CS_ENGINE_VERSION FULLSPECTRUM_VERSION
+// Snapmaker Orca forks track an older OrcaSlicer (2.3.x) libslic3r API.
+#define CS_ORCA_LEGACY_API 1
+#else
+#define CS_ENGINE_VERSION SoftFever_VERSION
+#endif
 
 #include <atomic>
 #include <chrono>
@@ -185,8 +202,10 @@ std::string type_name(ConfigOptionType t)
     case coPoint3: return "point3";
     case coBool: return "bool";              case coBools: return "bools";
     case coEnum: return "enum";              case coEnums: return "enums";
+#ifndef CS_ORCA_LEGACY_API
     case coPointsGroups: return "pointsGroups";
     case coIntsGroups: return "intsGroups";
+#endif
     default: return "none";
     }
 }
@@ -432,10 +451,12 @@ int slice_impl(const char* job_json, int job_len, const uint8_t* blob, int blob_
         auto& fmap = config.option<ConfigOptionInts>("filament_map", true)->values;
         if (int(fmap.size()) < filament_count) fmap.resize(filament_count, 1);
         if (extruder_count == 1) std::fill(fmap.begin(), fmap.end(), 1);
+#ifndef CS_ORCA_LEGACY_API
         if (!config.has("nozzle_volume_type")) {
             auto* nvt = config.option<ConfigOptionEnumsGeneric>("nozzle_volume_type", true);
             nvt->values.resize(extruder_count, nvtStandard);
         }
+#endif
     }
     config.normalize_fdm();
 
@@ -505,7 +526,10 @@ int slice_impl(const char* job_json, int job_len, const uint8_t* blob, int blob_
             {"flow_rate", CalibMode::Calib_Flow_Rate}, {"temp_tower", CalibMode::Calib_Temp_Tower}, {"vol_speed_tower", CalibMode::Calib_Vol_speed_Tower},
             {"vfa_tower", CalibMode::Calib_VFA_Tower}, {"retraction_tower", CalibMode::Calib_Retraction_tower},
             {"input_shaping_freq", CalibMode::Calib_Input_shaping_freq}, {"input_shaping_damp", CalibMode::Calib_Input_shaping_damp},
-            {"cornering", CalibMode::Calib_Cornering}};
+#ifndef CS_ORCA_LEGACY_API
+            {"cornering", CalibMode::Calib_Cornering},
+#endif
+        };
         auto mi = modes.find(job.calib.value("mode", std::string()));
         if (mi == modes.end()) throw cs::JobError("unknown calibration mode");
         cp.mode = mi->second;
@@ -517,7 +541,9 @@ int slice_impl(const char* job_json, int job_len, const uint8_t* blob, int blob_
         cp.freqStartX = job.calib.value("freqStartX", 0.0); cp.freqEndX = job.calib.value("freqEndX", 0.0);
         cp.freqStartY = job.calib.value("freqStartY", 0.0); cp.freqEndY = job.calib.value("freqEndY", 0.0);
         cp.test_model = job.calib.value("testModel", 0);
+#ifndef CS_ORCA_LEGACY_API
         cp.shaper_type = job.calib.value("shaperType", std::string());
+#endif
         if (auto a = job.calib.find("accelerations"); a != job.calib.end() && a->is_array()) for (const json& v : *a) cp.accelerations.push_back(v.get<double>());
         if (auto a = job.calib.find("speeds"); a != job.calib.end() && a->is_array()) for (const json& v : *a) cp.speeds.push_back(v.get<double>());
         print.set_calib_params(cp);
@@ -546,9 +572,11 @@ int slice_impl(const char* job_json, int job_len, const uint8_t* blob, int blob_
     ::unlink(out_path.c_str());
     const std::string written = print.export_gcode(out_path, &result, nullptr);
     const double t2 = now_ms();
+#ifndef CS_ORCA_LEGACY_API
     if (result.gcode_check_result.error_code)
         warnings.push_back({{"code", "unprintable_area"},
                             {"message", "G-code contains moves outside the printable area."}});
+#endif
 
     // Read the G-code straight into the output buffer (no intermediate copy),
     // then drop the MEMFS file so peak memory stays ~2x the G-code size.
@@ -618,7 +646,7 @@ std::string describe_impl()
         o["scope"] = scope_of(key);
         opts[key] = std::move(o);
     }
-    return json{{"engine", "orca"}, {"version", SoftFever_VERSION}, {"options", std::move(opts)}}.dump();
+    return json{{"engine", CS_ENGINE_ID}, {"version", CS_ENGINE_VERSION}, {"options", std::move(opts)}}.dump();
 }
 
 } // namespace
@@ -627,7 +655,7 @@ extern "C" {
 
 EMSCRIPTEN_KEEPALIVE const char* cs_version(void)
 {
-    static const std::string v = json{{"engine", "orca"}, {"version", SoftFever_VERSION},
+    static const std::string v = json{{"engine", CS_ENGINE_ID}, {"version", CS_ENGINE_VERSION},
                                       {"bridge", cs::BRIDGE_ABI},
 #ifdef NDEBUG
                                       {"build", "release"}
@@ -1108,6 +1136,61 @@ void update_cut_id(CutObjectBase& cut_id, ModelObjectCutAttributes attributes, i
     if (n > 0) cut_id.increase_check_sum(size_t(n));
 }
 
+#if __has_include(<libslic3r/MixedFilament.hpp>)
+#define CS_HAS_MIXED_FILAMENTS 1
+// FullSpectrum mixed (virtual) filaments: the same regeneration Print::apply
+// runs (auto pairs from the physical colours + the user's custom rows), plus
+// edits. args: { colors:[hex], definitions:"<mixed_filament_definitions>",
+// edits:[{op:"add",a,b,percent} | {op:"remove",stableId} | {op:"percent",stableId,percent}] }.
+// result: { definitions, filaments:[{id, stableId, custom, a, b, percent, components, color}] }.
+void op_mixed_filaments(const json& args, ToolOut& out)
+{
+    std::vector<std::string> colors;
+    for (const json& c : args.value("colors", json::array())) colors.push_back(c.is_string() ? c.get<std::string>() : std::string("#26A69A"));
+    if (colors.size() > MixedFilamentManager::kMaxPhysicalFilaments) colors.resize(MixedFilamentManager::kMaxPhysicalFilaments);
+    const size_t n = colors.size();
+    MixedFilamentManager mgr;
+    mgr.clear_custom_entries();
+    mgr.auto_generate(colors);
+    mgr.load_custom_entries(args.value("definitions", std::string()), colors);
+    auto clampi = [](int v, int lo, int hi) { return std::max(lo, std::min(hi, v)); };
+    for (const json& e : args.value("edits", json::array())) {
+        const std::string op = e.value("op", std::string());
+        if (op == "add") {
+            const unsigned a = unsigned(e.value("a", 1)), b = unsigned(e.value("b", 2));
+            if (a < 1 || b < 1 || a > n || b > n || a == b) throw cs::JobError("mixed filament: components must be two different physical filaments");
+            mgr.add_custom_filament(a, b, clampi(e.value("percent", 50), 0, 100), colors);
+        } else if (op == "remove" || op == "percent") {
+            const uint64_t id = e.value("stableId", uint64_t(0));
+            auto& rows = mgr.mixed_filaments();
+            for (size_t i = 0; i < rows.size(); ++i) {
+                if (rows[i].stable_id != id) continue;
+                MixedFilamentLegacyRow r = rows[i];
+                if (op == "remove") r.deleted = true; else r.mix_b_percent = clampi(e.value("percent", 50), 0, 100);
+                mgr.set_mixed_filament_legacy_row(i, r, n, colors);
+                break;
+            }
+        }
+    }
+    mgr.refresh_display_colors(colors);
+    json list = json::array();
+    const auto& rows = mgr.mixed_filament_legacy_rows();
+    for (unsigned id = unsigned(n) + 1; id <= unsigned(n + rows.size()); ++id) {
+        const int idx = mgr.mixed_index_from_filament_id(id, n);
+        if (idx < 0 || size_t(idx) >= rows.size()) continue;
+        const MixedFilamentLegacyRow& r = rows[size_t(idx)];
+        if (r.deleted) continue;
+        json comps = json::array();
+        for (unsigned c : MixedFilamentManager::decode_gradient_component_ids(r.gradient_component_ids, n)) comps.push_back(c);
+        if (comps.empty()) comps = json::array({r.component_a, r.component_b});
+        list.push_back({{"id", id}, {"stableId", r.stable_id}, {"custom", r.custom}, {"a", r.component_a}, {"b", r.component_b},
+                        {"percent", r.mix_b_percent}, {"components", comps}, {"color", r.display_color}});
+    }
+    out.result["definitions"] = mgr.serialize_custom_entries();
+    out.result["filaments"] = list;
+}
+#endif
+
 void op_cut(const json& args, std::vector<ToolMesh>& meshes, ToolOut& out)
 {
     const json vols = args.value("volumes", json::array());
@@ -1190,8 +1273,11 @@ void op_cut(const json& args, std::vector<ToolMesh>& meshes, ToolOut& out)
         only_if(flag("flipUpper"), ModelObjectCutAttribute::FlipUpper) |
         only_if(flag("flipLower"), ModelObjectCutAttribute::FlipLower) |
         only_if(dowels > 0, ModelObjectCutAttribute::CreateDowels) |
-        only_if(!has_connectors && !groove, ModelObjectCutAttribute::InvalidateCutInfo) |
-        only_if(flag("keepPaint", true), ModelObjectCutAttribute::KeepPaint);
+        only_if(!has_connectors && !groove, ModelObjectCutAttribute::InvalidateCutInfo)
+#ifndef CS_ORCA_LEGACY_API
+        | only_if(flag("keepPaint", true), ModelObjectCutAttribute::KeepPaint)
+#endif
+        ;
     update_cut_id(mo->cut_id, attrs, dowels);
 
     Cut cutter(mo, 0, cut_matrix, attrs);
@@ -1202,8 +1288,12 @@ void op_cut(const json& args, std::vector<ToolMesh>& meshes, ToolOut& out)
         gr.depth = g.value("depth", 5.f); gr.width = g.value("width", 5.f);
         gr.flaps_angle = g.value("flapsAngle", float(PI / 3)); gr.angle = g.value("angle", 0.f);
         gr.depth_tolerance = g.value("depthTolerance", 0.1f); gr.width_tolerance = g.value("widthTolerance", 0.1f);
+#ifdef CS_ORCA_LEGACY_API
+        result = &cutter.perform_with_groove(gr, rotation_m, flag("keepAsParts"));
+#else
         result = &cutter.perform_with_groove(gr, rotation_m, std::max(1, g.value("count", 1)), g.value("gap", 0.f),
                                              g.value("radius", 50.f), flag("keepAsParts"));
+#endif
     } else {
         result = &cutter.perform_with_plane();
     }
@@ -1257,6 +1347,9 @@ int tool_impl(const char* job_json, int job_len, const uint8_t* blob, int blob_l
         else if (op == "layer_profile_adaptive") op_layer_profile(args, meshes, out, false);
         else if (op == "layer_profile_smooth") op_layer_profile(args, meshes, out, true);
         else if (op == "cut") op_cut(args, meshes, out);
+#ifdef CS_HAS_MIXED_FILAMENTS
+        else if (op == "mixed_filaments") op_mixed_filaments(args, out);
+#endif
         else throw cs::JobError("unknown tool '" + op + "'");
         rep["ok"] = true;
     } catch (const std::bad_alloc&) {
