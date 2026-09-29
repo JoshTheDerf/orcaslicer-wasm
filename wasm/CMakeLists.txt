@@ -104,6 +104,9 @@ else()
 endif()
 include_directories(SYSTEM "${WASM_DEPS_PREFIX}/include" "${WASM_DEPS_PREFIX}/include/eigen3")
 
+# Emscripten ports: at compile time too, so a fresh emsdk fetches their headers (jpeglib.h, png.h, …).
+add_compile_options(-sUSE_ZLIB=1 -sUSE_LIBPNG=1 -sUSE_LIBJPEG=1 -sUSE_FREETYPE=1)
+
 add_compile_definitions(
   WASM_BUILD=1
   BOOST_LOG_STATIC_LINK

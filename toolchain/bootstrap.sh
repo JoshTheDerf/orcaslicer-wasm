@@ -40,4 +40,6 @@ if [[ ! -x tools/bin/m4 ]] && ! command -v m4 >/dev/null; then
   (cd m4-src && ./configure --prefix="$HERE/tools" >/dev/null && make -j"$(nproc 2>/dev/null || echo 4)" >/dev/null && make install >/dev/null)
   rm -rf m4-src
 fi
+# Emscripten ports the engines use (headers + libs land in emsdk's cache).
+emsdk/upstream/emscripten/embuilder build zlib libpng libjpeg freetype
 echo "toolchain ready: $(emsdk/upstream/emscripten/emcc --version | head -1)"
