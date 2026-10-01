@@ -25,6 +25,8 @@ scripts/build-fullspectrum.sh  the same for the FullSpectrum fork (fullspectrum/
 scripts/gen-schema.mjs      writes schema.json / version.json next to the build
 tests/cs-slice-test.mjs     end-to-end + robustness suite (node)
 tests/cs-tool-test.mjs      cs_tool: painting, layer profiles, cut + connectors / groove
+tests/cs-arrange-test.mjs   cs_tool arrange (Orca ArrangeJob): spacing, auto rotate, plates, locked / unprintable
+tests/cs-arrange-bench.mjs  arrange timing on heavy meshes, per phase
 tests/cs-fs-test.mjs        FullSpectrum: U1 profile, mixed filaments, gradients, patterns
 wasm/tests/md5_selftest.cpp native check of the MD5 shim against md5sum
 ```

@@ -28,6 +28,9 @@
 #include <libslic3r/MixedFilament.hpp>
 #endif
 #include <libslic3r/Orient.hpp>
+#include <libslic3r/Arrange.hpp>
+#include <libslic3r/ModelArrange.hpp>
+#include <libslic3r/GCode/WipeTower.hpp>
 #include <libslic3r/Geometry.hpp>
 #include <libslic3r/PlaceholderParser.hpp>
 #include <libslic3r/Preset.hpp>
@@ -51,7 +54,9 @@
 #define CS_ENGINE_VERSION SoftFever_VERSION
 #endif
 
+#include <array>
 #include <atomic>
+#include <cfloat>
 #include <chrono>
 #include <cstdio>
 #include <fstream>
@@ -1573,6 +1578,733 @@ void op_inspect_3mf(const uint8_t* blob, int blob_len, ToolOut& out)
 }
 #endif
 
+#ifndef CS_ORCA_LEGACY_API
+// -----------------------------------------------------------------------------
+// Auto arrange: OrcaSlicer's ArrangeJob (desktop "Arrange all objects" A /
+// "Arrange objects on current plate" Shift+A) with the GUI parts ported:
+// prepare_all / prepare_partplate (+ prepare_selected, which Orca has but
+// doesn't wire to a button), prepare_wipe_tower, check_unprintable, process()
+// and the PartPlateList bed-index bookkeeping of finalize().
+//
+// Request (cs_tool op "arrange"): the slice-job fields `config` (the global
+// config) and `objects` (mesh-local meshes + transform, parts, per-object
+// config, paint) at the top level, plus
+//   args: { mode: "all" | "plate" | "selection", currentPlate,
+//           plates: [{ locked, seq: "" | "by layer" | "by object", toolChanges: [extruder, …] }],
+//           items: [{ plate: -1 | index, printable, selected }]   (parallel to objects),
+//           settings: { distance, enableRotation, alignToYAxis, allowMultiMaterials, avoidCaliRegion },
+//           bbl }                                                  (BBL vendor printer)
+// Object transforms are plate-local (plate grid offset removed) for objects
+// on a plate. Result:
+//   { items: [{ plate, x, y, dRot, moved }]  (x, y: the mesh-local origin, plate-local; dRot: about world Z),
+//     plates: plate count after arranging, unplaced: [names], warnings: [text] }
+// -----------------------------------------------------------------------------
+namespace arr = Slic3r::arrangement;
+constexpr int ARRANGE_MAX_PLATES = 36; // PartPlateList::MAX_PLATES_COUNT / MAX_NUM_PLATES
+
+int cfg_int(const DynamicPrintConfig& c, const char* k, int dflt = 0)
+{
+    const ConfigOption* o = c.option(k);
+    return o ? o->getInt() : dflt;
+}
+
+// PartPlate::get_extruders(true) over the objects of one plate.
+std::vector<int> plate_extruders(const std::vector<const ModelObject*>& mos, const DynamicPrintConfig& glb, const std::vector<int>& tool_changes)
+{
+    std::vector<int> out;
+    const int glb_support_intf_extr = cfg_int(glb, "support_interface_filament");
+    const int glb_support_extr = cfg_int(glb, "support_filament");
+    int glb_outer_wall_extr = cfg_int(glb, "outer_wall_filament_id");
+    int glb_inner_wall_extr = cfg_int(glb, "inner_wall_filament_id");
+    if (glb_outer_wall_extr == 0) glb_outer_wall_extr = glb_inner_wall_extr;
+    if (glb_inner_wall_extr == 0) glb_inner_wall_extr = glb_outer_wall_extr;
+    const int glb_sparse_infill_extr = cfg_int(glb, "sparse_infill_filament_id");
+    const int glb_internal_solid_extr = cfg_int(glb, "internal_solid_filament_id");
+    int glb_top_surface_extr = cfg_int(glb, "top_surface_filament_id");
+    int glb_bottom_surface_extr = cfg_int(glb, "bottom_surface_filament_id");
+    if (glb_top_surface_extr == 0) glb_top_surface_extr = glb_internal_solid_extr;
+    if (glb_bottom_surface_extr == 0) glb_bottom_surface_extr = glb_internal_solid_extr;
+    bool glb_support = glb.has("enable_support") && glb.opt_bool("enable_support");
+    glb_support |= cfg_int(glb, "raft_layers") > 0;
+    auto obj_int = [](const ModelObject* mo, const char* k) { const ConfigOption* o = mo->config.option(k); return o ? o->getInt() : 0; };
+
+    for (const ModelObject* mo : mos) {
+        for (const ModelVolume* mv : mo->volumes) {
+            std::vector<int> ve = mv->get_extruders();
+            out.insert(out.end(), ve.begin(), ve.end());
+        }
+        for (const auto& range : mo->layer_config_ranges)
+            if (range.second.has("extruder"))
+                if (int id = range.second.option("extruder")->getInt(); id > 0) out.push_back(id);
+
+        bool obj_support = false;
+        const ConfigOption* so = mo->config.option("enable_support");
+        const ConfigOption* ro = mo->config.option("raft_layers");
+        if (so || ro) {
+            if (so) obj_support = so->getBool();
+            if (ro) obj_support |= ro->getInt() > 0;
+        } else obj_support = glb_support;
+        if (obj_support) {
+            if (int e = obj_int(mo, "support_interface_filament"); e != 0) out.push_back(e);
+            else if (glb_support_intf_extr != 0) out.push_back(glb_support_intf_extr);
+            if (int e = obj_int(mo, "support_filament"); e != 0) out.push_back(e);
+            else if (glb_support_extr != 0) out.push_back(glb_support_extr);
+        }
+        int outer = obj_int(mo, "outer_wall_filament_id");
+        if (outer == 0) outer = obj_int(mo, "inner_wall_filament_id");
+        if (outer != 0) out.push_back(outer); else if (glb_outer_wall_extr != 0) out.push_back(glb_outer_wall_extr);
+        int inner = obj_int(mo, "inner_wall_filament_id");
+        if (inner == 0) inner = obj_int(mo, "outer_wall_filament_id");
+        if (inner != 0) out.push_back(inner); else if (glb_inner_wall_extr != 0) out.push_back(glb_inner_wall_extr);
+        if (int e = obj_int(mo, "sparse_infill_filament_id"); e != 0) out.push_back(e);
+        else if (glb_sparse_infill_extr != 0) out.push_back(glb_sparse_infill_extr);
+        const int solid = obj_int(mo, "internal_solid_filament_id");
+        if (solid != 0) out.push_back(solid); else if (glb_internal_solid_extr != 0) out.push_back(glb_internal_solid_extr);
+        int top = obj_int(mo, "top_surface_filament_id");
+        if (top == 0) top = solid;
+        if (top != 0) out.push_back(top); else if (glb_top_surface_extr != 0) out.push_back(glb_top_surface_extr);
+        int bottom = obj_int(mo, "bottom_surface_filament_id");
+        if (bottom == 0) bottom = solid;
+        if (bottom != 0) out.push_back(bottom); else if (glb_bottom_surface_extr != 0) out.push_back(glb_bottom_surface_extr);
+    }
+    const int nums_extruders = glb.has("filament_colour") ? int(glb.option<ConfigOptionStrings>("filament_colour")->values.size()) : 0;
+    for (int e : tool_changes) if (e <= nums_extruders) out.push_back(e);
+    std::sort(out.begin(), out.end());
+    out.erase(std::unique(out.begin(), out.end()), out.end());
+    return out;
+}
+
+// PartPlate::estimate_wipe_tower_size.
+Vec3d estimate_wipe_tower_size(const DynamicPrintConfig& config, double w, double wipe_volume, int extruder_count, int plate_extruder_size,
+                               double max_height, bool enable_wrapping_detection)
+{
+    Vec3d size = Vec3d::Zero();
+    double layer_height = 0.08;
+    if (const ConfigOption* o = config.option("layer_height")) layer_height = o->getFloat();
+    if (plate_extruder_size == 0) return size;
+    size(2) = max_height;
+    auto timelapse_type = config.option<ConfigOptionEnum<TimelapseType>>("timelapse_type");
+    const bool need_wipe_tower = (timelapse_type ? timelapse_type->value == TimelapseType::tlSmooth : false) | enable_wrapping_detection;
+    const double extra_spacing = config.option("prime_tower_infill_gap")->getFloat() / 100.;
+    auto rib_opt = config.option<ConfigOptionEnum<WipeTowerWallType>>("wipe_tower_wall_type");
+    const bool use_rib_wall = rib_opt ? rib_opt->value == WipeTowerWallType::wtwRib : false;
+    double rib_width = config.option("wipe_tower_rib_width")->getFloat();
+    double filament_change_volume = 0.;
+    {
+        const auto* lengths = config.option<ConfigOptionFloats>("filament_change_length");
+        const double length = lengths && !lengths->values.empty() ? *std::max_element(lengths->values.begin(), lengths->values.end()) : 0;
+        const auto* diams = config.option<ConfigOptionFloats>("filament_diameter");
+        const double d = diams && !diams->values.empty() ? *std::max_element(diams->values.begin(), diams->values.end()) : 1.75;
+        filament_change_volume = length * PI * d * d / 4.;
+    }
+    double volume = wipe_volume * (extruder_count == 2 ? plate_extruder_size : (plate_extruder_size - 1));
+    if (extruder_count == 2) volume += filament_change_volume * (int) (plate_extruder_size / 2);
+    double depth;
+    if (use_rib_wall) {
+        depth = std::sqrt(volume / layer_height * extra_spacing);
+        if (need_wipe_tower || plate_extruder_size > 1) {
+            const float min_depth = WipeTower::get_limit_depth_by_height(max_height);
+            const double volume_depth = depth;
+            depth = std::max((double) min_depth, depth);
+            rib_width = std::min(rib_width, depth / 2);
+            depth = rib_width / std::sqrt(2) + std::max(depth + config.opt_float("wipe_tower_extra_rib_length"), volume_depth);
+            size(0) = size(1) = depth;
+        }
+    } else {
+        depth = volume / (layer_height * w) * extra_spacing;
+        if (need_wipe_tower || depth > EPSILON) {
+            const float min_depth = WipeTower::get_limit_depth_by_height(max_height);
+            depth = std::max((double) min_depth, depth);
+        }
+        size(0) = w;
+        size(1) = depth;
+    }
+    return size;
+}
+
+// The vertices of a mesh that decide everything arrange reads from it: the
+// ones on the convex hull of its XY projection under `W` (mesh → world: the
+// arrange outline; a rotation about Z keeps that set), the extremes along the
+// object's own axes under `L` (mesh → object: raw bounding box, the object's
+// centre) and the extremes in world Z (its height). Orca
+// builds the same outline from this subset as from the whole mesh (the 3D
+// hull's projection is the projected vertices' hull) without Orca's
+// connectivity stats and qhull over every vertex. Returns a fan "mesh" over
+// the subset, or the input when it is already small.
+void arrange_support_mesh(const std::vector<float>& pos, const std::vector<uint32_t>& idx, const Transform3d& L, const Transform3d& W,
+                          std::vector<float>& out_pos, std::vector<uint32_t>& out_idx)
+{
+    const size_t n = pos.size() / 3;
+    if (n <= 64) { out_pos = pos; out_idx = idx; return; }
+    std::vector<char> keep(n, 0);
+    std::array<size_t, 8> ext{};
+    std::array<double, 8> val{ DBL_MAX, -DBL_MAX, DBL_MAX, -DBL_MAX, DBL_MAX, -DBL_MAX, DBL_MAX, -DBL_MAX };
+    std::vector<std::pair<Vec2d, size_t>> pts;
+    pts.reserve(n);
+    for (size_t i = 0; i < n; ++i) {
+        const Vec3d p(pos[i * 3], pos[i * 3 + 1], pos[i * 3 + 2]);
+        const Vec3d v = L * p, w = W * p;
+        pts.emplace_back(Vec2d(w.x(), w.y()), i);
+        const double c[8] = { v.x(), v.x(), v.y(), v.y(), v.z(), v.z(), w.z(), w.z() };
+        for (int k = 0; k < 8; ++k)
+            if ((k % 2 == 0) ? c[k] < val[k] : c[k] > val[k]) { val[k] = c[k]; ext[k] = i; }
+    }
+    for (size_t e : ext) keep[e] = 1;
+    // Andrew's monotone chain over the distinct projected points. Points within
+    // 10 nm of the boundary are kept too: Orca rounds to nanometres and drops
+    // collinear points itself, so keeping a superset can't change its outline.
+    std::sort(pts.begin(), pts.end(), [](const auto& a, const auto& b) { return a.first.x() < b.first.x() || (a.first.x() == b.first.x() && a.first.y() < b.first.y()); });
+    pts.erase(std::unique(pts.begin(), pts.end(), [](const auto& a, const auto& b) { return a.first == b.first; }), pts.end());
+    constexpr double TOL = 1e-5; // mm
+    // Signed distance of b from the line o→a (left positive).
+    auto side = [](const Vec2d& o, const Vec2d& a, const Vec2d& b) {
+        const Vec2d d = a - o;
+        const double len = d.norm();
+        return len > 0 ? (d.x() * (b.y() - o.y()) - d.y() * (b.x() - o.x())) / len : 0.;
+    };
+    std::vector<size_t> hull(2 * pts.size());
+    size_t k = 0;
+    for (size_t i = 0; i < pts.size(); ++i) {
+        while (k >= 2 && side(pts[hull[k - 2]].first, pts[hull[k - 1]].first, pts[i].first) < -TOL) --k;
+        hull[k++] = i;
+    }
+    for (size_t i = pts.size() - 1, t = k + 1; i-- > 0;) {
+        while (k >= t && side(pts[hull[k - 2]].first, pts[hull[k - 1]].first, pts[i].first) < -TOL) --k;
+        hull[k++] = i;
+    }
+    for (size_t i = 0; i < k; ++i) keep[pts[hull[i]].second] = 1;
+    out_pos.clear();
+    for (size_t i = 0; i < n; ++i)
+        if (keep[i]) { out_pos.push_back(pos[i * 3]); out_pos.push_back(pos[i * 3 + 1]); out_pos.push_back(pos[i * 3 + 2]); }
+    const uint32_t m = uint32_t(out_pos.size() / 3);
+    if (m < 3) { out_pos = pos; out_idx = idx; return; }
+    out_idx.clear();
+    for (uint32_t i = 1; i + 1 < m; ++i) { out_idx.push_back(0); out_idx.push_back(i); out_idx.push_back(i + 1); }
+}
+
+bool has_color_paint(const json& paint)
+{
+    auto it = paint.find("color");
+    return paint.is_object() && it != paint.end() && it->is_array() && !it->empty();
+}
+
+struct ArrangeItem {
+    ModelObject* mo = nullptr;
+    int plate = -1;
+    bool printable = true;
+    bool selected = false;
+    Vec3d centre = Vec3d::Zero(); // mesh-local bbox centre (Orca's object origin)
+    Transform3d start;            // instance matrix before arranging
+};
+
+void op_arrange(const char* job_json, int job_len, const uint8_t* blob, int blob_len, const json& args, ToolOut& out)
+{
+    auto t_last = std::chrono::steady_clock::now();
+    json timing = json::object();
+    auto lap = [&](const char* what) {
+        const auto now = std::chrono::steady_clock::now();
+        timing[what] = std::chrono::duration<double, std::milli>(now - t_last).count();
+        t_last = now;
+    };
+    cs::Job job = cs::parse_job(job_json, job_len, blob, blob_len);
+    json subs = json::array();
+    DynamicPrintConfig config;
+    config.apply(FullPrintConfig::defaults());
+    load_config_json(config, job.config, subs);
+    config.normalize_fdm();
+    lap("config");
+
+    const std::string mode = args.value("mode", std::string("all"));
+    if (mode != "all" && mode != "plate" && mode != "selection") throw cs::JobError("arrange: unknown mode '" + mode + "'");
+    const json plates_j = args.value("plates", json::array());
+    const json items_j = args.value("items", json::array());
+    const json settings = args.value("settings", json::object());
+    if (!plates_j.is_array() || plates_j.empty() || int(plates_j.size()) > ARRANGE_MAX_PLATES) throw cs::JobError("arrange: bad plate list");
+    if (!items_j.is_array() || items_j.size() != job.objects.size()) throw cs::JobError("arrange: items must match objects");
+    const int n_plates = int(plates_j.size());
+    const int current_plate = std::clamp(args.value("currentPlate", 0), 0, n_plates - 1);
+    std::vector<bool> plate_locked(n_plates);
+    std::vector<std::vector<int>> plate_tool_changes(n_plates);
+    std::vector<std::string> plate_seq(n_plates);
+    for (int i = 0; i < n_plates; ++i) {
+        const json& p = plates_j[i];
+        plate_locked[i] = p.value("locked", false);
+        plate_seq[i] = p.value("seq", std::string());
+        if (auto tc = p.find("toolChanges"); tc != p.end() && tc->is_array())
+            for (const json& e : *tc) if (e.is_number_integer()) plate_tool_changes[i].push_back(e.get<int>());
+    }
+    const bool global_by_object = config.has("print_sequence") && config.opt_enum<PrintSequence>("print_sequence") == PrintSequence::ByObject;
+    // PartPlate::get_real_print_seq: the plate's own sequence, else the global one.
+    auto plate_by_object = [&](int i, bool* same_as_global) {
+        const std::string& s = plate_seq[i];
+        const bool by_obj = s.empty() ? global_by_object : s == "by object";
+        if (same_as_global) *same_as_global = s.empty() || by_obj == global_by_object;
+        return by_obj;
+    };
+
+    // Model: one object + instance per host object, volumes centred on the
+    // mesh bounding box (as Orca loads them), the instance keeping the host's
+    // rotation / scale / mirror so arrange sees the same Euler Z.
+    Model model;
+    std::vector<ArrangeItem> items(job.objects.size());
+    for (size_t k = 0; k < job.objects.size(); ++k) {
+        const cs::MeshInput& m = job.objects[k];
+        const json& ij = items_j[k];
+        ArrangeItem& it = items[k];
+        it.plate = ij.value("plate", -1);
+        if (it.plate >= n_plates) it.plate = -1;
+        it.printable = ij.value("printable", true);
+        it.selected = ij.value("selected", false);
+        Transform3d T = Transform3d::Identity();
+        T.matrix() = Eigen::Map<const Eigen::Matrix<double, 4, 4, Eigen::ColMajor>>(m.transform);
+        const Transform3d Tinv = T.inverse();
+        static const double I[16] = {1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1};
+        ModelObject* obj = model.add_object();
+        obj->name = m.name;
+        std::vector<int> tri_map;
+        std::vector<float> sp; std::vector<uint32_t> si;
+        // Colour paint decides the volume's filaments: those keep the whole mesh (paint is per triangle).
+        const bool main_painted = has_color_paint(m.paint);
+        if (!main_painted) arrange_support_mesh(m.positions, m.indices, Transform3d::Identity(), T, sp, si);
+        ModelVolume* vol = obj->add_volume(main_painted ? bed_mesh(m.positions, m.indices, I, m.name, &tri_map) : bed_mesh(sp, si, I, m.name));
+        vol->name = m.name;
+        if (main_painted) apply_paint(vol, m.paint, tri_map);
+        for (const cs::VolumeInput& p : m.parts) {
+            Transform3d Tp = Transform3d::Identity();
+            Tp.matrix() = Eigen::Map<const Eigen::Matrix<double, 4, 4, Eigen::ColMajor>>(p.transform);
+            const Eigen::Matrix<double, 4, 4, Eigen::ColMajor> local = (Tinv * Tp).matrix();
+            std::vector<int> ptri_map;
+            const bool painted = has_color_paint(p.paint);
+            ModelVolume* pv;
+            if (painted) pv = obj->add_volume(bed_mesh(p.positions, p.indices, local.data(), p.name, &ptri_map), volume_type(p.type));
+            else {
+                arrange_support_mesh(p.positions, p.indices, Tinv * Tp, Tp, sp, si);
+                pv = obj->add_volume(bed_mesh(sp, si, local.data(), p.name), volume_type(p.type));
+            }
+            pv->name = p.name;
+            if (painted) apply_paint(pv, p.paint, ptri_map);
+            if (!p.config.empty()) {
+                DynamicPrintConfig vc;
+                load_config_json(vc, p.config, subs);
+                pv->config.assign_config(vc);
+            }
+        }
+        if (!m.config.empty()) {
+            DynamicPrintConfig oc;
+            load_config_json(oc, m.config, subs);
+            obj->config.assign_config(oc);
+        }
+        it.centre = obj->raw_mesh_bounding_box().center();
+        obj->center_around_origin(false);
+        ModelInstance* inst = obj->add_instance();
+        inst->printable = it.printable;
+        it.start = T * Eigen::Translation3d(it.centre);
+        inst->set_transformation(Geometry::Transformation(it.start));
+        it.mo = obj;
+    }
+    lap("model");
+
+    // ---- init_arrange_params ----
+    const int filament_count = int(std::max<size_t>(1, vector_size(config, "filament_diameter")));
+    Model::setExtruderParams(config, filament_count);
+    {
+        PrintConfig pc;
+        pc.apply(config, true);
+        Model::setPrintSpeedTable(config, pc);
+    }
+    // GLCanvas3D::get_arrange_settings: the "seq print" set when printing by object.
+    const bool settings_seq = global_by_object;
+    arr::ArrangeParams params;
+    {
+        Print print;
+        Model plate_model;
+        for (const ArrangeItem& it : items)
+            if (it.plate == current_plate && it.printable) plate_model.add_object(*it.mo);
+        float skirt_offset = 0;
+        try {
+            print.apply(plate_model, config);
+            skirt_offset = std::get<0>(print.object_skirt_offset());
+        } catch (const std::exception&) {}
+        const PrintConfig& pc = print.config();
+        params.clearance_height_to_rod = pc.extruder_clearance_height_to_rod.value;
+        params.clearance_height_to_lid = pc.extruder_clearance_height_to_lid.value;
+        params.clearance_radius = pc.extruder_clearance_radius.value + skirt_offset * 2;
+        params.object_skirt_offset = skirt_offset;
+        params.printable_height = pc.printable_height.value;
+        params.nozzle_height = pc.nozzle_height.value;
+        params.align_center = pc.best_object_pos.value;
+    }
+    params.allow_rotations = settings.value("enableRotation", false);
+    params.allow_multi_materials_on_same_plate = settings.value("allowMultiMaterials", true);
+    // GLCanvas3D::_render_arrange_menu: only offered (else off) for BBL printers that scan the first layer.
+    const bool bbl = args.value("bbl", false);
+    const bool scan_first_layer = config.has("scan_first_layer") && config.opt_bool("scan_first_layer");
+    params.avoid_extrusion_cali_region = bbl && scan_first_layer && settings.value("avoidCaliRegion", true);
+    params.is_seq_print = settings_seq;
+    params.min_obj_distance = scaled(std::max(0.0, settings.value("distance", 0.0)));
+    // Align to Y axis is disabled (and cleared) while auto rotation is on.
+    params.align_to_y_axis = !params.allow_rotations && settings.value("alignToYAxis", false);
+    if (mode == "plate") {
+        bool same = true;
+        params.is_seq_print = plate_by_object(current_plate, &same);
+        if (!same) params.min_obj_distance = 0;
+    }
+    if (params.is_seq_print) {
+        params.bed_shrink_x = BED_SHRINK_SEQ_PRINT;
+        params.bed_shrink_y = BED_SHRINK_SEQ_PRINT;
+    }
+    lap("params");
+
+    // ---- prepare ----
+    const Points bed_shape = get_bed_shape(config);
+    const BoundingBox bed_bb(bed_shape);
+    const double plate_width = unscaled(bed_bb.size().x()), plate_depth = unscaled(bed_bb.size().y());
+    arr::ArrangePolygons selected, unselected, unprintable, locked;
+    std::vector<int> sel_idx, unprintable_idx, locked_idx; // item index per polygon
+    auto instance_poly = [&](int k) {
+        arr::ArrangePolygon ap = get_instance_arrange_poly(items[k].mo->instances.front(), config);
+        ap.setter = nullptr;
+        return ap;
+    };
+    auto push = [](arr::ArrangePolygons& cont, std::vector<int>* idx, arr::ArrangePolygon&& ap, int k) {
+        ap.itemid = int(cont.size());
+        cont.emplace_back(std::move(ap));
+        if (idx) idx->push_back(k);
+    };
+    std::vector<int> unselected_idx;
+    // PartPlateList::preprocess_arrange_polygon: plate-local coordinates are
+    // already what the host sent, so only the bed indices are set here.
+    auto preprocess = [&](int k, arr::ArrangePolygon& ap, bool sel) {
+        const int p = items[k].plate;
+        if (p >= 0) {
+            int locked_before = 0;
+            for (int i = 0; i < p; ++i) locked_before += plate_locked[i] ? 1 : 0;
+            if (plate_locked[p]) { ap.bed_idx = p; return true; }
+            if (!sel) ap.bed_idx = p - locked_before;
+            return false;
+        }
+        if (!sel) ap.bed_idx = ARRANGE_MAX_PLATES;
+        return false;
+    };
+    bool selected_is_locked = false;
+    if (mode == "all") {
+        for (int i = 0; i < n_plates; ++i) {
+            bool same = true;
+            plate_by_object(i, &same);
+            if (!plate_locked[i] && !same) plate_locked[i] = true; // ArrangeJob locks them for the run
+        }
+        for (int k = 0; k < int(items.size()); ++k) {
+            arr::ArrangePolygon ap = instance_poly(k);
+            if (preprocess(k, ap, true)) { push(locked, &locked_idx, std::move(ap), k); selected_is_locked = true; }
+            else if (items[k].printable) push(selected, &sel_idx, std::move(ap), k);
+            else push(unprintable, &unprintable_idx, std::move(ap), k);
+        }
+        if (selected.empty())
+            out.result["warnings"].push_back(selected_is_locked ? "All the selected objects are on a locked plate.\nCannot auto-arrange these objects."
+                                                                : "No arrangeable objects are selected.");
+    } else if (mode == "selection") {
+        for (int k = 0; k < int(items.size()); ++k) {
+            arr::ArrangePolygon ap = instance_poly(k);
+            if (preprocess(k, ap, items[k].selected)) { push(locked, &locked_idx, std::move(ap), k); if (items[k].selected) selected_is_locked = true; }
+            else if (!items[k].printable) push(unprintable, &unprintable_idx, std::move(ap), k);
+            else if (items[k].selected) push(selected, &sel_idx, std::move(ap), k);
+            else push(unselected, &unselected_idx, std::move(ap), k);
+        }
+        if (selected.empty()) {
+            if (!selected_is_locked) { selected.swap(unselected); sel_idx.swap(unselected_idx); }
+            else out.result["warnings"].push_back("All the selected objects are on a locked plate.\nCannot auto-arrange these objects.");
+        }
+    } else {
+        if (plate_locked[current_plate]) {
+            out.result["warnings"].push_back("This plate is locked.\nCannot auto-arrange on this plate.");
+        } else {
+            for (int k = 0; k < int(items.size()); ++k) {
+                arr::ArrangePolygon ap = instance_poly(k);
+                const bool in_plate = items[k].plate == current_plate;
+                // preprocess_arrange_polygon_other_locked: everything off this plate stays put.
+                if (!in_plate) { ap.bed_idx = items[k].plate >= 0 ? items[k].plate : ARRANGE_MAX_PLATES; push(locked, &locked_idx, std::move(ap), k); }
+                else if (items[k].printable) push(selected, &sel_idx, std::move(ap), k);
+                else push(unprintable, &unprintable_idx, std::move(ap), k);
+            }
+        }
+    }
+
+    lap("polygons");
+    // ---- prepare_wipe_tower ----
+    const bool enable_wrapping = config.has("enable_wrapping_detection") && config.opt_bool("enable_wrapping_detection");
+    const bool only_on_partplate = mode == "plate";
+    auto plate_objects = [&](int p, bool printable_only) {
+        std::vector<const ModelObject*> mos;
+        for (const ArrangeItem& it : items) if (it.plate == p && (!printable_only || it.printable)) mos.push_back(it.mo);
+        return mos;
+    };
+    // Per-plate facts, computed once (the wipe tower loop visits up to 36 beds).
+    std::map<int, double> height_cache;
+    auto plate_max_height = [&](int p) {
+        if (auto it = height_cache.find(p); it != height_cache.end()) return it->second;
+        double h = 0;
+        for (const ModelObject* mo : plate_objects(p, false)) h = std::max(h, mo->bounding_box_exact().size().z());
+        return height_cache[p] = h;
+    };
+    std::map<int, std::vector<int>> extruder_cache;
+    auto plate_extruders_of = [&](int p) -> const std::vector<int>& {
+        if (auto it = extruder_cache.find(p); it != extruder_cache.end()) return it->second;
+        return extruder_cache[p] = plate_extruders(plate_objects(p, false), config, plate_tool_changes[p]);
+    };
+    const int nozzle_nums = int(std::max<size_t>(1, vector_size(config, "nozzle_diameter")));
+    const float tower_w = float(config.opt_float("prime_tower_width"));
+    const float prime_volume = float(config.opt_float("prime_volume"));
+    const float tower_brim = float(config.opt_float("prime_tower_brim_width"));
+    auto tower_xy = [&](int p) {
+        const auto* xs = config.option<ConfigOptionFloats>("wipe_tower_x");
+        const auto* ys = config.option<ConfigOptionFloats>("wipe_tower_y");
+        return Vec2d(xs && !xs->values.empty() ? xs->get_at(p) : 15., ys && !ys->values.empty() ? ys->get_at(p) : 220.);
+    };
+    // PartPlate::estimate_wipe_tower_polygon (the plate itself, `p_valid`, supplies the objects).
+    auto estimate_tower = [&](int bedid, int p_valid, int plate_extruder_size) {
+        if (plate_extruder_size == 0) plate_extruder_size = int(plate_extruders_of(p_valid).size());
+        const Vec3d sz = estimate_wipe_tower_size(config, tower_w, prime_volume, nozzle_nums, plate_extruder_size, plate_max_height(p_valid), enable_wrapping);
+        const float depth = float(sz(1));
+        const float margin = float(WIPE_TOWER_MARGIN) + tower_brim;
+        float brim = tower_brim;
+        if (brim < 0) brim = WipeTower::get_auto_brim_by_height(float(sz.z()));
+        Vec2d xy = tower_xy(bedid);
+        float x = std::clamp(float(xy.x()), margin, std::max(margin, float(plate_width) - tower_w - margin - brim));
+        float y = std::clamp(float(xy.y()), margin, std::max(margin, float(plate_depth) - depth - margin - brim));
+        arr::ArrangePolygon ap;
+        ap.poly.contour = Polygon({{scaled(x - brim), scaled(y - brim)}, {scaled(x + tower_w + brim), scaled(y - brim)},
+                                   {scaled(x + tower_w + brim), scaled(y + depth + brim)}, {scaled(x - brim), scaled(y + depth + brim)}});
+        ap.bed_idx = bedid;
+        ap.name = "WipeTower";
+        ap.is_virt_object = true;
+        ap.is_wipe_tower = true;
+        return ap;
+    };
+    // GLCanvas3D::reload_scene: the prepare-view wipe tower a plate shows (Orca's get_wipe_tower()).
+    const bool smooth_timelapse = config.has("timelapse_type") && config.opt_enum<TimelapseType>("timelapse_type") == TimelapseType::tlSmooth;
+    const bool enable_prime_tower = config.has("enable_prime_tower") && config.opt_bool("enable_prime_tower");
+    const int filaments_count = int(vector_size(config, "filament_colour"));
+    auto shown_tower = [&](int p, arr::ArrangePolygon& ap) {
+        const bool need = smooth_timelapse || enable_wrapping;
+        if (!enable_prime_tower || !(need || filaments_count > 1)) return false;
+        if (plate_by_object(p, nullptr) && plate_objects(p, true).size() != 1) return false;
+        const std::vector<int>& pe = plate_extruders_of(p);
+        if (!need && pe.size() < 2) return false;
+        if (plate_objects(p, false).empty()) return false;
+        const Vec3d sz = estimate_wipe_tower_size(config, tower_w, prime_volume, nozzle_nums, int(pe.size()), plate_max_height(p), enable_wrapping);
+        const Vec2d xy = tower_xy(p);
+        float brim = tower_brim;
+        if (brim < 0) brim = WipeTower::get_auto_brim_by_height(float(sz.z()));
+        BoundingBoxf bb(Vec2d(xy.x(), xy.y()), Vec2d(xy.x() + sz.x(), xy.y() + sz.y()));
+        bb.offset(brim);
+        bb.offset(brim); // get_wipe_tower_info offsets by the brim twice
+        ap = arr::ArrangePolygon{};
+        ap.poly.contour = Polygon({{scaled(bb.min.x()), scaled(bb.min.y())}, {scaled(bb.max.x()), scaled(bb.min.y())},
+                                   {scaled(bb.max.x()), scaled(bb.max.y())}, {scaled(bb.min.x()), scaled(bb.max.y())}});
+        ap.name = "WipeTower";
+        ap.is_virt_object = true;
+        ap.is_wipe_tower = true;
+        ++ap.priority;
+        ap.bed_idx = 0;
+        return true;
+    };
+    auto prepare_wipe_tower = [&]() {
+        if (!enable_prime_tower || params.is_seq_print) return;
+        bool need_wipe_tower = smooth_timelapse;
+        for (const auto& item : selected) {
+            std::set<int> e(item.extrude_ids.begin(), item.extrude_ids.end());
+            if (e.size() > 1) { need_wipe_tower = true; break; }
+        }
+        if (params.allow_multi_materials_on_same_plate) {
+            std::map<int, std::set<int>> bed_temp_to_extruders;
+            for (const auto& item : selected) for (int id : item.extrude_ids) bed_temp_to_extruders[item.bed_temp].insert(id);
+            for (const auto& be : bed_temp_to_extruders) if (be.second.size() > 1) { need_wipe_tower = true; break; }
+        }
+        std::set<int> extruder_ids;
+        if (!only_on_partplate) {
+            for (int p = 0; p < n_plates; ++p) {
+                const std::vector<int>& pe = plate_extruders_of(p);
+                extruder_ids.insert(pe.begin(), pe.end());
+            }
+        }
+        int bedid_unlocked = 0;
+        for (int bedid = 0; bedid < ARRANGE_MAX_PLATES; ++bedid) {
+            const int p_valid = std::min(bedid, n_plates - 1);
+            if (bedid < n_plates && plate_locked[p_valid]) continue;
+            arr::ArrangePolygon ap;
+            if (bedid < n_plates && shown_tower(bedid, ap)) {
+                ap.bed_idx = bedid_unlocked;
+                unselected.emplace_back(ap);
+            } else if (need_wipe_tower) {
+                if (only_on_partplate) {
+                    const std::vector<int>& pe = plate_extruders_of(p_valid);
+                    extruder_ids = std::set<int>(pe.begin(), pe.end());
+                }
+                ap = estimate_tower(bedid, p_valid, int(extruder_ids.size()));
+                ap.bed_idx = bedid_unlocked;
+                unselected.emplace_back(ap);
+            }
+            ++bedid_unlocked;
+        }
+    };
+    if (mode != "plate") prepare_wipe_tower();
+    else if (!plate_locked[current_plate]) {
+        arr::ArrangePolygon ap;
+        if (shown_tower(current_plate, ap)) unselected.emplace_back(ap);
+    }
+
+    // PartPlateList::preprocess_exclude_areas: wrapping detection + bed exclude areas, one per plate.
+    auto preprocess_exclude_areas = [&](arr::ArrangePolygons& cont, int num_plates, float inflation) {
+        auto add = [&](const Polygon& poly, const std::string& name) {
+            for (int j = 0; j < num_plates; ++j) {
+                arr::ArrangePolygon ret;
+                ret.poly.contour = poly;
+                ret.is_virt_object = true;
+                ret.bed_idx = j;
+                ret.height = 1;
+                ret.name = name;
+                ret.inflation = coord_t(inflation);
+                cont.emplace_back(ret);
+            }
+        };
+        if (enable_wrapping) {
+            if (const auto* wa = config.option<ConfigOptionPoints>("wrapping_exclude_area"); wa && !wa->values.empty()) {
+                Polygon ap;
+                for (const Vec2d& p : wa->values) ap.append({scale_(p(0)), scale_(p(1))});
+                add(ap, "WrappingRegion");
+            }
+        }
+        if (const auto* ea = config.option<ConfigOptionPoints>("bed_exclude_area"); ea && ea->values.size() >= 3) {
+            // PartPlate::m_exclude_bounding_box: the exclude area's bounding box.
+            BoundingBoxf bb;
+            for (const Vec2d& p : ea->values) bb.merge(p);
+            add(Polygon({{scaled(bb.min.x()), scaled(bb.min.y())}, {scaled(bb.max.x()), scaled(bb.min.y())},
+                         {scaled(bb.max.x()), scaled(bb.max.y())}, {scaled(bb.min.x()), scaled(bb.max.y())}}), "ExcludedRegion0");
+        }
+    };
+    preprocess_exclude_areas(unselected, mode == "plate" ? current_plate + 1 : ARRANGE_MAX_PLATES, 0.f);
+    lap("wipeTower");
+
+    // ---- check_unprintable ----
+    for (size_t i = 0; i < selected.size();) {
+        if (selected[i].poly.area() < 0.001 || selected[i].height > params.printable_height) {
+            if (selected[i].poly.area() < 0.001) out.result["warnings"].push_back("Object " + selected[i].name + " has zero size and can't be arranged.");
+            unprintable.push_back(selected[i]);
+            unprintable_idx.push_back(sel_idx[i]);
+            selected.erase(selected.begin() + i);
+            sel_idx.erase(sel_idx.begin() + i);
+        } else ++i;
+    }
+
+    // ---- process ----
+    if (bbl && params.avoid_extrusion_cali_region && scan_first_layer) {
+        Polygon ap = scaled(BoundingBoxf(Vec2d{18, 0}, Vec2d{240, 15})).polygon();
+        for (int j = 0; j < ARRANGE_MAX_PLATES; ++j) {
+            arr::ArrangePolygon ret;
+            ret.poly.contour = ap;
+            ret.is_virt_object = true;
+            ret.is_extrusion_cali_object = true;
+            ret.bed_idx = j;
+            ret.height = 1;
+            ret.name = "NonpreferedRegion0";
+            unselected.emplace_back(ret);
+        }
+    }
+    arr::update_arrange_params(params, &config, selected);
+    arr::update_selected_items_inflation(selected, &config, params);
+    arr::update_unselected_items_inflation(unselected, &config, params);
+    arr::update_selected_items_axis_align(selected, &config, params);
+    const Points bedpts = arr::get_shrink_bedpts(&config, params);
+    preprocess_exclude_areas(params.excluded_regions, 1, float(scale_(1)));
+    params.stopcondition = [] { return false; };
+    params.progressind = [](unsigned, std::string) {};
+    lap("arrangeParams");
+    if (!selected.empty()) arr::arrange(selected, unselected, bedpts, params);
+    lap("nest");
+
+    // ---- finalize ----
+    // Bed indices → plates (PartPlateList::postprocess_bed_index_for_selected /
+    // _for_current_plate); new plates are appended as needed.
+    int plate_count = n_plates;
+    json unplaced = json::array();
+    int beds = 0;
+    for (size_t i = 0; i < selected.size(); ++i) {
+        arr::ArrangePolygon& ap = selected[i];
+        if (only_on_partplate) {
+            if (ap.bed_idx == -1) {}
+            else if (ap.bed_idx == 0) ap.bed_idx += current_plate;
+            else ap.bed_idx = plate_count;
+        } else if (ap.bed_idx != -1) {
+            bool found = false;
+            for (int p = 0; p < plate_count; ++p) {
+                if (plate_locked[p]) ap.bed_idx += 1;
+                else if (ap.bed_idx <= p) { found = true; break; }
+            }
+            if (!found) {
+                while (plate_count < ARRANGE_MAX_PLATES) {
+                    const int idx = plate_count++;
+                    plate_locked.push_back(false);
+                    if (ap.bed_idx <= idx) break;
+                }
+            }
+        }
+        beds = std::max(ap.bed_idx, beds);
+    }
+    // (Orca also counts the "not on any plate" marker here, which would send
+    // unprintable objects 36 plates away; it is left out.)
+    for (const arr::ArrangePolygon& ap : locked) if (ap.bed_idx < ARRANGE_MAX_PLATES) beds = std::max(ap.bed_idx, beds);
+    for (int k : unselected_idx) if (items[k].plate >= 0) beds = std::max(items[k].plate, beds);
+
+    json res_items = json::array();
+    for (size_t k = 0; k < items.size(); ++k) res_items.push_back({{"moved", false}});
+    // postprocess_arrange_polygon + apply(): the new instance matrix → the host's mesh-origin position.
+    auto emit = [&](int k, const arr::ArrangePolygon& ap, Vec2d tr, int bed) {
+        ArrangeItem& it = items[k];
+        Geometry::Transformation t(it.start);
+        const double rot0 = t.get_rotation().z();
+        ModelInstance* inst = it.mo->instances.front();
+        inst->apply_arrange_result(tr, ap.rotation);
+        const Transform3d M = inst->get_matrix() * Eigen::Translation3d(-it.centre);
+        const Vec3d origin = M.translation();
+        res_items[k] = {{"moved", true}, {"plate", bed}, {"x", origin.x()}, {"y", origin.y()}, {"dRot", ap.rotation - rot0}};
+    };
+    for (size_t i = 0; i < selected.size(); ++i) {
+        arr::ArrangePolygon ap = selected[i];
+        const int k = sel_idx[i];
+        Vec2d tr = ap.translation.cast<double>();
+        int bed = ap.bed_idx;
+        if (bed == -1) {
+            // Doesn't fit any plate: Orca parks it in the top-left corner of the plate after the last.
+            bed = plate_count;
+            const BoundingBox apbox = get_extents(ap.transformed_poly());
+            const Vec2crd s = apbox.size();
+            tr = Vec2d(0.5 * s.x(), scaled<double>(plate_depth) - 0.5 * s.y());
+            unplaced.push_back(items[k].mo->name);
+        }
+        emit(k, ap, tr, bed);
+    }
+    // Unprintable items go to the bed after the last one used (Orca's last virtual bed).
+    for (size_t i = 0; i < unprintable.size(); ++i) {
+        const arr::ArrangePolygon& ap = unprintable[i];
+        emit(unprintable_idx[i], ap, ap.translation.cast<double>(), beds + 1);
+    }
+    out.result["items"] = res_items;
+    out.result["plates"] = plate_count;
+    out.result["unplaced"] = unplaced;
+    out.result["seqPrint"] = params.is_seq_print;
+    // Arrange order (Orca sorts objects by it after arranging; it is the by-object print order).
+    std::vector<std::pair<int, int>> by_item;
+    for (size_t i = 0; i < selected.size(); ++i) by_item.emplace_back(selected[i].itemid, sel_idx[i]);
+    std::stable_sort(by_item.begin(), by_item.end(), [](auto& a, auto& b) { return a.first < b.first; });
+    json order = json::array();
+    for (auto& [_, k] : by_item) order.push_back(k);
+    out.result["order"] = order;
+    if (!out.result.contains("warnings")) out.result["warnings"] = json::array();
+    lap("finalize");
+    out.result["timing"] = timing;
+}
+#endif
+
 int tool_impl(const char* job_json, int job_len, const uint8_t* blob, int blob_len, std::string& out_json, std::string& out_blob)
 {
     ToolOut out;
@@ -1593,6 +2325,7 @@ int tool_impl(const char* job_json, int job_len, const uint8_t* blob, int blob_l
         else if (op == "cut") op_cut(args, meshes, out);
 #ifndef CS_ORCA_LEGACY_API
         else if (op == "inspect_3mf") op_inspect_3mf(blob, blob_len, out);
+        else if (op == "arrange") op_arrange(job_json, job_len, blob, blob_len, args, out);
 #endif
 #ifdef CS_HAS_MIXED_FILAMENTS
         else if (op == "mixed_filaments") op_mixed_filaments(args, out);
