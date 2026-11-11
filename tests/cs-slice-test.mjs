@@ -51,21 +51,25 @@ function findPreset(vendorId, list, name) {
   }
   return null;
 }
-function resolvePreset(vendorId, list, name) {
-  const chain = [];
-  let cur = name, vid = vendorId, guard = 0;
-  while (cur && guard++ < 32) {
-    const p = findPreset(vid, list, cur);
-    if (!p) throw new Error(`preset not found: ${cur}`);
-    chain.unshift(p.data); vid = p.vid;
-    cur = p.data.inherits;
-  }
-  const out = {};
-  for (const e of chain) for (const [k, v] of Object.entries(e)) {
-    if (['inherits', 'instantiation', 'from', 'setting_id', 'name', 'type', 'filament_id', 'version', 'description', 'renamed_from'].includes(k)) continue;
-    out[k] = v;
-  }
+// PresetBundle::load_vendor_configs_from_json: the resolved parent, then each `include`d preset
+// (resolved the same way), then the preset's own keys. Variant vectors are then sized to the
+// preset's variant count (extend_default_config_length, see padVariants).
+const STRUCTURAL = ['inherits', 'include', 'instantiation', 'from', 'setting_id', 'name', 'type', 'filament_id', 'version', 'description', 'renamed_from'];
+function resolvePreset(vendorId, list, name, guard = 0) {
+  if (guard > 32) throw new Error(`preset chain too deep: ${name}`);
+  const p = findPreset(vendorId, list, name);
+  if (!p) throw new Error(`preset not found: ${name}`);
+  const out = p.data.inherits ? resolvePreset(p.vid, list, p.data.inherits, guard + 1) : {};
+  for (const inc of [].concat(p.data.include ?? [])) Object.assign(out, resolvePreset(p.vid, list, inc, guard + 1));
+  for (const [k, v] of Object.entries(p.data)) if (!STRUCTURAL.includes(k)) out[k] = v;
   return out;
+}
+// Pad (front value) / trim a filament preset's variant vectors to its filament_extruder_variant count.
+function padVariants(fil) {
+  const n = fil.filament_extruder_variant?.length ?? 1;
+  for (const [k, v] of Object.entries(fil))
+    if (schema?.options[k]?.variant === 'filament' && Array.isArray(v) && v.length !== n) fil[k] = Array.from({ length: n }, (_, i) => v[i] ?? v[0]);
+  return fil;
 }
 function compatible(vendorId, list, machine) {
   return vendor(vendorId)[list].map((e) => e.name).filter((n) => {
@@ -81,7 +85,7 @@ function configFor(vendorId, machine, process, filament) {
   if (!process || !filament) throw new Error(`no process/filament for ${machine}`);
   return { name: `${machine} | ${process} | ${filament}`,
            config: { ...resolvePreset(vendorId, 'machine_list', machine), ...resolvePreset(vendorId, 'process_list', process),
-                     ...resolvePreset(vendorId, 'filament_list', filament) } };
+                     ...padVariants(resolvePreset(vendorId, 'filament_list', filament)) } };
 }
 
 // ---- meshes -------------------------------------------------------------------
@@ -187,21 +191,26 @@ function checkGcode(label, res, { minLayers = 5, maxZ } = {}) {
 const t0 = Date.now();
 const mod = await instance();
 const version = JSON.parse(mod.UTF8ToString(mod._cs_version()));
-ok(version.engine === 'orca' && version.version.startsWith('2.4'), `version ${JSON.stringify(version)}`);
+ok(version.engine === 'orca' && version.version === '2.5.0', `version ${JSON.stringify(version)}`);
 const MT = typeof mod._cs_slice_start === 'function';
 console.log(MT ? `multi-threaded build: ${mod._cs_thread_count()} threads${process.env.CS_SYNC === '1' ? ' (CS_SYNC: serial cs_slice)' : ''}` : 'single-threaded build');
 
+let schema;
 { // schema
   const o = mod._malloc(8) >>> 0;
   const rc = mod._cs_describe_config(o, o + 4);
   const p = mod.HEAPU32[o >>> 2] >>> 0, n = mod.HEAPU32[(o >>> 2) + 1] >>> 0;
-  const schema = JSON.parse(dec.decode(mod.HEAPU8.slice(p, p + n))); mod._cs_free(p); mod._free(o);
+  schema = JSON.parse(dec.decode(mod.HEAPU8.slice(p, p + n))); mod._cs_free(p); mod._free(o);
   const keys = Object.keys(schema.options);
   ok(rc === 0 && keys.length > 500, `schema: ${keys.length} options`);
   ok(schema.options.layer_height?.type === 'float' && schema.options.sparse_infill_pattern?.type === 'enum'
      && schema.options.sparse_infill_pattern.enumValues.includes('gyroid') && schema.options.layer_height.scope === 'print'
      && schema.options.nozzle_diameter?.scope === 'machine' && schema.options.filament_type?.scope === 'filament',
      'schema: types/scopes/enums sane');
+  ok(schema.options.outer_wall_speed?.variant === 'print' && schema.options.filament_max_volumetric_speed?.variant === 'filament'
+     && schema.options.slicing_pipeline_plugin?.pluginType === 'slicing-pipeline' && schema.options.slicing_pipeline_plugin.guiType === 'plugin_picker'
+     && schema.options.filament_mixed_components?.type === 'strings' && schema.options.enable_mixed_color_sublayer?.type === 'bool',
+     'schema: 2.5 variant flags, plugin picker, mixed filament keys');
 }
 
 const bbl = configFor('BBL', 'Bambu Lab P1S 0.4 nozzle');
@@ -308,6 +317,224 @@ for (let i = 0; i < 3; i++) {
   }
   const bad = orient({ ...box(1, 1, 1), transform: tilt });
   ok(typeof bad.ok === 'boolean', 'cs_orient on a tiny mesh returns a report');
+}
+
+// ---- Orca 2.5: extruder variants (per-nozzle-type vectors) -----------------------------
+{
+  const h2s = configFor('BBL', 'Bambu Lab H2S 0.4 nozzle', '0.20mm Standard @BBL H2S', 'Bambu PLA Basic @BBL H2S');
+  const wallSpeed = (g) => +(g.match(/^; outer_wall_speed = ([\d.]+)/m)?.[1] ?? NaN);
+  for (const [nvt, want] of [['Standard', 200], ['High Flow', 500]]) {
+    const r = await slice(mod, { ...h2s.config, nozzle_volume_type: [nvt] }, [{ ...box(20, 20, 5), transform: translate(160, 160, 0) }]);
+    checkGcode(`H2S, ${nvt} nozzle`, r, { minLayers: 10 });
+    ok(wallSpeed(r.gcode) === want, `H2S ${nvt}: outer_wall_speed resolves to ${wallSpeed(r.gcode)} (want ${want})`);
+  }
+  // Dual extruder: each extruder takes its own variant's element.
+  const h2d = configFor('BBL', 'Bambu Lab H2D 0.4 nozzle', '0.20mm Standard @BBL H2D', 'Bambu PLA Basic @BBL H2D');
+  const r = await slice(mod, { ...h2d.config, nozzle_volume_type: ['High Flow', 'Standard'] }, [{ ...box(20, 20, 5), transform: translate(160, 160, 0) }]);
+  checkGcode('H2D, left High Flow / right Standard', r, { minLayers: 10 });
+  const line = r.gcode.match(/^; outer_wall_speed = (.*)$/m)?.[1];
+  ok(line === '500,200', `H2D: outer_wall_speed per extruder = ${line} (want 500,200)`);
+}
+
+// ---- Orca 2.5: Hybrid nozzle rack (H2C), Manual / Nozzle Manual grouping ----------------------
+// Desktop's full_config(false, f_maps, f_volume_maps) shape: each filament's variant vectors
+// concatenated (3 columns per H2C filament, from its `include` template), filament_volume_map per
+// filament, and extruder_nozzle_stats (seeded by desktop, split per type for a Hybrid rack).
+function multiFilament(cfg, colors) {
+  const n = colors.length, out = { ...cfg };
+  const nv = cfg.filament_extruder_variant?.length ?? 1;
+  for (const [k, v] of Object.entries(cfg))
+    if (schema.options[k]?.scope === 'filament' && Array.isArray(v) && k !== 'filament_self_index')
+      out[k] = Array.from({ length: n }, () => v).flat();
+  out.filament_self_index = Array.from({ length: n }, (_, i) => Array(nv).fill(String(i + 1))).flat();
+  out.filament_colour = colors;
+  return out;
+}
+async function toolCall(mod, op, args) {
+  const req = enc.encode(JSON.stringify({ op, args }));
+  const rp = put(mod, req), o = mod._malloc(16) >>> 0;
+  heap(mod).HEAPU32.fill(0, o >>> 2, (o >>> 2) + 4);
+  mod._cs_tool(rp, req.length, 0, 0, o, o + 4, o + 8, o + 12);
+  const H = heap(mod).HEAPU32, p = H[o >>> 2] >>> 0, l = H[(o >>> 2) + 1] >>> 0, b = H[(o >>> 2) + 2] >>> 0;
+  const r = JSON.parse(dec.decode(mod.HEAPU8.slice(p, p + l)));
+  mod._cs_free(p); if (b) mod._cs_free(b); mod._free(rp); mod._free(o);
+  return r;
+}
+{
+  const h2c = configFor('BBL', 'Bambu Lab H2C 0.4 nozzle', '0.20mm Standard @BBL H2C', 'Bambu PLA Basic @BBL H2C');
+  ok(h2c.config.filament_extruder_variant?.length === 3, `H2C filament: include template gives 3 variant columns (${h2c.config.filament_extruder_variant})`);
+  const base = { ...multiFilament(h2c.config, ['#FF0000', '#00FF00', '#0000FF']),
+    filament_map_mode: 'Manual', filament_map: ['1', '2', '2'], nozzle_volume_type: ['Standard', 'Hybrid'], filament_volume_map: ['0', '0', '1'],
+    extruder_nozzle_stats: ['Standard#1', 'Standard#3|High Flow#3'],
+    flush_multiplier: ['1', '1'], flush_volumes_matrix: Array(18).fill('100'), wipe_tower_x: ['200'], wipe_tower_y: ['220'] };
+  const objs = [0, 1, 2].map((f) => ({ ...box(15, 15, 4), transform: translate(100 + f * 30, 150, 0), config: { extruder: String(f + 1) } }));
+  const field = (g, k) => g.match(new RegExp(`^; ${k} = (.*)$`, 'm'))?.[1];
+
+  const rv = await toolCall(mod, 'resolve_variants', { config: base });
+  ok(rv.ok && rv.result.filament.filament_extruder_variant?.[2] === 'Direct Drive High Flow' && rv.result.filament.filament_max_volumetric_speed?.join() === '25,25,40',
+     `H2C resolve_variants: filament 3 → High Flow column (${rv.result?.filament?.filament_extruder_variant}; ${rv.result?.filament?.filament_max_volumetric_speed}) ${rv.error ?? ''}`);
+
+  let r = await slice(mod, base, objs, { validate: true });
+  checkGcode('H2C Hybrid rack, Manual 1,2,2 / volumes 0,0,1', r, { minLayers: 10 });
+  if (r.rc === 0) {
+    ok(field(r.gcode, 'filament_volume_map') === '0,0,1', `H2C: filament_volume_map written back = ${field(r.gcode, 'filament_volume_map')} (want 0,0,1)`);
+    const nmap = field(r.gcode, 'filament_nozzle_map')?.split(',').map(Number) ?? [];
+    // nozzle list: extruder 1 Standard (0), extruder 2 Standard x3 (1..3) then High Flow x3 (4..6)
+    ok(nmap.length === 3 && nmap[0] === 0 && nmap[1] >= 1 && nmap[1] <= 3 && nmap[2] >= 4 && nmap[2] <= 6, `H2C: filament_nozzle_map = ${nmap} (filament 3 on a High Flow nozzle)`);
+    ok(field(r.gcode, 'filament_extruder_variant') === '"Direct Drive Standard";"Direct Drive Standard";"Direct Drive High Flow"',
+       `H2C: filament_extruder_variant = ${field(r.gcode, 'filament_extruder_variant')}`);
+    ok(field(r.gcode, 'filament_max_volumetric_speed') === '25,25,40', `H2C: filament_max_volumetric_speed = ${field(r.gcode, 'filament_max_volumetric_speed')} (want 25,25,40)`);
+  }
+  // Nozzle Manual: the host picks the physical nozzle per filament.
+  r = await slice(mod, { ...base, filament_map_mode: 'Nozzle Manual', filament_nozzle_map: ['0', '1', '2'] }, objs, { validate: true });
+  ok(r.rc === 0 && field(r.gcode, 'filament_volume_map') === '0,0,1' && (field(r.gcode, 'filament_nozzle_map')?.split(',').map(Number)[2] ?? -1) >= 4,
+     `H2C Nozzle Manual: volumes ${field(r.gcode, 'filament_volume_map')}, nozzles ${field(r.gcode, 'filament_nozzle_map')} ${r.report?.error ?? ''}`);
+
+  // Inputs the bridge rejects with a message naming what to send.
+  const bad = async (label, cfg, re) => {
+    const b = await slice(mod, cfg, objs, { validate: true });
+    ok(b.rc !== 0 && re.test(b.report?.error ?? ''), `H2C rejects ${label}: ${b.report?.error?.slice(0, 160)}`);
+  };
+  const { extruder_nozzle_stats: _s, ...noStats } = base;
+  await bad('Hybrid without extruder_nozzle_stats', noStats, /Hybrid.*extruder_nozzle_stats/);
+  await bad('a malformed stats token', { ...base, extruder_nozzle_stats: ['Standard#1', 'Standard:3'] }, /bad token/);
+  await bad('more nozzles than the rack holds', { ...base, extruder_nozzle_stats: ['Standard#1', 'Standard#4|High Flow#3'] }, /at most 6/);
+  await bad('a mis-sized filament_volume_map', { ...base, filament_volume_map: ['0', '1'] }, /filament_volume_map must have one entry per filament/);
+  await bad('Nozzle Manual without filament_nozzle_map', { ...base, filament_map_mode: 'Nozzle Manual' }, /filament_nozzle_map/);
+  // The app's shape before it applied `include`: one "Direct Drive Standard" name per filament over 3 columns.
+  await bad('variant vectors wider than filament_extruder_variant',
+            { ...base, filament_extruder_variant: Array(3).fill('Direct Drive Standard'), filament_self_index: ['1', '2', '3'] }, /include/);
+}
+
+// ---- Orca 2.5: native mixed filaments (plain config, desktop project_settings shape) ------------
+// Physical slots first, mixed slots at the tail; every per-filament vector has an entry for the
+// mixed slot (desktop copies its first component's preset); flush matrix over all slots with zero
+// rows/columns for the mixed slot.
+function withMixed(cfg, colors, mixes) {
+  const n = colors.length, all = n + mixes.length, out = { ...cfg };
+  // Each slot gets the whole filament preset: its variant vectors (one value per variant) concatenated.
+  const nv = cfg.filament_extruder_variant?.length ?? 1;
+  for (const [k, v] of Object.entries(cfg))
+    if (schema.options[k]?.scope === 'filament' && Array.isArray(v) && k !== 'filament_self_index' && (v.length === 1 || schema.options[k]?.variant === 'filament' || k === 'filament_extruder_variant'))
+      out[k] = Array.from({ length: all }, () => v).flat();
+  out.filament_self_index = Array.from({ length: all }, (_, i) => Array(nv).fill(String(i + 1))).flat();
+  out.filament_colour = [...colors, ...mixes.map((m) => m.color)];
+  out.filament_map = Array(all).fill('1');
+  out.flush_volumes_matrix = Array.from({ length: all * all }, (_, q) => {
+    const i = Math.floor(q / all), j = q % all;
+    return i === j || i >= n || j >= n ? '0' : '200';
+  });
+  out.filament_is_mixed = [...colors.map(() => '0'), ...mixes.map(() => '1')];
+  out.filament_mixed_components = [...colors.map(() => ''), ...mixes.map((m) => m.components)];
+  out.filament_mixed_sublayer_ratios = [...colors.map(() => ''), ...mixes.map((m) => m.ratios)];
+  out.filament_mixed_gradient = [...colors.map(() => '0'), ...mixes.map((m) => (m.range ? '1' : '0'))];
+  out.filament_mixed_gradient_range = [...colors.map(() => ''), ...mixes.map((m) => m.range ?? '')];
+  out.filament_mixed_gradient_curve = [...colors.map(() => ''), ...mixes.map(() => '')];
+  out.filament_mixed_gradient_per_part = [...colors.map(() => '0'), ...mixes.map(() => '0')];
+  return out;
+}
+{
+  const cfg = { ...withMixed(bbl.config, ['#FF0000', '#0000FF'], [{ components: '1,2', ratios: '0.5000,0.5000', range: '0.1000,0.9000', color: '#7F007F' }]),
+                enable_mixed_color_sublayer: '1', enable_prime_tower: '1' };
+  const r = await slice(mod, cfg, [{ ...box(20, 20, 8), transform: translate(118, 118, 0), config: { extruder: '3' } }]);
+  checkGcode('mixed filament 1+2 with Z gradient, object on slot 3 (P1S + AMS)', r, { minLayers: 20 });
+  const fm = r.report?.stats?.filamentMm ?? [];
+  ok(fm[0] > 0 && fm[1] > 0, `both physical filaments print the mixed slot (${fm.map((x) => x.toFixed(0)).join(', ')} mm)`);
+  // A gradient: range "0.1,0.9" = filament 1's share rises from ~10% at the bottom to ~90% at the
+  // top. Count the object's extrusions only (prime-tower purges are the same for every change).
+  const lay = r.gcode.split(/^;\s*(?:LAYER_CHANGE|CHANGE_LAYER)\b/m), share = (txt) => {
+    let t = -1, feat = '', e = [0, 0];
+    for (const line of txt.split('\n')) {
+      let m;
+      if ((m = line.match(/^T(\d+)/))) t = +m[1];
+      else if ((m = line.match(/^; FEATURE: (.*)/))) feat = m[1];
+      else if ((m = line.match(/^G1 [^;]*E([\d.]+)/)) && t >= 0 && t < 2 && feat !== 'Prime tower' && feat !== 'Custom') e[t] += +m[1];
+    }
+    return e[0] + e[1] > 0 ? e[0] / (e[0] + e[1]) : NaN;
+  };
+  const lo = share(lay.slice(3, 8).join('')), hi = share(lay.slice(-8, -3).join(''));
+  ok(hi > lo + 0.3, `gradient: filament 1 share ${lo.toFixed(2)} low → ${hi.toFixed(2)} high`);
+  const bad = await slice(mod, { ...cfg, filament_mixed_components: ['', '', '1,9'] }, [{ ...box(20, 20, 8), transform: translate(118, 118, 0), config: { extruder: '3' } }]);
+  ok(bad.rc !== 0 && /mixed filament/i.test(bad.report?.error ?? ''), `invalid mixed filament rejected: ${bad.report?.error}`);
+}
+
+// ---- Orca 2.5: Precise Seam modifier parts --------------------------------------------------
+{
+  const cube = box(20, 20, 10), seam = box(4, 4, 12);
+  const size = cube.positions.byteLength + cube.indices.byteLength;
+  const blob = new Uint8Array(size + seam.positions.byteLength + seam.indices.byteLength);
+  blob.set(new Uint8Array(cube.positions.buffer), 0); blob.set(new Uint8Array(cube.indices.buffer), cube.positions.byteLength);
+  blob.set(new Uint8Array(seam.positions.buffer), size); blob.set(new Uint8Array(seam.indices.buffer), size + seam.positions.byteLength);
+  const part = (type) => ({ name: 'seam', type, vertexOffset: size, vertexCount: 8, indexOffset: size + seam.positions.byteLength, triangleCount: 12,
+    transform: translate(136, 136, -1), config: {} });
+  const jobFor = (type) => enc.encode(JSON.stringify({ config: bbl.config, objects: [{ name: 'cube', vertexOffset: 0, vertexCount: 8,
+    indexOffset: cube.positions.byteLength, triangleCount: 12, transform: translate(118, 118, 0), parts: [part(type)] }] }));
+  for (const t of ['precise_seam_center', 'precise_seam_enforced', 'precise_seam_blocked'])
+    checkGcode(`precise seam part (${t})`, await rawSlice(mod, jobFor(t), blob), { minLayers: 20 });
+  const bad = await rawSlice(mod, jobFor('precise_seam_sideways'), blob);
+  ok(bad.rc !== 0 && /unknown part type/.test(bad.report?.error ?? ''), `unknown precise seam subtype rejected: ${bad.report?.error}`);
+}
+
+// ---- Orca 2.5: slicing-pipeline plugin hooks (Module.csHook + cs_hook_query) ------------------
+function hookQuery(m, req, reqBlob = new Uint8Array(0)) {
+  const j = enc.encode(JSON.stringify(req));
+  const jp = put(m, j), bp = put(m, reqBlob), o = m._malloc(16) >>> 0;
+  heap(m).HEAPU32.fill(0, o >>> 2, (o >>> 2) + 4);
+  const rc = m._cs_hook_query(jp, j.length, bp, reqBlob.length, o, o + 4, o + 8, o + 12);
+  const H = heap(m).HEAPU32, p = H[o >>> 2] >>> 0, n = H[(o >>> 2) + 1] >>> 0, b = H[(o >>> 2) + 2] >>> 0, bl = H[(o >>> 2) + 3] >>> 0;
+  const rep = n ? JSON.parse(dec.decode(m.HEAPU8.slice(p, p + n))) : null;
+  const bytes = bl ? m.HEAPU8.slice(b, b + bl) : new Uint8Array(0);
+  if (p) m._cs_free(p); if (b) m._cs_free(b); m._free(jp); m._free(bp); m._free(o);
+  return { rc, rep, bytes };
+}
+{
+  const hm = await instance();
+  ok(hookQuery(hm, { op: 'print.info' }).rc === -1, 'cs_hook_query outside a hook → -1');
+  const steps = [];
+  let shrunk = 0, mode = 'shrink';
+  hm.csHook = (kind, reqJson) => {
+    const begin = JSON.parse(reqJson);
+    steps.push(begin.step);
+    if (mode === 'fail' && begin.step === 'posPerimeters') return { status: 'FatalError', capability: 'boom', message: 'plugin said no' };
+    if (begin.step !== 'posSlice' || mode !== 'shrink') return { status: 'Success', capability: 'shrink' };
+    const id = begin.objectId;
+    const layers = hookQuery(hm, { op: 'object.layers', objectId: id }).rep.results[0].layers;
+    // 1) read every layer's region-0 slices, 2) offset them by -2 mm with libslic3r's Clipper,
+    // 3) write them back (the geom results' blob is the write's request blob), 4) re-derive lslices.
+    const read = hookQuery(hm, { batch: layers.map((_, l) => ({ op: 'layer.surfaces', objectId: id, layer: l, region: 0, which: 'slices' })) });
+    const delta = -2 / begin.scalingFactor;
+    const geo = hookQuery(hm, { batch: read.rep.results.map((r) => ({ op: 'geom.offset_ex', a: r.surfaces, delta, blobOffset: r.blobOffset })) }, read.bytes);
+    const type = read.rep.results[0].surfaces[0]?.type ?? 0;
+    const write = hookQuery(hm, { batch: geo.rep.results.flatMap((g, l) => [
+      { op: 'surfaces.set', objectId: id, layer: l, region: 0, which: 'slices', type, expolygons: g.expolygons, blobOffset: g.blobOffset },
+      { op: 'layer.make_slices', objectId: id, layer: l }]) }, geo.bytes);
+    if (write.rc === 0) shrunk = layers.length;
+    return { status: 'Success', capability: 'shrink', message: `shrunk ${shrunk} layers` };
+  };
+  // Width of the object's own extrusions (the start G-code's purge line sits far left of it).
+  const bounds = (g) => { let lo = Infinity, hi = -Infinity, x = 0;
+    for (const m of g.matchAll(/^G1 ([^;\n]*)/gm)) { const xm = m[1].match(/X(-?[\d.]+)/); if (xm) x = +xm[1]; if (/E[\d.]+/.test(m[1]) && x > 90 && x < 170) { lo = Math.min(lo, x); hi = Math.max(hi, x); } } return hi - lo; };
+  const obj = [{ ...box(30, 30, 6), transform: translate(113, 113, 0) }];
+  const plain = await slice(hm, { ...bbl.config, skirt_loops: '0', brim_type: 'no_brim' }, obj);
+  ok(plain.rc === 0 && steps.length === 0, 'no hooks without slicing_pipeline_plugin (inert)');
+  const hooked = await slice(hm, { ...bbl.config, skirt_loops: '0', brim_type: 'no_brim', slicing_pipeline_plugin: ['shrink'] }, obj);
+  checkGcode('pipeline hook edits layer slices', hooked, { minLayers: 20 });
+  const w0 = bounds(plain.gcode), w1 = bounds(hooked.gcode);
+  ok(shrunk > 20 && Math.abs((w0 - w1) - 4) < 0.6, `posSlice hook shrank ${shrunk} layers: width ${w0.toFixed(2)} → ${w1.toFixed(2)} mm`);
+  const want = ['posSlice', 'posPerimeters', 'posPrepareInfill', 'posInfill', 'psWipeTower', 'psSkirtBrim'];
+  ok(want.every((s) => steps.includes(s)), `hook steps fired: ${[...new Set(steps)].join(', ')}`);
+  ok(hooked.report.warnings.some((w) => w.code === 'plugin' && /shrunk/.test(w.message)), 'hook message reported as a plugin warning');
+  const ev = (hooked.report.events ?? []).map((e) => e.event);
+  ok(['SliceStarted', 'SliceGeometryFinished', 'GCodeExportStarted', 'GCodeExportFinished'].every((e) => ev.includes(e)), `lifecycle events: ${ev.join(', ')}`);
+  mode = 'fail';
+  const failed = await slice(hm, { ...bbl.config, slicing_pipeline_plugin: ['boom'] }, obj);
+  ok(failed.rc !== 0 && /Slicing pipeline plugin 'boom' error: plugin said no/.test(failed.report?.error ?? ''), `FatalError → slice error: ${failed.report?.error}`);
+  hm.csHook = () => { throw new Error('python blew up'); };
+  const threw = await slice(hm, { ...bbl.config, slicing_pipeline_plugin: ['x'] }, obj);
+  ok(threw.rc !== 0 && /python blew up/.test(threw.report?.error ?? ''), `csHook exception → slice error: ${threw.report?.error}`);
+  mode = 'shrink';
+  hm.csHook = undefined;
+  checkGcode('slice after hook failures (same instance)', await slice(hm, bbl.config, obj), { minLayers: 20 });
 }
 
 { // conditions

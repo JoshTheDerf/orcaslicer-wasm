@@ -24,20 +24,18 @@ async function load(dir) {
 
 // ---- profiles (same resolution as the web catalog) ----
 const vendor = (id) => JSON.parse(readFileSync(join(profilesDir, `${id}.json`), 'utf8'));
-function resolvePreset(vid, list, name) {
-  const chain = [];
-  for (let cur = name, g = 0; cur && g < 32; g++) {
-    let hit = null;
-    for (const v of [vid, 'OrcaFilamentLibrary']) {
-      const e = vendor(v)[list]?.find((x) => x.name === cur);
-      if (e) { hit = { v, data: JSON.parse(readFileSync(join(profilesDir, v, e.sub_path), 'utf8')) }; break; }
-    }
-    if (!hit) throw new Error(`preset not found: ${cur}`);
-    chain.unshift(hit.data); vid = hit.v; cur = hit.data.inherits;
+// Parent, then each `include`, then the preset's own keys (PresetBundle::load_vendor_configs_from_json).
+function resolvePreset(vid, list, name, g = 0) {
+  let hit = null;
+  for (const v of [vid, 'OrcaFilamentLibrary']) {
+    const e = vendor(v)[list]?.find((x) => x.name === name);
+    if (e) { hit = { v, data: JSON.parse(readFileSync(join(profilesDir, v, e.sub_path), 'utf8')) }; break; }
   }
-  const out = {};
-  for (const e of chain) for (const [k, v] of Object.entries(e))
-    if (!['inherits', 'instantiation', 'from', 'setting_id', 'name', 'type', 'filament_id', 'version', 'description', 'renamed_from'].includes(k)) out[k] = v;
+  if (!hit || g > 32) throw new Error(`preset not found: ${name}`);
+  const out = hit.data.inherits ? resolvePreset(hit.v, list, hit.data.inherits, g + 1) : {};
+  for (const inc of [].concat(hit.data.include ?? [])) Object.assign(out, resolvePreset(hit.v, list, inc, g + 1));
+  for (const [k, v] of Object.entries(hit.data))
+    if (!['inherits', 'include', 'instantiation', 'from', 'setting_id', 'name', 'type', 'filament_id', 'version', 'description', 'renamed_from'].includes(k)) out[k] = v;
   return out;
 }
 const config = { ...resolvePreset('BBL', 'machine_list', 'Bambu Lab P1S 0.4 nozzle'),

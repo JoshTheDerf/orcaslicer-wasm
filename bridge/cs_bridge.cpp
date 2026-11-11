@@ -11,6 +11,7 @@
 //  * Config goes through Orca's own ConfigBase::load_from_json(), so legacy
 //    key renames / value substitutions behave exactly like the desktop app.
 #include "common/cs_common.hpp"
+#include "cs_hooks.hpp"
 
 #include <libslic3r/libslic3r.h>
 #include <libslic3r/Config.hpp>
@@ -23,14 +24,17 @@
 #include <libslic3r/GCode/GCodeProcessor.hpp>
 #include <libslic3r/Layer.hpp>
 #include <libslic3r/Model.hpp>
+#include <libslic3r/MeshRepair.hpp>
 #include <libslic3r/Format/bbs_3mf.hpp>
-#if __has_include(<libslic3r/MixedFilament.hpp>)
-#include <libslic3r/MixedFilament.hpp>
-#endif
 #include <libslic3r/Orient.hpp>
 #include <libslic3r/Arrange.hpp>
 #include <libslic3r/ModelArrange.hpp>
 #include <libslic3r/GCode/WipeTower.hpp>
+#include <libslic3r/GCode/WipeTowerEstimate.hpp>
+#include <libslic3r/IMEXArrange.hpp>
+#include <libslic3r/IMEXZones.hpp>
+#include <libslic3r/IMEXHelpers.hpp>
+#include <libslic3r/ClipperUtils.hpp>
 #include <libslic3r/Geometry.hpp>
 #include <libslic3r/PlaceholderParser.hpp>
 #include <libslic3r/Preset.hpp>
@@ -38,23 +42,19 @@
 #include <libslic3r/PrintConfig.hpp>
 #include <libslic3r/TriangleMesh.hpp>
 #include <libslic3r/Utils.hpp>
-#if __has_include("libslic3r_version.h")
+#include <libslic3r/FilamentMixer.hpp>
+#include <libslic3r/ColorDecomposeRecipe.hpp>
+#include <libslic3r/TextureDisplacement.hpp>
+#include <libslic3r/CAD/SketchEngine.hpp>
+#include <libslic3r/CAD/SketchInference.hpp>
+#include <libslic3r/CAD/SketchImport.hpp>
+#include <libslic3r/CAD/SketchSolver.hpp>
 #include "libslic3r_version.h"  // generated into orca-build/src/libslic3r
-#else
-#include "common_func/common_func.hpp"  // Snapmaker Orca forks (e.g. FullSpectrum) keep versions here
-#endif
-#ifndef CS_ENGINE_ID
 #define CS_ENGINE_ID "orca"
-#endif
-#if defined(FULLSPECTRUM_VERSION)
-#define CS_ENGINE_VERSION FULLSPECTRUM_VERSION
-// Snapmaker Orca forks track an older OrcaSlicer (2.3.x) libslic3r API.
-#define CS_ORCA_LEGACY_API 1
-#else
 #define CS_ENGINE_VERSION SoftFever_VERSION
-#endif
 
 #include <array>
+#include <boost/algorithm/string.hpp>
 #include <atomic>
 #include <cfloat>
 #include <chrono>
@@ -208,10 +208,8 @@ std::string type_name(ConfigOptionType t)
     case coPoint3: return "point3";
     case coBool: return "bool";              case coBools: return "bools";
     case coEnum: return "enum";              case coEnums: return "enums";
-#ifndef CS_ORCA_LEGACY_API
     case coPointsGroups: return "pointsGroups";
     case coIntsGroups: return "intsGroups";
-#endif
     default: return "none";
     }
 }
@@ -236,6 +234,9 @@ std::string gui_type_name(ConfigOptionDef::GUIType g)
     case G::slider: return "slider";
     case G::legend: return "legend";
     case G::one_string: return "one_string";
+    case G::plugin_picker: return "plugin_picker";
+    case G::plugin_config: return "plugin_config";
+    case G::printer_agent_select: return "printer_agent_select";
     default: return "";
     }
 }
@@ -317,6 +318,11 @@ ModelVolumeType volume_type(const std::string& t)
     if (t == "modifier") return ModelVolumeType::PARAMETER_MODIFIER;
     if (t == "support_blocker") return ModelVolumeType::SUPPORT_BLOCKER;
     if (t == "support_enforcer") return ModelVolumeType::SUPPORT_ENFORCER;
+    if (t.rfind("precise_seam_", 0) == 0) { // center|left|right|enforced|blocked|neutral (Model's own names)
+        const ModelVolumeType v = ModelVolume::type_from_string(t);
+        if (!is_precise_seam(v)) throw cs::JobError("unknown part type '" + t + "'");
+        return v;
+    }
     return ModelVolumeType::MODEL_PART;
 }
 
@@ -397,6 +403,322 @@ void build_model(Model& model, const cs::Job& job, json& substitutions)
     }
 }
 
+// ---- mixed filaments (Orca 2.5 native) -------------------------------------------
+// A mixed filament is a virtual filament slot: every per-filament option has an
+// entry for it (desktop copies its first component's filament preset), and the
+// filament_is_mixed / filament_mixed_* arrays describe the mix. Hosts may send
+// those keys directly (the job's primary form); cs_tool mixed_filament "expand"
+// builds them the way Sidebar::add_mixed_filament + PresetBundle::set_num_filaments do:
+//   [{ components:[1,3], ratios:[70,30], color?:"#RRGGBB",
+//      gradient?:{ enabled, range:[a0,a1] | "a0,a1", curve:"x,y|x,y" | [[x,y(,mIn,mOut)]...], perPart } }]
+// Slots are appended after the existing ones, in order.
+std::string format_pair(double a, double b)
+{
+    char buf[64];
+    std::snprintf(buf, sizeof(buf), "%.4f,%.4f", a, b);
+    return buf;
+}
+
+std::string mixed_color(const DynamicPrintConfig& cfg, const std::vector<unsigned>& comps, const std::vector<int>& weights)
+{
+    const auto* col = cfg.option<ConfigOptionStrings>("filament_colour");
+    std::vector<std::string> hex;
+    for (unsigned c : comps) hex.push_back(col && c >= 1 && c <= col->size() ? col->get_at(c - 1) : std::string("#808080"));
+    return blend_color_multi(hex, weights);
+}
+
+void validate_mixed(const DynamicPrintConfig& cfg)
+{
+    auto bools = [&](const char* k) { const auto* o = cfg.option<ConfigOptionBools>(k); return o ? o->values : std::vector<unsigned char>{}; };
+    auto strs  = [&](const char* k) { const auto* o = cfg.option<ConfigOptionStrings>(k); return o ? o->values : std::vector<std::string>{}; };
+    const auto errs = validate_mixed_filament_params(bools("filament_is_mixed"), strs("filament_mixed_components"),
+                                                     strs("filament_mixed_sublayer_ratios"), bools("filament_mixed_gradient"),
+                                                     strs("filament_mixed_gradient_range"), strs("filament_mixed_gradient_curve"));
+    if (!errs.empty()) throw cs::JobError("mixed filament: " + errs.begin()->second);
+}
+
+json expand_mixed_filaments(DynamicPrintConfig& cfg, const json& defs)
+{
+    json added = json::array();
+    if (!defs.is_array() || defs.empty()) return added;
+    static const std::set<std::string> fil_keys(Preset::filament_options().begin(), Preset::filament_options().end());
+    static const std::set<std::string> own = {
+        "filament_is_mixed", "filament_mixed_components", "filament_mixed_sublayer_ratios", "filament_mixed_gradient",
+        "filament_mixed_gradient_range", "filament_mixed_gradient_curve", "filament_mixed_gradient_per_part",
+        "filament_self_index", "filament_colour", "filament_multi_colour", "flush_volumes_matrix"};
+    for (const json& d : defs) {
+        const size_t n = std::max<size_t>(1, vector_size(cfg, "filament_diameter"));
+        if (n >= 64) throw cs::JobError("mixed filament: too many filament slots");
+        if (!d.is_object()) throw cs::JobError("mixed filament: entry must be an object");
+        const auto* is_mixed = cfg.option<ConfigOptionBools>("filament_is_mixed");
+        std::vector<unsigned> comps;
+        for (const json& c : d.value("components", json::array())) {
+            if (!c.is_number_integer() || c.get<int>() < 1 || size_t(c.get<int>()) > n) throw cs::JobError("mixed filament: component out of range");
+            const unsigned id = c.get<unsigned>();
+            if (is_mixed && id - 1 < is_mixed->size() && is_mixed->values[id - 1]) throw cs::JobError("mixed filament: a component must be a physical filament");
+            comps.push_back(id);
+        }
+        if (comps.size() < 2) throw cs::JobError("mixed filament: needs at least 2 components");
+        std::vector<int> weights;
+        for (const json& r : d.value("ratios", json::array())) weights.push_back(r.is_number() ? int(std::lround(r.get<double>() * (r.get<double>() <= 1.0 ? 100 : 1))) : 0);
+        if (weights.empty()) weights.assign(comps.size(), 1);
+        if (weights.size() != comps.size()) throw cs::JobError("mixed filament: one ratio per component");
+        const unsigned src = comps.front() - 1;
+
+        // Per-filament vectors: copy the first component's entry (variant-carrying keys:
+        // every element whose filament_self_index is that filament).
+        std::vector<int> self = cfg.has("filament_self_index") ? cfg.option<ConfigOptionInts>("filament_self_index")->values : std::vector<int>{};
+        const auto* fev = cfg.option<ConfigOptionStrings>("filament_extruder_variant");
+        const size_t nvar = fev ? fev->size() : 0;
+        std::vector<size_t> src_elems;
+        if (nvar > n && self.size() == nvar) { for (size_t i = 0; i < nvar; ++i) if (self[i] == int(src) + 1) src_elems.push_back(i); }
+        for (const std::string& key : cfg.keys()) {
+            if (own.count(key)) continue;
+            auto* v = dynamic_cast<ConfigOptionVectorBase*>(cfg.option(key));
+            if (!v || !(fil_keys.count(key) || key.rfind("filament_", 0) == 0)) continue;
+            const size_t sz = v->size();
+            auto append_element = [&](size_t e) {
+                std::unique_ptr<ConfigOption> picked(cfg.option(key)->clone());
+                auto* pv = static_cast<ConfigOptionVectorBase*>(picked.get());
+                pv->set_at(cfg.option(key), 0, e);
+                pv->resize(1);
+                v->append(picked.get());
+            };
+            if (sz == n) append_element(src);
+            else if (sz == nvar && !src_elems.empty()) for (size_t e : src_elems) append_element(e);
+        }
+        if (!src_elems.empty()) {
+            auto& si = cfg.option<ConfigOptionInts>("filament_self_index", true)->values;
+            for (size_t i = 0; i < src_elems.size(); ++i) si.push_back(int(n) + 1);
+        } else if (self.size() == n) {
+            cfg.option<ConfigOptionInts>("filament_self_index", true)->values.push_back(int(n) + 1);
+        }
+        const std::string color = d.value("color", mixed_color(cfg, comps, weights));
+        for (const char* k : {"filament_colour", "filament_multi_colour"})
+            if (auto* o = cfg.option<ConfigOptionStrings>(k)) { o->values.resize(n, o->values.empty() ? "#808080" : o->values.back()); o->values.push_back(color); }
+        // flush_volumes_matrix: n*n per nozzle → (n+1)^2; the mixed slot's row and column are 0
+        // (tool changes go to its physical components).
+        if (auto* fm = cfg.option<ConfigOptionFloats>("flush_volumes_matrix"); fm && n > 0 && fm->size() % (n * n) == 0 && !fm->values.empty()) {
+            const size_t k = fm->size() / (n * n), m = n + 1;
+            std::vector<double> nm(m * m * k, 0.);
+            for (size_t z = 0; z < k; ++z)
+                for (size_t i = 0; i < n; ++i)
+                    for (size_t j = 0; j < n; ++j) nm[z * m * m + i * m + j] = fm->values[z * n * n + i * n + j];
+            fm->values = std::move(nm);
+        }
+        resize_mixed_filament_metadata(cfg, n, n + 1);
+        cfg.option<ConfigOptionBools>("filament_is_mixed")->values[n] = true;
+        cfg.option<ConfigOptionStrings>("filament_mixed_components")->values[n] = format_mixed_components(comps);
+        cfg.option<ConfigOptionStrings>("filament_mixed_sublayer_ratios")->values[n] = format_mixed_ratios(weights);
+        const json g = d.value("gradient", json::object());
+        const bool grad = g.is_object() && g.value("enabled", false);
+        cfg.option<ConfigOptionBools>("filament_mixed_gradient")->values[n] = grad;
+        if (grad) {
+            const json r = g.value("range", json(nullptr));
+            std::string range;
+            if (r.is_string()) range = r.get<std::string>();
+            else if (r.is_array() && r.size() == 2 && r[0].is_number() && r[1].is_number()) range = format_pair(r[0].get<double>(), r[1].get<double>());
+            else if (comps.size() == 2) range = "0.1000,0.9000";
+            cfg.option<ConfigOptionStrings>("filament_mixed_gradient_range")->values[n] = range;
+            const json c = g.value("curve", json(nullptr));
+            std::string curve;
+            if (c.is_string()) curve = c.get<std::string>();
+            else if (c.is_array()) {
+                GradientCurve gc;
+                for (const json& p : c) {
+                    if (!p.is_array() || p.size() < 2) throw cs::JobError("mixed filament: curve points are [x, y(, mIn, mOut)]");
+                    GradientAnchor a; a.x = p[0].get<double>(); a.y = p[1].get<double>();
+                    if (p.size() >= 4 && p[2].is_number()) a.m_in = p[2].get<double>();
+                    if (p.size() >= 4 && p[3].is_number()) a.m_out = p[3].get<double>();
+                    gc.points.push_back(a);
+                }
+                curve = serialize_gradient_curve(gc);
+            }
+            cfg.option<ConfigOptionStrings>("filament_mixed_gradient_curve")->values[n] = curve;
+            cfg.option<ConfigOptionBools>("filament_mixed_gradient_per_part")->values[n] = g.value("perPart", false);
+        }
+        added.push_back({{"slot", n + 1}, {"color", color}, {"components", comps}, {"ratios", cfg.opt_string("filament_mixed_sublayer_ratios", unsigned(n))}});
+    }
+    return added;
+}
+
+// ---- extruder variants ------------------------------------------------------------
+// 2.5 profiles carry one value per extruder variant ("Direct Drive Standard",
+// "Direct Drive High Flow", ...) for the keys in print/printer/filament_options_with_variant.
+// The host sends the vectors as the presets have them (PresetBundle::full_config(false)
+// shape); Print::apply() picks each extruder's element when the printer has several
+// extruders or variants. A single-extruder, single-variant printer whose print/printer
+// presets still list several variants is not resolved there, so do it here with the same
+// functions (DynamicPrintConfig::update_values_to_printer_extruders).
+void normalize_filament_self_index(DynamicPrintConfig& cfg, int filament_count)
+{
+    const auto* fev = cfg.option<ConfigOptionStrings>("filament_extruder_variant");
+    if (!fev) return;
+    auto* si = cfg.option<ConfigOptionInts>("filament_self_index", true);
+    const size_t nv = fev->size();
+    if (si->size() == nv) return;
+    if (nv % size_t(filament_count) != 0)
+        throw cs::JobError("filament_self_index must have one entry per filament_extruder_variant element");
+    const size_t per = nv / size_t(filament_count);
+    si->values.resize(nv);
+    for (size_t i = 0; i < nv; ++i) si->values[i] = int(i / per) + 1;
+}
+
+// A filament preset's variant vectors have one value per entry of its filament_extruder_variant
+// (desktop pads them to that count when it loads the preset, extend_default_config_length). Many
+// system filaments (every BBL "@BBL H2C/H2D/X1C/…" preset) get their variant names only from an
+// `include` template (fdm_filament_template_direct_dual*), so a host that flattens `inherits` but
+// not `include` sends 2-3 values per filament under a single "Direct Drive Standard" name, and every
+// filament after the first silently reads its neighbour's columns. Reject that shape.
+// Allowed sizes: filament_extruder_variant's (desktop), the filament count (one value per filament,
+// pre-2.5 configs) or 1 (key not sent).
+void validate_filament_variant_layout(const DynamicPrintConfig& cfg, int filament_count)
+{
+    const size_t nv = std::max<size_t>(1, vector_size(cfg, "filament_extruder_variant"));
+    for (const std::string& key : filament_options_with_variant) {
+        if (key == "filament_extruder_variant") continue;
+        const auto* v = dynamic_cast<const ConfigOptionVectorBase*>(cfg.option(key));
+        if (!v) continue;
+        const size_t n = v->size();
+        if (n <= 1 || n == nv || n == size_t(filament_count)) continue;
+        throw cs::JobError(key + " has " + std::to_string(n) + " values but filament_extruder_variant names " + std::to_string(nv) +
+                           " variant column(s) for " + std::to_string(filament_count) +
+                           " filament(s): every filament's variant vectors need one value per entry of its filament_extruder_variant. "
+                           "This usually means the filament presets were flattened without their `include` templates "
+                           "(e.g. fdm_filament_template_direct_dual_e3d), which define filament_extruder_variant.");
+    }
+}
+
+bool cfg_has_multi_nozzle_extruder(const DynamicPrintConfig& cfg)
+{
+    const auto* mx = cfg.option<ConfigOptionIntsNullable>("extruder_max_nozzle_count");
+    if (!mx) return false;
+    for (size_t i = 0; i < mx->values.size(); ++i)
+        if (!mx->is_nil(i) && mx->values[i] > 1) return true;
+    return false;
+}
+
+// Multi-extruder / nozzle-rack bookkeeping desktop does between the GUI and Print::apply
+// (Plater::priv::update_background_process → PresetBundle::full_config(false, f_maps, f_volume_maps)):
+//  * filament_volume_map always has one entry per filament; when the plate has none it is
+//    get_default_nozzle_volume_types_for_filaments(), the nozzle_volume_type of each filament's
+//    extruder. Filled in here when the host did not send it.
+//  * extruder_nozzle_stats ("<Type>#<count>|…" per extruder) is always present on a printer with a
+//    nozzle rack (extruder_max_nozzle_count > 1): Tab seeds it (seedExtruderNozzleStats) and the
+//    "Set the physical nozzle count" dialog / device sync splits a Hybrid rack into per-type counts.
+//    A Hybrid extruder without per-type counts groups into one "Hybrid" nozzle, which writes
+//    filament_volume_map back as Hybrid and resolves every filament to its Standard column.
+//  * Nozzle Manual mode reads filament_nozzle_map + filament_volume_map + per-extruder stats only.
+// Errors name what the host must send.
+void prepare_nozzle_maps(DynamicPrintConfig& cfg, const json& sent, int filament_count, int extruder_count)
+{
+    const bool sent_volume_map = sent.is_object() && sent.contains("filament_volume_map");
+    auto* vmap = cfg.option<ConfigOptionInts>("filament_volume_map", true);
+    const auto* nvt = cfg.option<ConfigOptionEnumsGeneric>("nozzle_volume_type");
+    const auto& fmap = cfg.option<ConfigOptionInts>("filament_map", true)->values;
+    if (int(vmap->values.size()) != filament_count) {
+        if (sent_volume_map && extruder_count > 1)
+            throw cs::JobError("filament_volume_map must have one entry per filament (" + std::to_string(filament_count) + "), got " +
+                               std::to_string(vmap->values.size()));
+        if (!sent_volume_map) {
+            vmap->values.assign(filament_count, int(nvtStandard));
+            if (extruder_count > 1 && nvt)
+                for (int f = 0; f < filament_count; ++f) {
+                    const int e = f < int(fmap.size()) ? fmap[f] - 1 : 0;
+                    if (e >= 0 && e < int(nvt->values.size())) vmap->values[f] = nvt->values[e];
+                }
+        }
+    }
+    if (!cfg_has_multi_nozzle_extruder(cfg)) return;
+
+    const auto* stats_opt = cfg.option<ConfigOptionStrings>("extruder_nozzle_stats");
+    std::vector<std::string> stats_str = stats_opt ? stats_opt->values : std::vector<std::string>();
+    const bool have_stats = std::any_of(stats_str.begin(), stats_str.end(), [](const std::string& s) { return !s.empty(); });
+    if (have_stats && int(stats_str.size()) != extruder_count)
+        throw cs::JobError("extruder_nozzle_stats must have one entry per extruder (" + std::to_string(extruder_count) + "), got " +
+                           std::to_string(stats_str.size()));
+    // Strict token check (Orca's parser skips malformed tokens silently).
+    for (size_t e = 0; e < stats_str.size(); ++e) {
+        if (stats_str[e].empty()) continue;
+        std::vector<std::string> toks;
+        boost::algorithm::split(toks, stats_str[e], boost::algorithm::is_any_of("|"));
+        for (const std::string& t : toks) {
+            const size_t hash = t.find('#');
+            const auto& keys = ConfigOptionEnum<NozzleVolumeType>::get_enum_values();
+            auto it = hash == std::string::npos ? keys.end() : keys.find(t.substr(0, hash));
+            char* end = nullptr;
+            const long cnt = hash == std::string::npos ? -1 : std::strtol(t.c_str() + hash + 1, &end, 10);
+            if (it == keys.end() || it->second == nvtHybrid || cnt < 0 || !end || *end != '\0')
+                throw cs::JobError("extruder_nozzle_stats[" + std::to_string(e) + "]: bad token \"" + t +
+                                   "\" (want \"<nozzle type>#<count>\" joined by |, e.g. \"Standard#3|High Flow#3\"; Hybrid is not a nozzle type)");
+        }
+    }
+    const auto stats = get_extruder_nozzle_stats(stats_str);
+    const auto* mx = cfg.option<ConfigOptionIntsNullable>("extruder_max_nozzle_count");
+    auto total = [&](int e) { int t = 0; if (e < int(stats.size())) for (const auto& kv : stats[e]) t += kv.second; return t; };
+    for (int e = 0; e < extruder_count; ++e) {
+        const int t = total(e);
+        if (mx && e < int(mx->values.size()) && !mx->is_nil(e) && t > mx->values[e])
+            throw cs::JobError("extruder_nozzle_stats[" + std::to_string(e) + "] lists " + std::to_string(t) + " nozzles, extruder " +
+                               std::to_string(e + 1) + " holds at most " + std::to_string(mx->values[e]) + " (extruder_max_nozzle_count)");
+        if (nvt && e < int(nvt->values.size()) && nvt->values[e] == nvtHybrid && t == 0)
+            throw cs::JobError("extruder " + std::to_string(e + 1) + " has nozzle_volume_type Hybrid but extruder_nozzle_stats gives no "
+                               "per-type nozzle counts for it: send extruder_nozzle_stats with one entry per extruder, e.g. "
+                               "[\"Standard#1\", \"Standard#3|High Flow#3\"] (desktop seeds extruder_max_nozzle_count nozzles of the "
+                               "selected type per extruder; a Hybrid rack is split by the user or by device sync)");
+    }
+    const auto* mode = cfg.option<ConfigOptionEnum<FilamentMapMode>>("filament_map_mode");
+    if (mode && mode->value == fmmNozzleManual) {
+        const auto* nmap = cfg.option<ConfigOptionInts>("filament_nozzle_map");
+        if (!nmap || int(nmap->values.size()) != filament_count || int(vmap->values.size()) != filament_count)
+            throw cs::JobError("filament_map_mode Nozzle Manual needs filament_nozzle_map and filament_volume_map with one entry per filament (" +
+                               std::to_string(filament_count) + ")");
+        for (int e = 0; e < extruder_count; ++e)
+            if (total(e) == 0)
+                throw cs::JobError("filament_map_mode Nozzle Manual needs extruder_nozzle_stats for every extruder (extruder " +
+                                   std::to_string(e + 1) + " has none), e.g. [\"Standard#1\", \"Standard#3|High Flow#3\"]");
+        for (int f = 0; f < filament_count; ++f)
+            if (vmap->values[f] == nvtHybrid)
+                throw cs::JobError("filament_map_mode Nozzle Manual: filament_volume_map[" + std::to_string(f) +
+                                   "] must name a nozzle type (Standard / High Flow / ...), not Hybrid");
+    }
+}
+
+// Which resolution Print::apply() will run, mirrored for the bridge and resolve_variants.
+bool printer_resolved_by_print_apply(const DynamicPrintConfig& cfg)
+{
+    int extruder_count = 1;
+    const bool different = cfg.support_different_extruders(extruder_count);
+    return extruder_count > 1 || different;
+}
+
+void resolve_print_printer_variants(DynamicPrintConfig& cfg)
+{
+    int extruder_count = 1;
+    cfg.support_different_extruders(extruder_count);
+    std::vector<std::vector<NozzleVolumeType>> nvt;
+    const int vc = cfg.get_extruder_nozzle_volume_count(extruder_count, nvt);
+    // variant_2 first: variant_1 halves printer_extruder_id/variant (as in Print::apply).
+    cfg.update_values_to_printer_extruders(cfg, extruder_count, vc, nvt, printer_options_with_variant_2, "printer_extruder_id", "printer_extruder_variant", 2);
+    cfg.update_values_to_printer_extruders(cfg, extruder_count, vc, nvt, printer_options_with_variant_1, "printer_extruder_id", "printer_extruder_variant");
+    cfg.update_values_to_printer_extruders(cfg, extruder_count, vc, nvt, print_options_with_variant, "print_extruder_id", "print_extruder_variant");
+}
+
+bool wider_than_one(const DynamicPrintConfig& cfg, const char* key)
+{
+    const auto* o = cfg.option<ConfigOptionStrings>(key);
+    return o && o->size() > 1;
+}
+
+// Returns true when the bridge resolved print/printer variants itself.
+bool pre_resolve_variants(DynamicPrintConfig& cfg)
+{
+    if (printer_resolved_by_print_apply(cfg)) return false;
+    if (!wider_than_one(cfg, "print_extruder_variant") && !wider_than_one(cfg, "printer_extruder_variant")) return false;
+    resolve_print_printer_variants(cfg);
+    return true;
+}
+
 json collect_stats(const Print& print, const GCodeProcessorResult& result, const DynamicPrintConfig& cfg)
 {
     const auto& ps = result.print_statistics;
@@ -457,13 +779,17 @@ int slice_impl(const char* job_json, int job_len, const uint8_t* blob, int blob_
         auto& fmap = config.option<ConfigOptionInts>("filament_map", true)->values;
         if (int(fmap.size()) < filament_count) fmap.resize(filament_count, 1);
         if (extruder_count == 1) std::fill(fmap.begin(), fmap.end(), 1);
-#ifndef CS_ORCA_LEGACY_API
         if (!config.has("nozzle_volume_type")) {
             auto* nvt = config.option<ConfigOptionEnumsGeneric>("nozzle_volume_type", true);
             nvt->values.resize(extruder_count, nvtStandard);
         }
-#endif
     }
+    normalize_filament_self_index(config, filament_count);
+    validate_filament_variant_layout(config, filament_count);
+    prepare_nozzle_maps(config, job.config, filament_count, extruder_count);
+    if (const auto* m = config.option<ConfigOptionBools>("filament_is_mixed"); m && has_any_mixed_filament(m->values))
+        validate_mixed(config);
+    pre_resolve_variants(config);
     config.normalize_fdm();
 
     Model model;
@@ -532,9 +858,7 @@ int slice_impl(const char* job_json, int job_len, const uint8_t* blob, int blob_
             {"flow_rate", CalibMode::Calib_Flow_Rate}, {"temp_tower", CalibMode::Calib_Temp_Tower}, {"vol_speed_tower", CalibMode::Calib_Vol_speed_Tower},
             {"vfa_tower", CalibMode::Calib_VFA_Tower}, {"retraction_tower", CalibMode::Calib_Retraction_tower},
             {"input_shaping_freq", CalibMode::Calib_Input_shaping_freq}, {"input_shaping_damp", CalibMode::Calib_Input_shaping_damp},
-#ifndef CS_ORCA_LEGACY_API
             {"cornering", CalibMode::Calib_Cornering},
-#endif
         };
         auto mi = modes.find(job.calib.value("mode", std::string()));
         if (mi == modes.end()) throw cs::JobError("unknown calibration mode");
@@ -547,9 +871,9 @@ int slice_impl(const char* job_json, int job_len, const uint8_t* blob, int blob_
         cp.freqStartX = job.calib.value("freqStartX", 0.0); cp.freqEndX = job.calib.value("freqEndX", 0.0);
         cp.freqStartY = job.calib.value("freqStartY", 0.0); cp.freqEndY = job.calib.value("freqEndY", 0.0);
         cp.test_model = job.calib.value("testModel", 0);
-#ifndef CS_ORCA_LEGACY_API
         cp.shaper_type = job.calib.value("shaperType", std::string());
-#endif
+        cp.vfa_layer_height = job.calib.value("vfaLayerHeight", 0.0);        // 0 = auto (nozzle / 2)
+        cp.nozzle_based_resize = job.calib.value("nozzleBasedResize", true);
         if (auto a = job.calib.find("accelerations"); a != job.calib.end() && a->is_array()) for (const json& v : *a) cp.accelerations.push_back(v.get<double>());
         if (auto a = job.calib.find("speeds"); a != job.calib.end() && a->is_array()) for (const json& v : *a) cp.speeds.push_back(v.get<double>());
         print.set_calib_params(cp);
@@ -560,15 +884,18 @@ int slice_impl(const char* job_json, int job_len, const uint8_t* blob, int blob_
         throw cs::JobError("Nothing to slice: no object is fully inside the print volume.");
 
     if (job.validate) {
-        StringObjectException warning;
-        StringObjectException err = print.validate(&warning);
+        std::vector<StringObjectException> validate_warnings;
+        StringObjectException err = print.validate(&validate_warnings);
         if (!err.string.empty()) throw cs::JobError(err.string);
-        if (!warning.string.empty()) warnings.push_back({{"code", "validate"}, {"message", warning.string}});
+        for (const StringObjectException& w : validate_warnings)
+            if (!w.string.empty()) warnings.push_back({{"code", "validate"}, {"message", w.string}});
     }
 
+    cs::hooks::Scope hook_scope(print); // plugin pipeline hooks (Module.csHook) + lifecycle events
     const double t0 = now_ms();
     print.process();
     const double t1 = now_ms();
+
     if (std::string conflict = print.get_conflict_string(); !conflict.empty())
         warnings.push_back({{"code", "conflict"}, {"message", conflict}});
 
@@ -577,12 +904,11 @@ int slice_impl(const char* job_json, int job_len, const uint8_t* blob, int blob_
     const std::string out_path = "/tmp/cs_output.gcode";
     ::unlink(out_path.c_str());
     const std::string written = print.export_gcode(out_path, &result, nullptr);
+    hook_scope.finish(report);
     const double t2 = now_ms();
-#ifndef CS_ORCA_LEGACY_API
     if (result.gcode_check_result.error_code)
         warnings.push_back({{"code", "unprintable_area"},
                             {"message", "G-code contains moves outside the printable area."}});
-#endif
 
     // Read the G-code straight into the output buffer (no intermediate copy),
     // then drop the MEMFS file so peak memory stays ~2x the G-code size.
@@ -669,6 +995,12 @@ std::string describe_impl()
         o["nullable"] = def.nullable;
         o["guiType"] = gui_type_name(def.gui_type);
         o["scope"] = scope_of(key);
+        if (!def.plugin_type.empty()) o["pluginType"] = def.plugin_type; // e.g. "slicing-pipeline"
+        // Per-extruder-variant vectors (one element per print/printer/filament_extruder_variant entry).
+        if (print_options_with_variant.count(key)) o["variant"] = "print";
+        else if (printer_options_with_variant_1.count(key)) o["variant"] = "printer";
+        else if (printer_options_with_variant_2.count(key)) { o["variant"] = "printer"; o["variantStride"] = 2; }
+        else if (filament_options_with_variant.count(key)) o["variant"] = "filament";
         opts[key] = std::move(o);
     }
     return json{{"engine", CS_ENGINE_ID}, {"version", CS_ENGINE_VERSION}, {"options", std::move(opts)}}.dump();
@@ -1044,7 +1376,7 @@ void op_paint_apply(const json& args, ToolOut& out)
             auto cursor = TriangleSelector::SinglePointCursor::cursor_factory(z_world, cam, radius, trafo, clp);
             ps.sel->select_patch(facet, std::move(cursor), st, trafo_nt, true, 0.f);
         } else if (kind == "fill") {
-            ps.sel->seed_fill_select_triangles(pt, facet, trafo_nt, clp, args.value("angle", 30.f), overhang, true);
+            ps.sel->seed_fill_select_triangles(pt, facet, trafo_nt, clp, args.value("angle", 30.f), overhang, Vec3f::UnitZ(), true);
             ps.sel->seed_fill_apply_on_triangles(st);
         } else if (kind == "bucket") {
             ps.sel->bucket_fill_select_triangles(pt, facet, clp, args.value("angle", 30.f), true, true);
@@ -1161,179 +1493,613 @@ void update_cut_id(CutObjectBase& cut_id, ModelObjectCutAttributes attributes, i
     if (n > 0) cut_id.increase_check_sum(size_t(n));
 }
 
-#if __has_include(<libslic3r/MixedFilament.hpp>)
-#define CS_HAS_MIXED_FILAMENTS 1
-// FullSpectrum mixed (virtual) filaments: the same regeneration Print::apply
-// runs (auto pairs from the physical colours + the user's custom rows), plus
-// edits, through the manager's typed definitions.
-//   args: { colors:[hex], definitions:"<mixed_filament_definitions>", edits:[...] }
-//   edits: {op:"add", a, b, percent} | {op:"add_definition", definition}
-//        | {op:"set", stableId, definition} | {op:"remove", stableId} | {op:"percent", stableId, percent}
-//   result: { definitions, filaments:[{id, stableId, custom, a, b, percent, color, kind,
-//             components:[{id, percent}], distribution, cadence:{a,b}, localZMax,
-//             gradient:{enabled, start, end, stops[], solidWidths[]}, offsets[], perimeterModulation,
-//             pattern:[[id...]...]}] }
-json mixed_definition_json(const MixedFilamentDefinition& d)
-{
-    json comps = json::array();
-    for (const auto& c : d.recipe.blend.components) comps.push_back({{"id", c.filament.id}, {"percent", c.percent}});
-    json pattern = json::array();
-    if (d.recipe.manual_pattern)
-        for (const auto& g : d.recipe.manual_pattern->groups) {
-            json grp = json::array();
-            for (const auto& r : g) grp.push_back(r.id);
-            pattern.push_back(grp);
-        }
-    const auto& gb = d.behavior.gradient;
-    return {
-        {"stableId", d.identity.stable_id},
-        {"custom", d.source.kind == MixedFilamentSourceKind::Custom},
-        {"kind", d.recipe.kind == MixedFilamentRecipeKind::ManualPattern ? "pattern" : "blend"},
-        {"components", comps},
-        {"distribution", d.behavior.distribution == MixedFilamentDistributionMode::LayerCycle ? "layer_cycle" : "simple"},
-        {"cadence", {{"a", d.behavior.layer_cadence.component_a_layers}, {"b", d.behavior.layer_cadence.component_b_layers}}},
-        {"localZMax", d.behavior.local_z.max_sublayers},
-        {"gradient", {{"enabled", gb.enabled}, {"start", gb.component_a_start}, {"end", gb.component_a_end},
-                      {"stops", gb.stop_positions}, {"solidWidths", gb.solid_widths}}},
-        {"offsets", d.behavior.surface_bias.component_offsets_mm},
-        {"offsetA", d.behavior.surface_bias.component_a_offset_mm},
-        {"offsetB", d.behavior.surface_bias.component_b_offset_mm},
-        {"perimeterModulation", d.behavior.surface_bias.perimeter_modulation},
-        {"pattern", pattern},
-        {"color", d.presentation.display_color},
-    };
-}
 
-// Apply the (partial) JSON onto a definition. Physical ids are clamped to 1..n.
-void apply_mixed_definition(MixedFilamentDefinition& d, const json& j, size_t n)
+// ---- mixed filaments: the helpers behind desktop's mixed-filament dialog -----------
+//   action "preview":   { colors:[hex per filament], components:[1-based], ratios:[weights] }
+//                       -> { color, measured }   (measured: lab-measured blend from Orca's table, or null)
+//   action "recommend": { target:"#hex", mode:"filaments"|"cmyw"|"rybw", materialType?,
+//                         filaments:[{ color, name?, type?, mixed? }] }
+//                       -> { valid, mode, color, components:[{ filament (1-based, 0 = standard base colour),
+//                            color, baseColor, ratio }] }
+//   action "validate":  { config:{filament_is_mixed, filament_mixed_*} } -> { errors:{ key: message } }
+//   action "curve":     { curve: "x,y|..." | [[x,y(,mIn,mOut)]...], samples?:n }
+//                       -> { serialized, points:[[x,y,mIn|null,mOut|null]], samples:[[t,ratio]] }
+//   action "expand":    { config, mixedFilaments } -> { slots:[...], config:{ changed keys, serialized } }
+//                       (desktop's add-mixed-filament expansion of every per-filament key)
+void op_mixed_filament(const json& args, ToolOut& out)
 {
-    if (!j.is_object()) throw cs::JobError("mixed filament: definition must be an object");
-    auto clampi = [](int v, int lo, int hi) { return std::max(lo, std::min(hi, v)); };
-    auto clampf = [](float v, float lo, float hi) { return std::isfinite(v) ? std::max(lo, std::min(hi, v)) : lo; };
-    if (auto c = j.find("components"); c != j.end() && c->is_array()) {
-        std::vector<MixedFilamentWeightedComponent> comps;
-        for (const json& e : *c) {
-            if (!e.is_object()) continue;
-            MixedFilamentWeightedComponent w;
-            w.filament.id = unsigned(clampi(e.value("id", 1), 1, int(n)));
-            w.percent = clampi(e.value("percent", 0), 0, 100);
-            comps.push_back(w);
-        }
-        if (comps.size() < 2 || comps.size() > n) throw cs::JobError("mixed filament: needs 2.." + std::to_string(n) + " components");
-        d.recipe.blend.components = std::move(comps);
-    }
-    if (auto k = j.find("kind"); k != j.end() && k->is_string())
-        d.recipe.kind = *k == "pattern" ? MixedFilamentRecipeKind::ManualPattern : MixedFilamentRecipeKind::WeightedBlend;
-    if (auto p = j.find("pattern"); p != j.end() && p->is_array()) {
-        MixedFilamentManualPattern mp;
-        for (const json& g : *p) {
-            if (!g.is_array()) continue;
-            std::vector<MixedFilamentPhysicalRef> grp;
-            for (const json& id : g) if (id.is_number_integer()) grp.push_back({unsigned(clampi(id.get<int>(), 1, int(n)))});
-            if (!grp.empty()) mp.groups.push_back(std::move(grp));
-        }
-        if (mp.groups.empty()) d.recipe.manual_pattern.reset(); else d.recipe.manual_pattern = std::move(mp);
-    }
-    if (d.recipe.kind == MixedFilamentRecipeKind::ManualPattern && !d.recipe.manual_pattern)
-        throw cs::JobError("mixed filament: a pattern needs at least one filament");
-    if (auto v = j.find("distribution"); v != j.end() && v->is_string())
-        d.behavior.distribution = *v == "layer_cycle" ? MixedFilamentDistributionMode::LayerCycle : MixedFilamentDistributionMode::Simple;
-    if (auto c = j.find("cadence"); c != j.end() && c->is_object()) {
-        d.behavior.layer_cadence.component_a_layers = clampi(c->value("a", 1), 1, 100);
-        d.behavior.layer_cadence.component_b_layers = clampi(c->value("b", 1), 1, 100);
-    }
-    if (auto v = j.find("localZMax"); v != j.end() && v->is_number()) d.behavior.local_z.max_sublayers = clampi(v->get<int>(), 0, 64);
-    if (auto g = j.find("gradient"); g != j.end() && g->is_object()) {
-        auto& gb = d.behavior.gradient;
-        gb.enabled = g->value("enabled", gb.enabled);
-        gb.component_a_start = clampf(g->value("start", gb.component_a_start), 0.f, 1.f);
-        gb.component_a_end = clampf(g->value("end", gb.component_a_end), 0.f, 1.f);
-        auto floats = [&](const char* key, std::vector<float>& out, float hi) {
-            if (auto a = g->find(key); a != g->end() && a->is_array()) {
-                out.clear();
-                for (const json& x : *a) if (x.is_number()) out.push_back(clampf(x.get<float>(), 0.f, hi));
+    const std::string action = args.value("action", std::string());
+    auto ints = [](const json& a) { std::vector<int> v; if (a.is_array()) for (const json& x : a) v.push_back(x.is_number() ? int(std::lround(x.get<double>())) : 0); return v; };
+    if (action == "preview") {
+        std::vector<std::string> colors;
+        for (const json& c : args.value("colors", json::array())) colors.push_back(c.is_string() ? c.get<std::string>() : std::string("#808080"));
+        const std::vector<int> comps = ints(args.value("components", json::array())), weights = ints(args.value("ratios", json::array()));
+        if (comps.size() < 2 || comps.size() != weights.size()) throw cs::JobError("preview: components and ratios must match (2+)");
+        std::vector<std::string> hex;
+        for (int c : comps) hex.push_back(c >= 1 && size_t(c) <= colors.size() ? colors[size_t(c) - 1] : std::string("#808080"));
+        const std::string measured = lookup_measured_blend_color(hex, weights);
+        out.result = {{"color", blend_color_multi(hex, weights)}, {"measured", measured.empty() ? json(nullptr) : json(measured)}};
+    } else if (action == "recommend") {
+        ColorDecomposeRgb target;
+        if (!color_decompose_hex_to_rgb(args.value("target", std::string()), target)) throw cs::JobError("recommend: target must be #RRGGBB");
+        const std::string mode = args.value("mode", std::string("filaments")), material = args.value("materialType", std::string());
+        ColorDecomposeRecipeResult r;
+        if (mode == "cmyw" || mode == "rybw") {
+            r = lookup_standard_recipe(target, mode == "cmyw" ? ColorDecomposeRecipeMode::CMYW : ColorDecomposeRecipeMode::RYBW, material);
+        } else {
+            std::vector<ColorDecomposePhysicalFilament> fils;
+            unsigned idx = 0;
+            for (const json& f : args.value("filaments", json::array())) {
+                ++idx;
+                if (!f.is_object()) continue;
+                ColorDecomposePhysicalFilament pf;
+                pf.color_hex = f.value("color", std::string());
+                pf.name = f.value("name", std::string());
+                pf.type = f.value("type", std::string());
+                pf.is_mixed = f.value("mixed", false);
+                pf.filament_index = idx;
+                fils.push_back(pf);
             }
-        };
-        floats("stops", gb.stop_positions, 1.f);
-        floats("solidWidths", gb.solid_widths, 1.f);
-        std::sort(gb.stop_positions.begin(), gb.stop_positions.end());
-    }
-    auto& sb = d.behavior.surface_bias;
-    if (auto o = j.find("offsets"); o != j.end() && o->is_array()) {
-        sb.component_offsets_mm.clear();
-        for (const json& x : *o) if (x.is_number()) sb.component_offsets_mm.push_back(clampf(x.get<float>(), -2.f, 2.f));
-    }
-    if (auto v = j.find("offsetA"); v != j.end() && v->is_number()) sb.component_a_offset_mm = clampf(v->get<float>(), -2.f, 2.f);
-    if (auto v = j.find("offsetB"); v != j.end() && v->is_number()) sb.component_b_offset_mm = clampf(v->get<float>(), -2.f, 2.f);
-    if (auto v = j.find("perimeterModulation"); v != j.end() && v->is_boolean()) sb.perimeter_modulation = v->get<bool>();
-}
-
-void op_mixed_filaments(const json& args, ToolOut& out)
-{
-    std::vector<std::string> colors;
-    for (const json& c : args.value("colors", json::array())) colors.push_back(c.is_string() ? c.get<std::string>() : std::string("#26A69A"));
-    if (colors.size() > MixedFilamentManager::kMaxPhysicalFilaments) colors.resize(MixedFilamentManager::kMaxPhysicalFilaments);
-    const size_t n = colors.size();
-    MixedFilamentManager mgr;
-    mgr.clear_custom_entries();
-    mgr.auto_generate(colors);
-    mgr.load_custom_entries(args.value("definitions", std::string()), colors);
-    auto clampi = [](int v, int lo, int hi) { return std::max(lo, std::min(hi, v)); };
-    auto index_of = [&](uint64_t id) -> int {
-        const auto defs = mgr.mixed_filament_definitions(n);
-        for (size_t i = 0; i < defs.size(); ++i) if (defs[i].identity.stable_id == id) return int(i);
-        return -1;
-    };
-    for (const json& e : args.value("edits", json::array())) {
-        const std::string op = e.value("op", std::string());
-        if (op == "add") {
-            const unsigned a = unsigned(e.value("a", 1)), b = unsigned(e.value("b", 2));
-            if (a < 1 || b < 1 || a > n || b > n || a == b) throw cs::JobError("mixed filament: components must be two different physical filaments");
-            mgr.add_custom_filament(a, b, clampi(e.value("percent", 50), 0, 100), colors);
-        } else if (op == "add_definition") {
-            MixedFilamentDefinition d;
-            d.recipe.blend.components = {{{1}, 50}, {{2}, 50}};
-            apply_mixed_definition(d, e.value("definition", json::object()), n);
-            mgr.add_custom_filament_definition(std::move(d), colors);
-        } else if (op == "set") {
-            const int i = index_of(e.value("stableId", uint64_t(0)));
-            if (i < 0) throw cs::JobError("mixed filament: unknown id");
-            MixedFilamentDefinition d = mgr.mixed_filament_definitions(n)[size_t(i)];
-            apply_mixed_definition(d, e.value("definition", json::object()), n);
-            mgr.set_mixed_filament_definition(size_t(i), d, colors);
-        } else if (op == "remove" || op == "percent") {
-            const uint64_t id = e.value("stableId", uint64_t(0));
-            auto& rows = mgr.mixed_filaments();
-            for (size_t i = 0; i < rows.size(); ++i) {
-                if (rows[i].stable_id != id) continue;
-                MixedFilamentLegacyRow r = rows[i];
-                if (op == "remove") r.deleted = true; else r.mix_b_percent = clampi(e.value("percent", 50), 0, 100);
-                mgr.set_mixed_filament_legacy_row(i, r, n, colors);
-                break;
+            r = recommend_from_physical_filaments(target, fils, material);
+        }
+        json comps = json::array();
+        for (const auto& c : r.components)
+            comps.push_back({{"filament", c.filament_index}, {"color", c.color_hex}, {"baseColor", c.base_color}, {"ratio", c.ratio}});
+        out.result = {{"valid", r.valid}, {"mode", r.mode == ColorDecomposeRecipeMode::CMYW ? "cmyw" : r.mode == ColorDecomposeRecipeMode::RYBW ? "rybw" : "filaments"},
+                      {"color", r.matched_color_hex}, {"components", comps}};
+    } else if (action == "validate") {
+        DynamicPrintConfig cfg;
+        json subs = json::array();
+        load_config_json(cfg, args.value("config", json::object()), subs);
+        auto bools = [&](const char* k) { const auto* o = cfg.option<ConfigOptionBools>(k); return o ? o->values : std::vector<unsigned char>{}; };
+        auto strs  = [&](const char* k) { const auto* o = cfg.option<ConfigOptionStrings>(k); return o ? o->values : std::vector<std::string>{}; };
+        json errs = json::object();
+        for (const auto& [k, m] : validate_mixed_filament_params(bools("filament_is_mixed"), strs("filament_mixed_components"),
+                                                                  strs("filament_mixed_sublayer_ratios"), bools("filament_mixed_gradient"),
+                                                                  strs("filament_mixed_gradient_range"), strs("filament_mixed_gradient_curve")))
+            errs[k] = m;
+        out.result = {{"errors", errs}};
+    } else if (action == "curve") {
+        GradientCurve c;
+        const json in = args.value("curve", json(""));
+        if (in.is_string()) c = parse_gradient_curve(in.get<std::string>());
+        else if (in.is_array()) {
+            for (const json& p : in) {
+                if (!p.is_array() || p.size() < 2 || !p[0].is_number() || !p[1].is_number()) throw cs::JobError("curve: points are [x, y(, mIn, mOut)]");
+                GradientAnchor a; a.x = p[0].get<double>(); a.y = p[1].get<double>();
+                if (p.size() >= 4 && p[2].is_number()) a.m_in = p[2].get<double>();
+                if (p.size() >= 4 && p[3].is_number()) a.m_out = p[3].get<double>();
+                c.points.push_back(a);
+            }
+            c = parse_gradient_curve(serialize_gradient_curve(c)); // same clamping + sort as a stored curve
+        }
+        json pts = json::array();
+        for (const auto& a : c.points) pts.push_back({a.x, a.y, std::isfinite(a.m_in) ? json(a.m_in) : json(nullptr), std::isfinite(a.m_out) ? json(a.m_out) : json(nullptr)});
+        const int n = std::clamp(args.value("samples", 0), 0, 4096);
+        json samples = json::array();
+        for (int i = 0; i < n && !c.empty(); ++i) {
+            const double t = n == 1 ? 0. : double(i) / (n - 1);
+            samples.push_back({t, sample_gradient_curve(c, t)});
+        }
+        out.result = {{"serialized", serialize_gradient_curve(c)}, {"points", pts}, {"samples", samples}};
+    } else if (action == "expand") {
+        DynamicPrintConfig cfg;
+        cfg.apply(FullPrintConfig::defaults());
+        json subs = json::array();
+        load_config_json(cfg, args.value("config", json::object()), subs);
+        const DynamicPrintConfig before = cfg;
+        const json slots = expand_mixed_filaments(cfg, args.value("mixedFilaments", json::array()));
+        validate_mixed(cfg);
+        json changed = json::object();
+        for (const std::string& k : cfg.keys()) {
+            const ConfigOption* a = before.option(k);
+            const ConfigOption* b = cfg.option(k);
+            if (!a || *a != *b) {
+                if (const auto* v = dynamic_cast<const ConfigOptionVectorBase*>(b)) changed[k] = v->vserialize();
+                else changed[k] = b->serialize();
             }
         }
+        out.result = {{"slots", slots}, {"config", changed}};
+    } else {
+        throw cs::JobError("mixed_filament: unknown action '" + action + "'");
     }
-    mgr.refresh_display_colors(colors);
-    const std::string serialized = mgr.serialize_custom_entries();
-    const auto defs = mgr.mixed_filament_definitions(n);
-    const auto& rows = mgr.mixed_filament_legacy_rows();
-    json list = json::array();
-    for (unsigned id = unsigned(n) + 1; id <= unsigned(n + defs.size()); ++id) {
-        const int idx = mgr.mixed_index_from_filament_id(id, n);
-        if (idx < 0 || size_t(idx) >= defs.size() || defs[size_t(idx)].visibility.tombstoned) continue;
-        json f = mixed_definition_json(defs[size_t(idx)]);
-        f["id"] = id;
-        if (size_t(idx) < rows.size()) {
-            const MixedFilamentLegacyRow& r = rows[size_t(idx)];
-            f["a"] = r.component_a; f["b"] = r.component_b; f["percent"] = r.mix_b_percent;
-            if (!r.display_color.empty()) f["color"] = r.display_color;
-        }
-        list.push_back(f);
-    }
-    out.result["definitions"] = serialized;
-    out.result["filaments"] = list;
 }
-#endif
+
+// ---- extruder variants: what each extruder / filament actually uses ----------------
+//   args { config } (the job's config, PresetBundle::full_config(false) shape)
+//   -> { extruderCount, differentExtruders, resolvedBy: "print_apply"|"bridge"|"none",
+//        print:{key:[per extruder]}, printer:{key:[...]}, filament:{key:[per filament]} }
+// The same resolution cs_slice applies (pre_resolve_variants + Print::apply).
+// The job config resolved the way cs_slice resolves it before Print::apply's grouping: maps
+// normalized and validated (prepare_nozzle_maps), print/printer variant columns picked, each
+// filament's variant picked by filament_map / filament_volume_map.
+struct ResolvedConfig {
+    DynamicPrintConfig cfg;
+    int filament_count = 1;
+    int extruder_count = 1;
+    bool different = false;
+    std::string by = "none";
+};
+ResolvedConfig resolve_job_config(const json& cj)
+{
+    ResolvedConfig r;
+    DynamicPrintConfig& cfg = r.cfg;
+    cfg.apply(FullPrintConfig::defaults());
+    json subs = json::array();
+    load_config_json(cfg, cj, subs);
+    const int filament_count = r.filament_count = int(std::max<size_t>(1, vector_size(cfg, "filament_diameter")));
+    int extruder_count = 1;
+    const bool different = r.different = cfg.support_different_extruders(extruder_count);
+    r.extruder_count = extruder_count;
+    {
+        auto& fmap = cfg.option<ConfigOptionInts>("filament_map", true)->values;
+        if (int(fmap.size()) < filament_count) fmap.resize(filament_count, 1);
+        if (extruder_count == 1) std::fill(fmap.begin(), fmap.end(), 1);
+        if (!cfg.has("nozzle_volume_type")) cfg.option<ConfigOptionEnumsGeneric>("nozzle_volume_type", true)->values.resize(extruder_count, nvtStandard);
+    }
+    normalize_filament_self_index(cfg, filament_count);
+    validate_filament_variant_layout(cfg, filament_count);
+    prepare_nozzle_maps(cfg, cj, filament_count, extruder_count);
+    if (printer_resolved_by_print_apply(cfg)) { resolve_print_printer_variants(cfg); r.by = "print_apply"; }
+    else if (pre_resolve_variants(cfg)) r.by = "bridge";
+    if (extruder_count > 1 || different || cfg.has_multi_variant_filament()) {
+        std::vector<std::vector<NozzleVolumeType>> nvt;
+        const int vc = cfg.get_extruder_nozzle_volume_count(extruder_count, nvt);
+        std::set<std::string> keys = filament_options_with_variant;
+        keys.insert("filament_self_index");
+        DynamicPrintConfig orig = cfg;   // Print::apply passes its pre-resolution copy (m_ori_full_print_config)
+        cfg.update_values_to_printer_extruders_for_multiple_filaments(orig, extruder_count, vc, keys, "filament_self_index", "filament_extruder_variant");
+    }
+    return r;
+}
+
+void op_resolve_variants(const json& args, ToolOut& out)
+{
+    ResolvedConfig rc = resolve_job_config(args.value("config", json::object()));
+    const DynamicPrintConfig& cfg = rc.cfg;
+    const int extruder_count = rc.extruder_count;
+    const bool different = rc.different;
+    const std::string& by = rc.by;
+    auto dump = [&](const std::set<std::string>& ks) {
+        json o = json::object();
+        for (const std::string& k : ks)
+            if (const ConfigOption* opt = cfg.option(k)) {
+                if (const auto* v = dynamic_cast<const ConfigOptionVectorBase*>(opt)) o[k] = v->vserialize();
+                else o[k] = opt->serialize();
+            }
+        return o;
+    };
+    std::set<std::string> printer = printer_options_with_variant_1;
+    printer.insert(printer_options_with_variant_2.begin(), printer_options_with_variant_2.end());
+    out.result = {{"extruderCount", extruder_count}, {"differentExtruders", different}, {"resolvedBy", by},
+                  {"print", dump(print_options_with_variant)}, {"printer", dump(printer)}, {"filament", dump(filament_options_with_variant)}};
+}
+
+// ---- wipe tower footprint (PartPlate::estimate_wipe_tower_footprint / placement) ------
+//   args { config,                       the job config (cs_slice shape)
+//          filaments?: [1-based],         filaments the plate prints (objects, parts, paint, support
+//                                         filaments, custom-G-code tool changes; PartPlate::get_extruders(true));
+//                                         default: every filament
+//          minFilaments?: n,              floor: pad with the lowest unused ids (desktop's init / arrange use 2)
+//          maxHeight?: mm,                tallest object on the plate (default 0)
+//          layerHeight?: mm,              thinnest layer height on the plate (default config layer_height)
+//          objects?: n,                   printed objects on the plate (default 1; only by-object sequence reads it)
+//          plate?: i,                     index into wipe_tower_x / wipe_tower_y (default 0)
+//          position?: [x, y],             anchor to place (default wipe_tower_x/y[plate]), plate-local mm
+//          printerModelId?: "N9" }        vendor model_id (only "N9" moves desktop's default Y)
+//   -> { printed, towerType, width, depth, height, brim, coneMargin, rotation,
+//        outline: [[x,y]] tower-local first-layer outline (brim excluded, unrotated),
+//        footprint: [[x,y]] tower-local, brim + cone included, rotated: what must fit,
+//        printableArea: [[[x,y]]] printable_area ∩ every extruder_printable_area (Print's check),
+//        placement: {x, y, moved, fits}   the anchor after desktop's clamp, moved inside printableArea,
+//        defaultPosition: {x, y, fits} }  PartPlateList::set_default_wipe_tower_pos_for_plate
+// All in the bed/plate frame the job uses. The anchor is the tower's min corner before rotation.
+void op_wipe_tower_footprint(const json& args, ToolOut& out)
+{
+    ResolvedConfig rc = resolve_job_config(args.value("config", json::object()));
+    const DynamicPrintConfig& cfg = rc.cfg;
+    const int filament_count = rc.filament_count;
+
+    // PartPlate::estimate_wipe_tower_footprint
+    auto plate_filaments = [&](int floor_count) {
+        std::vector<int> ids;
+        if (auto f = args.find("filaments"); f != args.end() && f->is_array()) {
+            for (const json& v : *f)
+                if (v.is_number_integer() && v.get<int>() >= 1 && v.get<int>() <= filament_count) ids.push_back(v.get<int>());
+        } else
+            for (int i = 1; i <= filament_count; ++i) ids.push_back(i);
+        std::sort(ids.begin(), ids.end());
+        ids.erase(std::unique(ids.begin(), ids.end()), ids.end());
+        for (int id = 1; int(ids.size()) < floor_count; ++id)
+            if (std::find(ids.begin(), ids.end(), id) == ids.end()) ids.push_back(id);
+        const int wtf = cfg.has("wipe_tower_filament") ? cfg.opt_int("wipe_tower_filament") : 0;
+        if (cfg.has("enable_prime_tower") && cfg.opt_bool("enable_prime_tower") && ids.size() > 1 && wtf > 0 &&
+            std::find(ids.begin(), ids.end(), wtf) == ids.end())
+            ids.push_back(wtf);
+        return ids;
+    };
+    const double max_height = std::max(0.0, args.value("maxHeight", 0.0));
+    double layer_height = args.value("layerHeight", 0.0);
+    if (!(layer_height > 0)) layer_height = cfg.has("layer_height") ? cfg.opt_float("layer_height") : 0.08;
+    const WipeTowerType tower_type = resolve_wipe_tower_type(cfg);
+    auto footprint_for = [&](int floor_count, std::vector<int>* ids_out) {
+        std::vector<int> ids = plate_filaments(floor_count);
+        if (ids_out) *ids_out = ids;
+        std::vector<unsigned int> fids;
+        for (int id : ids) fids.push_back(unsigned(id - 1));
+        if (fids.empty()) return WipeTowerFootprint();
+        return estimate_wipe_tower_footprint(cfg, tower_type, fids, layer_height, max_height);
+    };
+    std::vector<int> ids;
+    const WipeTowerFootprint fp = footprint_for(std::max(0, args.value("minFilaments", 0)), &ids);
+    const double w = fp.width, d = fp.depth, brim = fp.brim_width;
+
+    const Polygon outline = estimate_wipe_tower_first_layer_outline(cfg, tower_type, w, d, fp.height);
+    const BoundingBox ob = get_extents(outline);
+    const double cone = std::max({0., unscaled(ob.max.x()) - w, unscaled(ob.max.y()) - d, -unscaled(ob.min.x()), -unscaled(ob.min.y())});
+    const double rotation = cfg.has("wipe_tower_rotation_angle") ? cfg.opt_float("wipe_tower_rotation_angle") : 0.;
+    // Print::validate's tower: the outline rotated, offset by the brim.
+    Polygons tower_local;
+    {
+        Polygon base = outline;
+        if (rotation != 0.) base.rotate(Geometry::deg2rad(rotation));
+        tower_local = brim > 0 ? offset(base, float(scale_(brim))) : Polygons{base};
+    }
+
+    // Print::get_extruder_shared_printable_polygon
+    Polygons bed;
+    {
+        const auto* pa = cfg.option<ConfigOptionPoints>("printable_area");
+        const auto* ea = cfg.option<ConfigOptionPointsGroups>("extruder_printable_area");
+        const bool multi = vector_size(cfg, "nozzle_diameter") >= 2 && ea && !ea->values.empty() &&
+                           std::all_of(ea->values.begin(), ea->values.end(), [](const Vec2ds& a) { return a.size() >= 3; });
+        if (multi) {
+            bed = {Polygon::new_scale(ea->values.front())};
+            for (size_t i = 1; i < ea->values.size(); ++i) bed = intersection(bed, Polygons{Polygon::new_scale(ea->values[i])});
+        } else if (pa && pa->values.size() >= 3)
+            bed = {Polygon::new_scale(pa->values)};
+    }
+    BoundingBoxf plate_bb;
+    if (const auto* pa = cfg.option<ConfigOptionPoints>("printable_area")) for (const Vec2d& p : pa->values) plate_bb.merge(p);
+    const double plate_w = plate_bb.defined ? plate_bb.size().x() : 0., plate_d = plate_bb.defined ? plate_bb.size().y() : 0.;
+
+    auto fits_at = [&](double x, double y) {
+        if (bed.empty() || d <= 0) return true;
+        Polygons t = tower_local;
+        for (Polygon& p : t) p.translate(Point(scale_(x), scale_(y)));
+        return diff(t, bed).empty();
+    };
+    auto move_inside = [&](double& x, double& y, double margin) {
+        if (bed.empty()) return;
+        const BoundingBox box(Point::new_scale(x, y), Point::new_scale(x + w, y + d));
+        const Vec2f mv = WipeTower::move_box_inside_polygon(box, bed, scaled<coord_t>(margin));
+        x += mv.x(); y += mv.y();
+    };
+
+    // PartPlate::estimate_wipe_tower_polygon's clamp (without the obstacle search, which needs the
+    // plate's objects), then into the shared printable polygon like set_default_wipe_tower_pos_for_plate.
+    const int plate = std::max(0, args.value("plate", 0));
+    double x = 0, y = 0;
+    if (auto pj = args.find("position"); pj != args.end() && pj->is_array() && pj->size() == 2 && (*pj)[0].is_number() && (*pj)[1].is_number()) {
+        x = (*pj)[0].get<double>(); y = (*pj)[1].get<double>();
+    } else {
+        const auto* xs = cfg.option<ConfigOptionFloats>("wipe_tower_x");
+        const auto* ys = cfg.option<ConfigOptionFloats>("wipe_tower_y");
+        x = xs && !xs->values.empty() ? xs->get_at(plate) : 0.;
+        y = ys && !ys->values.empty() ? ys->get_at(plate) : 0.;
+    }
+    const double x0 = x, y0 = y;
+    {
+        const double wb = brim + cone;
+        const double margin = WIPE_TOWER_MARGIN + wb;
+        const double x_hi = std::max(margin, plate_w - w - margin), y_hi = std::max(margin, plate_d - d - margin);
+        const double margin_c = WIPE_TOWER_AUTO_MARGIN + wb;
+        double x_lo_c = margin_c, x_hi_c = plate_w - w - margin_c;
+        if (x_lo_c > x_hi_c) { x_lo_c = margin; x_hi_c = x_hi; }
+        double y_lo_c = margin_c, y_hi_c = plate_d - d - margin_c;
+        if (y_lo_c > y_hi_c) { y_lo_c = margin; y_hi_c = y_hi; }
+        const double tol = 5.;
+        const bool replace_x = x < margin - tol || x > x_hi + tol;
+        const bool replace_y = y < margin - tol || y > y_hi + tol;
+        x = replace_x ? std::clamp(x, x_lo_c, x_hi_c) : std::clamp(x, margin, x_hi);
+        y = replace_y ? std::clamp(y, y_lo_c, y_hi_c) : std::clamp(y, margin, y_hi);
+        if (!fits_at(x, y)) move_inside(x, y, margin);
+    }
+
+    // PartPlateList::set_default_wipe_tower_pos_for_plate
+    json def;
+    {
+        const auto* ps = cfg.option<ConfigOptionEnum<PrinterStructure>>("printer_structure");
+        double dx = 165., dy = 250.;
+        if (ps && ps->value == PrinterStructure::psI3) { dx = 0.; dy = 250.; }
+        if (args.value("printerModelId", std::string()) == "N9") dy = 160.;
+        WipeTowerFootprint dfp = fp;
+        if (is_approx(dfp.width, 0.0) || is_approx(dfp.depth, 0.0)) dfp = footprint_for(2, nullptr);
+        BoundingBoxf bb2 = plate_bb;
+        if (const auto* ea = cfg.option<ConfigOptionPointsGroups>("extruder_printable_area"))
+            for (const Vec2ds& pts : ea->values) {
+                if (pts.empty()) continue;
+                BoundingBoxf b(pts);
+                bb2.min = bb2.min.x() >= b.min.x() ? bb2.min : b.min;
+                bb2.max = bb2.max.x() <= b.max.x() ? bb2.max : b.max;
+            }
+        const double margin = WIPE_TOWER_AUTO_MARGIN + dfp.brim_width;
+        if (dx + margin + dfp.width > bb2.max.x()) dx = bb2.max.x() - dfp.width - margin;
+        else if (dx < margin + bb2.min.x()) dx = margin + bb2.min.x();
+        if (dy + margin + dfp.depth > bb2.max.y()) dy = bb2.max.y() - dfp.depth - margin;
+        else if (dy < margin) dy = margin;
+        if (!bed.empty()) {
+            const BoundingBox box(Point::new_scale(dx, dy), Point::new_scale(dx + dfp.width, dy + dfp.depth));
+            const Vec2f mv = WipeTower::move_box_inside_polygon(box, bed, scaled<coord_t>(margin));
+            dx += mv.x(); dy += mv.y();
+        }
+        def = {{"x", dx}, {"y", dy}, {"fits", fits_at(dx, dy)}};
+    }
+
+    auto pts_json = [](const Polygon& p) {
+        json a = json::array();
+        for (const Point& q : p.points) a.push_back({unscaled(q.x()), unscaled(q.y())});
+        return a;
+    };
+    json bed_j = json::array();
+    for (const Polygon& p : bed) bed_j.push_back(pts_json(p));
+    json fp_j = json::array();
+    if (!tower_local.empty()) fp_j = pts_json(tower_local.front());
+    bool has_mixed = false;
+    if (const auto* m = cfg.option<ConfigOptionBools>("filament_is_mixed")) has_mixed = has_any_mixed_filament(m->values);
+    const bool printed = prime_tower_is_printed(cfg, int(ids.size()), std::max(1, args.value("objects", 1)), has_mixed);
+    out.result = {{"printed", printed}, {"towerType", tower_type == WipeTowerType::Type1 ? "Type1" : "Type2"},
+                  {"width", w}, {"depth", d}, {"height", fp.height}, {"brim", brim}, {"coneMargin", cone}, {"rotation", rotation},
+                  {"filaments", ids}, {"outline", pts_json(outline)}, {"footprint", fp_j}, {"printableArea", bed_j},
+                  {"placement", {{"x", x}, {"y", y}, {"moved", std::abs(x - x0) > 1e-6 || std::abs(y - y0) > 1e-6}, {"fits", fits_at(x, y)}}},
+                  {"defaultPosition", def}};
+}
+
+// ---- mesh repair ("Fix model" / "Fix All": ObjectList::fix_through_cgal → ModelVolume::repair) ----
+// Orca 2.5 repairs with libslic3r's CGAL repair_mesh on every platform (FixModelByCgal; the
+// Windows-only Netfabb/Win10 SDK path is gone): weld, drop degenerate / duplicate faces, orient
+// shells consistently, fill holes, remove self-intersections, drop shells that are not solids.
+//   meshes[0] the volume's mesh (any frame; repair is frame-independent)
+//   args { paint?: {support, seam, color, fuzzy: [[triangle, hex]]}, keepPainting?: true }
+//   -> meshes[0] = repaired mesh (the input when nothing changed or the repair failed);
+//      result { repaired, modified, error, triangles, vertices, stats:{weldedVertices,
+//      removedTriangles, reversedShells, filledHoles, removedShells, selfIntersections},
+//      paint (re-projected onto the new triangles, desktop's keep_painting; omitted when none) }
+void op_repair_mesh(const json& args, const std::vector<ToolMesh>& meshes, ToolOut& out)
+{
+    if (meshes.size() != 1) throw cs::JobError("repair_mesh: exactly one mesh");
+    indexed_triangle_set its = to_its(meshes[0]);
+    if (its.indices.empty()) throw cs::JobError("repair_mesh: mesh has no triangles");
+    for (const Vec3f& v : its.vertices)
+        if (!v.allFinite()) throw cs::JobError("repair_mesh: non-finite vertex");
+    const int nv = int(its.vertices.size());
+    for (const auto& f : its.indices)
+        for (int k = 0; k < 3; ++k)
+            if (f[k] < 0 || f[k] >= nv) throw cs::JobError("repair_mesh: index out of range");
+    Model model;
+    ModelObject* obj = model.add_object();
+    const size_t ntri = its.indices.size();
+    ModelVolume* vol = obj->add_volume(TriangleMesh(std::move(its)));
+    const json paint = args.value("paint", json::object());
+    std::vector<int> tri_map(ntri);
+    for (size_t i = 0; i < ntri; ++i) tri_map[i] = int(i);
+    apply_paint(vol, paint, tri_map);
+    MeshRepairStats st;
+    std::string error;
+    const bool repaired = vol->repair(args.value("keepPainting", true), &st, &error, {});
+    const indexed_triangle_set& res = vol->mesh().its;
+    json pj = json::object();
+    if (!vol->supported_facets.empty()) pj["support"] = paint_map(vol->supported_facets);
+    if (!vol->seam_facets.empty()) pj["seam"] = paint_map(vol->seam_facets);
+    if (!vol->mmu_segmentation_facets.empty()) pj["color"] = paint_map(vol->mmu_segmentation_facets);
+    if (!vol->fuzzy_skin_facets.empty()) pj["fuzzy"] = paint_map(vol->fuzzy_skin_facets);
+    out.result = {{"repaired", repaired}, {"modified", repaired && st.modified}, {"error", repaired ? json(nullptr) : json(error)},
+                  {"triangles", res.indices.size()}, {"vertices", res.vertices.size()},
+                  {"stats", {{"weldedVertices", st.welded_vertices}, {"removedTriangles", st.removed_triangles}, {"reversedShells", st.reversed_shells},
+                             {"filledHoles", st.filled_holes}, {"removedShells", st.removed_shells}, {"selfIntersections", st.self_intersections}}}};
+    if (!pj.empty()) out.result["paint"] = pj;
+    out.meshes.push_back(res);
+}
+
+// ---- texture displacement bake (Orca 2.5 "Texture displacement" tool) ---------------
+// The desktop bakes the relief into the volume's mesh before slicing; hosts do the
+// same with this op and slice the returned mesh.
+//   meshes[0]  the volume's undisplaced (base) mesh, mesh-local
+//   args { layers: <texture_displacement_layers_to_json text or object: {layers:[...], options:{...}}>,
+//          images: { "<slot>": { offset, length } }   PNG bytes in the request blob (8- or 16-bit, grey or colour)
+//          paint:  { "<slot>": [[triangle, hex], ...] }  the layer's paint mask (3MF TriangleSelector strings)
+//          transform?: [16] column-major mesh → world (instance * volume; default identity),
+//          anchor?: [x,y,z] world point the texture is anchored at (multi-part objects pass one point),
+//          restingDrop?: mm }
+//   -> meshes[0] = displaced mesh; result { triangles, budgetLimited }
+void op_texture_displacement(const json& args, std::vector<ToolMesh>& meshes, const uint8_t* blob, int blob_len, ToolOut& out)
+{
+    if (meshes.size() != 1) throw cs::JobError("texture_displacement: exactly one mesh");
+    const json lj = args.value("layers", json(nullptr));
+    const std::string text = lj.is_string() ? lj.get<std::string>() : lj.dump();
+    std::vector<TextureDisplacementLayer> layers;
+    TextureDisplacementOptions options;
+    if (!texture_displacement_layers_from_json(text, layers, options)) throw cs::JobError("texture_displacement: invalid layers JSON");
+    const json images = args.value("images", json::object());
+    for (TextureDisplacementLayer& l : layers) {
+        auto im = images.find(std::to_string(l.slot));
+        if (im == images.end()) continue;
+        const uint64_t off = cs::get_u64(*im, "offset"), len = cs::get_u64(*im, "length");
+        if (!cs::checked_range(off, len, 1, uint64_t(blob_len < 0 ? 0 : blob_len))) throw cs::JobError("texture_displacement: image out of bounds");
+        l.image_data = std::make_shared<std::vector<unsigned char>>(blob + off, blob + off + len);
+    }
+    const indexed_triangle_set base = to_its(meshes[0]);
+    // Paint masks through a FacetsAnnotation, exactly as a 3MF load fills ModelVolume::texture_displacement_facet().
+    Model model;
+    ModelObject* mo = model.add_object();
+    ModelVolume* mv = mo->add_volume(TriangleMesh(base));
+    std::vector<int> ident(base.indices.size());
+    for (size_t k = 0; k < ident.size(); ++k) ident[k] = int(k);
+    TextureDisplacementFacetsData facets;
+    const json paint = args.value("paint", json::object());
+    for (int slot = 0; slot < int(TEXTURE_DISPLACEMENT_MAX_LAYERS); ++slot) {
+        auto p = paint.find(std::to_string(slot));
+        if (p == paint.end()) continue;
+        load_paint_map(mv->texture_displacement_facet(slot), *p, int(base.indices.size()));
+        facets[size_t(slot)] = mv->texture_displacement_facet(slot).get_data();
+    }
+    Transform3d T = Transform3d::Identity();
+    if (auto t = args.find("transform"); t != args.end()) T = json_matrix(*t, "transform");
+    Vec3d anchor = T.translation();
+    if (auto a = args.find("anchor"); a != args.end()) anchor = json_vec3f(*a, "anchor").cast<double>();
+    TextureBakeStats stats;
+    indexed_triangle_set res = build_texture_displacement(base, layers, facets, options,
+        [](int p) { cs::progress(p, "Baking texture displacement"); return true; }, nullptr, T, nullptr, &stats,
+        nullptr, &anchor, float(args.value("restingDrop", 0.0)));
+    if (res.indices.empty()) throw cs::JobError("texture_displacement: the bake produced no mesh");
+    out.result = {{"triangles", res.indices.size()}, {"budgetLimited", stats.budget_limited}};
+    out.meshes.push_back(std::move(res));
+}
+
+// ---- Design-tab sketch helpers (libslic3r/CAD without the OCCT kernel) ------------------
+// Entities: { type: line|arc|circle|point|ellipse|ellipseArc|bspline, p0:[x,y], p1, center, radius,
+//             startAngle, endAngle, construction, rminor, rotation, ctrl:[[x,y]...] }   (sketch mm)
+// Constraints: { type: <SketchConstraintType, lowerCamel>, ea, eb, ra: p0|p1|center, rb, value, ec, rc }
+//   (ea/eb/ec = entity index, or -2 origin, -3 X axis, -4 Y axis)
+//   action "solve":  { entities, constraints, drag?:{ entity, role } }
+//                    -> { entities, ok, dof, result (SLVS_RESULT_*), bad:[constraint idx], skipped:[...] }
+//   action "infer":  { entities, newEntity, angleTol?, lengthTol? } -> { constraints }
+//   action "snap":   { entities, query:[x,y], tol, includeOrigin? } -> { kind, entity, role, point }
+//   action "axis":   { anchor:[x,y], tip:[x,y], angleTol? } -> { type | null }
+//   action "text":   { text, sizeMm, font:{ offset, length } (TTF/OTF bytes in the blob) } -> { regions }
+//   action "svg":    { svg: "<svg…>", scale? } -> { regions }
+//   regions: [ region: [ loop: [[x,y]...] ] ]  (first loop outer, rest holes)
+const char* const kSketchConstraintNames[] = {
+    "fix", "coincident", "horizontal", "vertical", "distance", "lockX", "lockY", "equalLength", "parallel",
+    "perpendicular", "concentric", "tangent", "midpoint", "symmetric", "angle", "radius", "diameter",
+    "pointOnLine", "pointOnObject", "equalRadius", "collinear", "distanceX", "distanceY",
+    "symmetricAboutY", "symmetricAboutX"}; // order of SketchConstraintType (append-only upstream)
+const char* const kSketchEntityNames[] = {"line", "arc", "circle", "point", "ellipse", "ellipseArc", "bspline"};
+const char* const kSketchRoleNames[] = {"p0", "p1", "center"};
+
+template<size_t N> int name_index(const char* const (&names)[N], const json& j, const char* what)
+{
+    if (j.is_number_integer() && j.get<int>() >= 0 && size_t(j.get<int>()) < N) return j.get<int>();
+    if (j.is_string()) for (size_t i = 0; i < N; ++i) if (j == names[i]) return int(i);
+    throw cs::JobError(std::string("sketch: unknown ") + what + " " + j.dump());
+}
+Vec2d vec2(const json& j, Vec2d d = Vec2d::Zero())
+{
+    if (!j.is_array() || j.size() != 2 || !j[0].is_number() || !j[1].is_number()) return d;
+    return {j[0].get<double>(), j[1].get<double>()};
+}
+json vec2_json(const Vec2d& v) { return json::array({v.x(), v.y()}); }
+
+std::vector<SketchEntity> sketch_entities(const json& a)
+{
+    std::vector<SketchEntity> out;
+    if (!a.is_array()) return out;
+    for (const json& j : a) {
+        SketchEntity e;
+        e.type = SketchEntity::Type(name_index(kSketchEntityNames, j.value("type", json("line")), "entity type"));
+        e.p0 = vec2(j.value("p0", json())); e.p1 = vec2(j.value("p1", json())); e.center = vec2(j.value("center", json()));
+        e.radius = j.value("radius", 0.0); e.start_angle = j.value("startAngle", 0.0); e.end_angle = j.value("endAngle", 0.0);
+        e.construction = j.value("construction", false); e.rminor = j.value("rminor", 0.0); e.rotation = j.value("rotation", 0.0);
+        for (const json& c : j.value("ctrl", json::array())) e.ctrl.push_back(vec2(c));
+        out.push_back(std::move(e));
+    }
+    return out;
+}
+json sketch_entities_json(const std::vector<SketchEntity>& es)
+{
+    json a = json::array();
+    for (const SketchEntity& e : es) {
+        json c = json::array();
+        for (const Vec2d& p : e.ctrl) c.push_back(vec2_json(p));
+        a.push_back({{"type", kSketchEntityNames[int(e.type)]}, {"p0", vec2_json(e.p0)}, {"p1", vec2_json(e.p1)},
+                     {"center", vec2_json(e.center)}, {"radius", e.radius}, {"startAngle", e.start_angle}, {"endAngle", e.end_angle},
+                     {"construction", e.construction}, {"rminor", e.rminor}, {"rotation", e.rotation}, {"ctrl", c}});
+    }
+    return a;
+}
+std::vector<SketchEntityConstraintDef> sketch_constraints(const json& a)
+{
+    std::vector<SketchEntityConstraintDef> out;
+    if (!a.is_array()) return out;
+    for (const json& j : a) {
+        SketchEntityConstraintDef c;
+        c.type = SketchConstraintType(name_index(kSketchConstraintNames, j.value("type", json("coincident")), "constraint type"));
+        c.ea = j.value("ea", -1); c.eb = j.value("eb", -1); c.ec = j.value("ec", -1);
+        c.ra = SketchPointRole(name_index(kSketchRoleNames, j.value("ra", json("p0")), "role"));
+        c.rb = SketchPointRole(name_index(kSketchRoleNames, j.value("rb", json("p0")), "role"));
+        c.rc = SketchPointRole(name_index(kSketchRoleNames, j.value("rc", json("p0")), "role"));
+        c.value = j.value("value", 0.0);
+        out.push_back(c);
+    }
+    return out;
+}
+json sketch_constraints_json(const std::vector<SketchEntityConstraintDef>& cs_)
+{
+    json a = json::array();
+    for (const auto& c : cs_)
+        a.push_back({{"type", kSketchConstraintNames[int(c.type)]}, {"ea", c.ea}, {"eb", c.eb}, {"ec", c.ec},
+                     {"ra", kSketchRoleNames[int(c.ra)]}, {"rb", kSketchRoleNames[int(c.rb)]}, {"rc", kSketchRoleNames[int(c.rc)]}, {"value", c.value}});
+    return a;
+}
+json regions_json(const ImportRegions& rs)
+{
+    json a = json::array();
+    for (const ImportRegion& r : rs) {
+        json loops = json::array();
+        for (const auto& loop : r) { json l = json::array(); for (const Vec2d& p : loop) l.push_back(vec2_json(p)); loops.push_back(std::move(l)); }
+        a.push_back(std::move(loops));
+    }
+    return a;
+}
+
+void op_sketch(const json& args, const uint8_t* blob, int blob_len, ToolOut& out)
+{
+    const std::string action = args.value("action", std::string());
+    if (action == "solve") {
+        std::vector<SketchEntity> ents = sketch_entities(args.value("entities", json::array()));
+        const auto cons = sketch_constraints(args.value("constraints", json::array()));
+        for (const auto& c : cons)
+            for (int e : {c.ea, c.eb, c.ec})
+                if (e >= int(ents.size()) || (e < 0 && e != -1 && !is_sketch_ref(e))) throw cs::JobError("sketch: constraint references a missing entity");
+        SketchSolveResult r;
+        if (auto d = args.find("drag"); d != args.end() && d->is_object()) {
+            const int ei = d->value("entity", -1);
+            if (ei >= int(ents.size())) throw cs::JobError("sketch: drag entity out of range");
+            r = sketch_solve_drag(ents, cons, ei, SketchPointRole(name_index(kSketchRoleNames, d->value("role", json("p0")), "role")));
+        } else r = sketch_solve(ents, cons);
+        out.result = {{"entities", sketch_entities_json(ents)}, {"ok", r.ok}, {"dof", r.dof}, {"result", r.result}, {"bad", r.bad}, {"skipped", r.skipped}};
+    } else if (action == "infer") {
+        std::vector<SketchEntity> ents = sketch_entities(args.value("entities", json::array()));
+        const int ne = args.value("newEntity", -1);
+        if (ne < 0 || ne >= int(ents.size())) throw cs::JobError("sketch: newEntity out of range");
+        out.result = {{"constraints", sketch_constraints_json(infer_relations(ents, ne, args.value("angleTol", kSketchInferAngleTol), args.value("lengthTol", 0.01)))}};
+    } else if (action == "snap") {
+        const InferenceSnap s = infer_point_snap(sketch_entities(args.value("entities", json::array())), vec2(args.value("query", json())),
+                                                 args.value("tol", 0.5), args.value("includeOrigin", true));
+        static const char* const kinds[] = {"none", "endpoint", "center", "midpoint", "onEdge", "origin"};
+        out.result = {{"kind", kinds[int(s.kind)]}, {"entity", s.entity}, {"role", kSketchRoleNames[int(s.role)]}, {"point", vec2_json(s.point)}};
+    } else if (action == "axis") {
+        const auto t = infer_axis_constraint(vec2(args.value("anchor", json())), vec2(args.value("tip", json())), args.value("angleTol", kSketchInferAngleTol));
+        out.result = {{"type", t ? json(kSketchConstraintNames[int(*t)]) : json(nullptr)}};
+    } else if (action == "text") {
+        const json f = args.value("font", json::object());
+        const uint64_t off = cs::get_u64(f, "offset"), len = cs::get_u64(f, "length");
+        if (!cs::checked_range(off, len, 1, uint64_t(blob_len < 0 ? 0 : blob_len)) || len == 0) throw cs::JobError("sketch: font out of bounds");
+        const std::string path = "/tmp/cs_sketch_font.ttf";
+        { std::ofstream fo(path, std::ios::binary | std::ios::trunc); fo.write(reinterpret_cast<const char*>(blob + off), std::streamsize(len)); }
+        const ImportRegions r = text_to_regions(args.value("text", std::string()), args.value("sizeMm", 10.0), path);
+        ::unlink(path.c_str());
+        out.result = {{"regions", regions_json(r)}};
+    } else if (action == "svg") {
+        const std::string path = "/tmp/cs_sketch.svg";
+        { std::ofstream fo(path, std::ios::binary | std::ios::trunc); fo << args.value("svg", std::string()); }
+        const ImportRegions r = svg_to_regions(path, args.value("scale", 1.0));
+        ::unlink(path.c_str());
+        out.result = {{"regions", regions_json(r)}};
+    } else {
+        throw cs::JobError("sketch: unknown action '" + action + "'");
+    }
+}
 
 void op_cut(const json& args, std::vector<ToolMesh>& meshes, ToolOut& out)
 {
@@ -1418,9 +2184,7 @@ void op_cut(const json& args, std::vector<ToolMesh>& meshes, ToolOut& out)
         only_if(flag("flipLower"), ModelObjectCutAttribute::FlipLower) |
         only_if(dowels > 0, ModelObjectCutAttribute::CreateDowels) |
         only_if(!has_connectors && !groove, ModelObjectCutAttribute::InvalidateCutInfo)
-#ifndef CS_ORCA_LEGACY_API
         | only_if(flag("keepPaint", true), ModelObjectCutAttribute::KeepPaint)
-#endif
         ;
     update_cut_id(mo->cut_id, attrs, dowels);
 
@@ -1432,12 +2196,8 @@ void op_cut(const json& args, std::vector<ToolMesh>& meshes, ToolOut& out)
         gr.depth = g.value("depth", 5.f); gr.width = g.value("width", 5.f);
         gr.flaps_angle = g.value("flapsAngle", float(PI / 3)); gr.angle = g.value("angle", 0.f);
         gr.depth_tolerance = g.value("depthTolerance", 0.1f); gr.width_tolerance = g.value("widthTolerance", 0.1f);
-#ifdef CS_ORCA_LEGACY_API
-        result = &cutter.perform_with_groove(gr, rotation_m, flag("keepAsParts"));
-#else
         result = &cutter.perform_with_groove(gr, rotation_m, std::max(1, g.value("count", 1)), g.value("gap", 0.f),
                                              g.value("radius", 50.f), flag("keepAsParts"));
-#endif
     } else {
         result = &cutter.perform_with_plane();
     }
@@ -1453,7 +2213,8 @@ void op_cut(const json& args, std::vector<ToolMesh>& meshes, ToolOut& out)
             e["name"] = v->name;
             const ModelVolumeType t = v->type();
             e["type"] = t == ModelVolumeType::NEGATIVE_VOLUME ? "negative" : t == ModelVolumeType::PARAMETER_MODIFIER ? "modifier"
-                      : t == ModelVolumeType::SUPPORT_BLOCKER ? "support_blocker" : t == ModelVolumeType::SUPPORT_ENFORCER ? "support_enforcer" : "part";
+                      : t == ModelVolumeType::SUPPORT_BLOCKER ? "support_blocker" : t == ModelVolumeType::SUPPORT_ENFORCER ? "support_enforcer"
+                      : is_precise_seam(t) ? ModelVolume::type_to_string(t) : "part";
             const Transform3d vt = v->get_matrix();
             e["transform"] = std::vector<double>(vt.matrix().data(), vt.matrix().data() + 16);
             e["connector"] = v->cut_info.is_connector;
@@ -1473,7 +2234,6 @@ void op_cut(const json& args, std::vector<ToolMesh>& meshes, ToolOut& out)
     out.result["objects"] = objs;
 }
 
-#ifndef CS_ORCA_LEGACY_API
 // Load a 3MF with OrcaSlicer's own project loader (Format/bbs_3mf.cpp) and
 // describe what it read: lets hosts check that files they write open in
 // desktop Orca the same way. The raw 3MF bytes are the request blob.
@@ -1508,7 +2268,8 @@ void op_inspect_3mf(const uint8_t* blob, int blob_len, ToolOut& out)
                                  LoadStrategy::LoadModel | LoadStrategy::LoadConfig | LoadStrategy::Silence);
     ::unlink(path.c_str());
     if (!ok) throw cs::JobError("OrcaSlicer's 3MF loader rejected the file");
-    auto volume_type = [](ModelVolumeType t) {
+    auto volume_type = [](ModelVolumeType t) -> std::string {
+        if (is_precise_seam(t)) return ModelVolume::type_to_string(t);
         return t == ModelVolumeType::NEGATIVE_VOLUME ? "negative" : t == ModelVolumeType::PARAMETER_MODIFIER ? "modifier"
              : t == ModelVolumeType::SUPPORT_BLOCKER ? "support_blocker" : t == ModelVolumeType::SUPPORT_ENFORCER ? "support_enforcer" : "part";
     };
@@ -1523,10 +2284,27 @@ void op_inspect_3mf(const uint8_t* blob, int blob_len, ToolOut& out)
         for (const ModelVolume* v : o->volumes) {
             json vc = json::object();
             for (const std::string& k : v->config.keys()) vc[k] = v->config.opt_serialize(k);
-            vols.push_back({{"name", v->name}, {"type", volume_type(v->type())}, {"triangles", v->mesh().its.indices.size()},
-                            {"paint", {{"support", !v->supported_facets.empty()}, {"seam", !v->seam_facets.empty()},
-                                       {"color", !v->mmu_segmentation_facets.empty()}, {"fuzzy", !v->fuzzy_skin_facets.empty()}}},
-                            {"transform", trafo_of(v->get_transformation())}, {"config", vc}});
+            json vj = {{"name", v->name}, {"type", volume_type(v->type())}, {"triangles", v->mesh().its.indices.size()},
+                       {"paint", {{"support", !v->supported_facets.empty()}, {"seam", !v->seam_facets.empty()},
+                                  {"color", !v->mmu_segmentation_facets.empty()}, {"fuzzy", !v->fuzzy_skin_facets.empty()}}},
+                       {"transform", trafo_of(v->get_transformation())}, {"config", vc}};
+            // Texture displacement: the layers as desktop serialises them (texture_displacement_layers_to_json,
+            // image bytes excluded), plus each layer's image (archive path, bytes loaded) and paint mask.
+            if (!v->texture_displacement_layers.empty()) {
+                json td = json::object();
+                try { td["layers"] = json::parse(texture_displacement_layers_to_json(v->texture_displacement_layers, v->texture_displacement_options)); }
+                catch (...) { td["layers"] = nullptr; }
+                json imgs = json::array();
+                for (const TextureDisplacementLayer& l : v->texture_displacement_layers) {
+                    const bool slot_ok = l.slot >= 0 && l.slot < int(TEXTURE_DISPLACEMENT_MAX_LAYERS);
+                    imgs.push_back({{"slot", l.slot}, {"name", l.name}, {"pathIn3mf", l.path_in_3mf},
+                                    {"imageBytes", l.image_data ? l.image_data->size() : 0},
+                                    {"painted", slot_ok && !v->texture_displacement_facet(l.slot).empty()}});
+                }
+                td["images"] = imgs;
+                vj["textureDisplacement"] = td;
+            }
+            vols.push_back(vj);
         }
         json oc = json::object();
         for (const std::string& k : o->config.keys()) oc[k] = o->config.opt_serialize(k);
@@ -1536,7 +2314,7 @@ void op_inspect_3mf(const uint8_t* blob, int blob_len, ToolOut& out)
             ji["printable"] = i->printable;
             inst.push_back(ji);
         }
-        objs.push_back({{"name", o->name}, {"volumes", vols}, {"config", oc}, {"instances", inst},
+        objs.push_back({{"name", o->name}, {"volumes", vols}, {"config", oc}, {"instances", inst}, {"autoDrop", o->auto_drop},
                         {"layerHeightProfile", o->layer_height_profile.get().size()}, {"layerRanges", o->layer_config_ranges.size()}});
     }
     json pl = json::array();
@@ -1564,6 +2342,8 @@ void op_inspect_3mf(const uint8_t* blob, int blob_len, ToolOut& out)
         cg[std::to_string(plate)] = {{"mode", int(info.mode)}, {"items", items}};
     }
     out.result["customGcodes"] = cg;
+    // Metadata/orca_cad.bin (or its legacy name): the Design tab's editable CAD recipe, as loaded.
+    out.result["cadRecipe"] = {{"present", !model.cad_recipe.empty()}, {"bytes", model.cad_recipe.size()}};
     out.result["objects"] = objs;
     out.result["plates"] = pl;
     auto get = [&](const char* k) { return config.has(k) ? config.opt_serialize(k) : std::string(); };
@@ -1576,9 +2356,7 @@ void op_inspect_3mf(const uint8_t* blob, int blob_len, ToolOut& out)
     out.result["version"] = version.to_string();
     out.result["substitutions"] = ctxt.substitutions.size();
 }
-#endif
 
-#ifndef CS_ORCA_LEGACY_API
 // -----------------------------------------------------------------------------
 // Auto arrange: OrcaSlicer's ArrangeJob (desktop "Arrange all objects" A /
 // "Arrange objects on current plate" Shift+A) with the GUI parts ported:
@@ -1826,10 +2604,12 @@ void op_arrange(const char* job_json, int job_len, const uint8_t* blob, int blob
     std::vector<bool> plate_locked(n_plates);
     std::vector<std::vector<int>> plate_tool_changes(n_plates);
     std::vector<std::string> plate_seq(n_plates);
+    std::vector<std::string> plate_imex(n_plates); // PartPlate::get_imex_mode: "" = Primary (the process preset's mode applies)
     for (int i = 0; i < n_plates; ++i) {
         const json& p = plates_j[i];
         plate_locked[i] = p.value("locked", false);
         plate_seq[i] = p.value("seq", std::string());
+        plate_imex[i] = p.value("imexMode", std::string());
         if (auto tc = p.find("toolChanges"); tc != p.end() && tc->is_array())
             for (const json& e : *tc) if (e.is_number_integer()) plate_tool_changes[i].push_back(e.get<int>());
     }
@@ -1933,6 +2713,16 @@ void op_arrange(const char* job_json, int job_len, const uint8_t* blob, int blob
         params.printable_height = pc.printable_height.value;
         params.nozzle_height = pc.nozzle_height.value;
         params.align_center = pc.best_object_pos.value;
+        if (pc.belt_printer.value) {
+            // init_arrange_params: parts print in belt order (see BeltTransform).
+            const BeltRotationAxis axis = pc.belt_slice_rotation.value;
+            const double angle = pc.belt_slice_rotation_angle.value;
+            const bool tilted = (axis == BeltRotationAxis::X || axis == BeltRotationAxis::Y) && std::abs(angle) > EPSILON;
+            params.is_belt = true;
+            params.belt_axis = axis == BeltRotationAxis::Y ? 0 : 1;
+            params.belt_reversed = tilted && ((axis == BeltRotationAxis::Y) != (angle < 0.));
+            params.belt_tilt_slope = tilted ? float(1. / std::tan(Geometry::deg2rad(std::clamp(std::abs(angle), 5., 90.)))) : 0.f;
+        }
     }
     params.allow_rotations = settings.value("enableRotation", false);
     params.allow_multi_materials_on_same_plate = settings.value("allowMultiMaterials", true);
@@ -1972,6 +2762,11 @@ void op_arrange(const char* job_json, int job_len, const uint8_t* blob, int blob
         if (idx) idx->push_back(k);
     };
     std::vector<int> unselected_idx;
+    // ArrangeJob's is_belt_purge_prism: generated from the arranged parts, so arrange neither moves it nor packs around it.
+    auto is_purge_prism = [&](int k) {
+        const ConfigOption* o = items[k].mo->config.option("belt_purge_tower_object");
+        return o != nullptr && o->getBool();
+    };
     // PartPlateList::preprocess_arrange_polygon: plate-local coordinates are
     // already what the host sent, so only the bed indices are set here.
     auto preprocess = [&](int k, arr::ArrangePolygon& ap, bool sel) {
@@ -1994,6 +2789,7 @@ void op_arrange(const char* job_json, int job_len, const uint8_t* blob, int blob
             if (!plate_locked[i] && !same) plate_locked[i] = true; // ArrangeJob locks them for the run
         }
         for (int k = 0; k < int(items.size()); ++k) {
+            if (is_purge_prism(k)) continue;
             arr::ArrangePolygon ap = instance_poly(k);
             if (preprocess(k, ap, true)) { push(locked, &locked_idx, std::move(ap), k); selected_is_locked = true; }
             else if (items[k].printable) push(selected, &sel_idx, std::move(ap), k);
@@ -2004,6 +2800,7 @@ void op_arrange(const char* job_json, int job_len, const uint8_t* blob, int blob
                                                                 : "No arrangeable objects are selected.");
     } else if (mode == "selection") {
         for (int k = 0; k < int(items.size()); ++k) {
+            if (is_purge_prism(k)) continue;
             arr::ArrangePolygon ap = instance_poly(k);
             if (preprocess(k, ap, items[k].selected)) { push(locked, &locked_idx, std::move(ap), k); if (items[k].selected) selected_is_locked = true; }
             else if (!items[k].printable) push(unprintable, &unprintable_idx, std::move(ap), k);
@@ -2019,6 +2816,7 @@ void op_arrange(const char* job_json, int job_len, const uint8_t* blob, int blob
             out.result["warnings"].push_back("This plate is locked.\nCannot auto-arrange on this plate.");
         } else {
             for (int k = 0; k < int(items.size()); ++k) {
+                if (is_purge_prism(k)) continue;
                 arr::ArrangePolygon ap = instance_poly(k);
                 const bool in_plate = items[k].plate == current_plate;
                 // preprocess_arrange_polygon_other_locked: everything off this plate stays put.
@@ -2110,6 +2908,8 @@ void op_arrange(const char* job_json, int job_len, const uint8_t* blob, int blob
     };
     auto prepare_wipe_tower = [&]() {
         if (!enable_prime_tower || params.is_seq_print) return;
+        // Belt printers purge into the belt purge prism, whose strip prepare_belt_regions reserves.
+        if (params.is_belt) return;
         bool need_wipe_tower = smooth_timelapse;
         for (const auto& item : selected) {
             std::set<int> e(item.extrude_ids.begin(), item.extrude_ids.end());
@@ -2183,7 +2983,66 @@ void op_arrange(const char* job_json, int job_len, const uint8_t* blob, int blob
         }
     };
     preprocess_exclude_areas(unselected, mode == "plate" ? current_plate + 1 : ARRANGE_MAX_PLATES, 0.f);
+    // ArrangeJob::prepare_belt_regions: belt printers pack against the bed edges, so the purge
+    // prism's strip (when the parts use more than one filament) and the brim along every edge
+    // are reserved with fixed virtual items on every plate.
+    if (params.is_belt && !params.is_seq_print) {
+        const int num_plates = mode == "plate" ? current_plate + 1 : ARRANGE_MAX_PLATES;
+        BoundingBoxf bedf;
+        if (const auto* pa = config.option<ConfigOptionPoints>("printable_area")) for (const Vec2d& p : pa->values) bedf.merge(p);
+        const bool belt_is_y = params.belt_axis == 1;
+        std::vector<BoundingBoxf> regions;
+        std::set<int> filaments;
+        for (const arr::ArrangePolygons* cont : {&selected, &unselected})
+            for (const arr::ArrangePolygon& ap : *cont)
+                if (!ap.is_virt_object) filaments.insert(ap.extrude_ids.begin(), ap.extrude_ids.end());
+        if (config.opt_bool("enable_belt_purge_tower") && filaments.size() > 1) {
+            const int islands = int(filaments.size()) - 1;
+            const double width = std::max(config.opt_float("belt_purge_tower_width"), 2. * islands - 1.) + 1.;
+            BoundingBoxf strip = bedf;
+            if (belt_is_y) strip.min.x() = std::max(bedf.min.x(), bedf.max.x() - width);
+            else strip.min.y() = std::max(bedf.min.y(), bedf.max.y() - width);
+            regions.push_back(strip);
+        }
+        const double bw = config.opt_enum<BrimType>("brim_type") == btNoBrim ? 0. :
+            config.opt_float("brim_width") + config.opt_float("brim_object_gap") + config.opt_float("extra_brim_width") - 1.;
+        if (bw > 0.) {
+            regions.emplace_back(bedf.min, Vec2d(bedf.min.x() + bw, bedf.max.y()));
+            regions.emplace_back(Vec2d(bedf.max.x() - bw, bedf.min.y()), bedf.max);
+            regions.emplace_back(bedf.min, Vec2d(bedf.max.x(), bedf.min.y() + bw));
+            regions.emplace_back(Vec2d(bedf.min.x(), bedf.max.y() - bw), bedf.max);
+        }
+        for (int j = 0; j < num_plates; ++j)
+            for (size_t i = 0; i < regions.size(); ++i) {
+                arr::ArrangePolygon ap;
+                ap.poly.contour = scaled(regions[i]).polygon();
+                ap.is_virt_object = true;
+                ap.bed_idx = j;
+                ap.height = 1;
+                ap.name = "BeltRegion" + std::to_string(i);
+                unselected.emplace_back(std::move(ap));
+            }
+    }
     lap("wipeTower");
+
+    // ArrangeJob::prepare_imex_zones: each arranger bed's IDEX/IQEX zones (the plate it packs
+    // into: the current plate, or the unlocked plates in order), from the plate's own mode, else
+    // the process preset's imex_parallel_mode (compute_imex_zone_layout).
+    ImexArrangeInput imex_in;
+    {
+        BoundingBoxf bedf;
+        if (const auto* pa = config.option<ConfigOptionPoints>("printable_area")) for (const Vec2d& p : pa->values) bedf.merge(p);
+        const std::string process_mode = config.has("imex_parallel_mode") ? config.opt_string("imex_parallel_mode") : std::string();
+        auto zones_of = [&](int p) {
+            const std::string pm = plate_imex[p].empty() ? std::string(kImexPrimaryMode) : plate_imex[p];
+            return imex_arrange_zones(compute_imex_zone_layout(config, pm, process_mode, bedf));
+        };
+        if (only_on_partplate) imex_in.beds.push_back(zones_of(current_plate));
+        else for (int p = 0; p < n_plates; ++p) if (!plate_locked[p]) imex_in.beds.push_back(zones_of(p));
+        imex_in.adds_plates = !only_on_partplate;
+        imex_in.read_config(config);
+    }
+    for (const auto& b : imex_in.beds) if (b) { out.result["imex"] = true; break; }
 
     // ---- check_unprintable ----
     for (size_t i = 0; i < selected.size();) {
@@ -2214,12 +3073,20 @@ void op_arrange(const char* job_json, int job_len, const uint8_t* blob, int blob
     arr::update_selected_items_inflation(selected, &config, params);
     arr::update_unselected_items_inflation(unselected, &config, params);
     arr::update_selected_items_axis_align(selected, &config, params);
-    const Points bedpts = arr::get_shrink_bedpts(&config, params);
+    Points bedpts = arr::get_shrink_bedpts(&config, params);
+    // Keep the parts on IDEX/IQEX plates in their primary zones (ImexArranger).
+    const ImexArranger imex(imex_in, params, bedpts);
+    bedpts = imex.bed_shape();
+    imex.add_keep_outs(unselected);
     preprocess_exclude_areas(params.excluded_regions, 1, float(scale_(1)));
     params.stopcondition = [] { return false; };
     params.progressind = [](unsigned, std::string) {};
     lap("arrangeParams");
-    if (!selected.empty()) arr::arrange(selected, unselected, bedpts, params);
+    const arr::ArrangePolygons before = imex.active() ? selected : arr::ArrangePolygons();
+    if (!selected.empty()) {
+        arr::arrange(selected, unselected, bedpts, params);
+        imex.finish(selected, before, unselected, params);
+    }
     lap("nest");
 
     // ---- finalize ----
@@ -2303,13 +3170,13 @@ void op_arrange(const char* job_json, int job_len, const uint8_t* blob, int blob
     lap("finalize");
     out.result["timing"] = timing;
 }
-#endif
 
 int tool_impl(const char* job_json, int job_len, const uint8_t* blob, int blob_len, std::string& out_json, std::string& out_blob)
 {
     ToolOut out;
     json rep = {{"ok", false}, {"error", nullptr}};
     try {
+        ensure_runtime_dirs(); // resources_dir(): mixed-filament recipe tables, nozzle info
         if (!job_json || job_len <= 0) throw cs::JobError("empty request");
         const json j = json::parse(job_json, job_json + job_len);
         const std::string op = j.value("op", std::string());
@@ -2323,13 +3190,14 @@ int tool_impl(const char* job_json, int job_len, const uint8_t* blob, int blob_l
         else if (op == "layer_profile_adaptive") op_layer_profile(args, meshes, out, false);
         else if (op == "layer_profile_smooth") op_layer_profile(args, meshes, out, true);
         else if (op == "cut") op_cut(args, meshes, out);
-#ifndef CS_ORCA_LEGACY_API
+        else if (op == "mixed_filament") op_mixed_filament(args, out);
+        else if (op == "resolve_variants") op_resolve_variants(args, out);
+        else if (op == "wipe_tower_footprint") op_wipe_tower_footprint(args, out);
+        else if (op == "repair_mesh") op_repair_mesh(args, meshes, out);
+        else if (op == "sketch") op_sketch(args, blob, blob_len, out);
+        else if (op == "texture_displacement") op_texture_displacement(args, meshes, blob, blob_len, out);
         else if (op == "inspect_3mf") op_inspect_3mf(blob, blob_len, out);
         else if (op == "arrange") op_arrange(job_json, job_len, blob, blob_len, args, out);
-#endif
-#ifdef CS_HAS_MIXED_FILAMENTS
-        else if (op == "mixed_filaments") op_mixed_filaments(args, out);
-#endif
         else throw cs::JobError("unknown tool '" + op + "'");
         rep["ok"] = true;
     } catch (const std::bad_alloc&) {

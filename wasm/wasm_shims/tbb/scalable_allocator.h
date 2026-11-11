@@ -1,9 +1,14 @@
 #pragma once
 
 #include <cstddef>
+#include <cstdlib>
 #include <limits>
 #include <new>
 #include <utility>
+
+// tbbmalloc's C entry points (Clipper2's node allocator uses them directly).
+inline void* scalable_malloc(std::size_t size) { return std::malloc(size); }
+inline void  scalable_free(void* p) { std::free(p); }
 
 namespace oneapi { namespace tbb {
 

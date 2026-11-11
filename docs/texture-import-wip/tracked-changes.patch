@@ -1,0 +1,530 @@
+--- a/bridge/cs_bridge.cpp
++++ b/bridge/cs_bridge.cpp
+@@ -45,6 +45,7 @@
+ #include <libslic3r/FilamentMixer.hpp>
+ #include <libslic3r/ColorDecomposeRecipe.hpp>
+ #include <libslic3r/TextureDisplacement.hpp>
++#include "cs_texture_palette.hpp"
+ #include <libslic3r/CAD/SketchEngine.hpp>
+ #include <libslic3r/CAD/SketchInference.hpp>
+ #include <libslic3r/CAD/SketchImport.hpp>
+@@ -1268,6 +1269,9 @@
+ struct ToolOut {
+     json result = json::object();
+     std::vector<indexed_triangle_set> meshes;
++    // Extra binary outputs, packed after the meshes (4-aligned) and listed in the response as
++    // "blobs": { name: { offset, length } }.
++    std::vector<std::pair<std::string, std::string>> blobs;
+ };
+ 
+ // Paint strings of one FacetsAnnotation as [[triangle, hex], ...].
+@@ -1910,52 +1914,239 @@
+ //          paint:  { "<slot>": [[triangle, hex], ...] }  the layer's paint mask (3MF TriangleSelector strings)
+ //          transform?: [16] column-major mesh → world (instance * volume; default identity),
+ //          anchor?: [x,y,z] world point the texture is anchored at (multi-part objects pass one point),
+-//          restingDrop?: mm }
+-//   -> meshes[0] = displaced mesh; result { triangles, budgetLimited }
+-void op_texture_displacement(const json& args, std::vector<ToolMesh>& meshes, const uint8_t* blob, int blob_len, ToolOut& out)
++//          restingDrop?: mm,
++//          (additive, Orca 2.5 TextureDisplacementBakeJob)
++//          volumePaint?: { support, seam, color, fuzzy: [[triangle, hex]] }  the volume's other paint, carried
++//                        onto the baked mesh (transfer_facet_paint) when the bake changes the topology,
++//          modelUv?: { offset, length }  the volume's own UV channel (ModelVolume::texture_uv), float32 u,v ×3
++//                    per base triangle in the request blob; ModelUV layers map through it,
++//          color?: { config: { filament_colour, filament_is_mixed, filament_mixed_components,
++//                              filament_mixed_sublayer_ratios, filament_mixed_gradient } }
++//                  the project's filament slots; turns on the "Colors" output for layers with color_enabled }
++//   -> meshes[0] = displaced mesh; result { triangles, budgetLimited, moved, topologyChanged, clearSlots,
++//        paint?: { support, seam, color, fuzzy } (on the baked mesh; colour merged over the volume's colour paint),
++//        colors?: { palette:[{color, a, b, num, den, filament}], newMixedFilaments:[{slot, components, ratios, color}],
++//                   paintedTriangles } }
++//      blobs { triangleColor: uint8 per baked triangle (palette entry + 1, 0 = none) when colouring,
++//              modelUv: float32 ×6 per baked triangle when modelUv was given }
++struct TdInput {
++    std::vector<TextureDisplacementLayer> layers;
++    TextureDisplacementOptions options;
++};
++TdInput td_layers(const json& args, const uint8_t* blob, int blob_len, const char* what)
+ {
+-    if (meshes.size() != 1) throw cs::JobError("texture_displacement: exactly one mesh");
++    TdInput in;
+     const json lj = args.value("layers", json(nullptr));
+     const std::string text = lj.is_string() ? lj.get<std::string>() : lj.dump();
+-    std::vector<TextureDisplacementLayer> layers;
+-    TextureDisplacementOptions options;
+-    if (!texture_displacement_layers_from_json(text, layers, options)) throw cs::JobError("texture_displacement: invalid layers JSON");
++    if (!texture_displacement_layers_from_json(text, in.layers, in.options)) throw cs::JobError(std::string(what) + ": invalid layers JSON");
+     const json images = args.value("images", json::object());
+-    for (TextureDisplacementLayer& l : layers) {
++    for (TextureDisplacementLayer& l : in.layers) {
+         auto im = images.find(std::to_string(l.slot));
+         if (im == images.end()) continue;
+         const uint64_t off = cs::get_u64(*im, "offset"), len = cs::get_u64(*im, "length");
+-        if (!cs::checked_range(off, len, 1, uint64_t(blob_len < 0 ? 0 : blob_len))) throw cs::JobError("texture_displacement: image out of bounds");
++        if (!cs::checked_range(off, len, 1, uint64_t(blob_len < 0 ? 0 : blob_len))) throw cs::JobError(std::string(what) + ": image out of bounds");
+         l.image_data = std::make_shared<std::vector<unsigned char>>(blob + off, blob + off + len);
+     }
++    return in;
++}
++
++DynamicPrintConfig td_color_config(const json& color)
++{
++    DynamicPrintConfig cfg;
++    json subs = json::array();
++    load_config_json(cfg, color.value("config", json::object()), subs);
++    if (!cfg.has("filament_colour")) throw cs::JobError("texture_displacement: color.config needs filament_colour");
++    return cfg;
++}
++
++json td_palette_json(const std::vector<PrintableColor>& palette, const std::vector<int>* filament_of)
++{
++    json a = json::array();
++    for (size_t i = 0; i < palette.size(); ++i) {
++        const PrintableColor& e = palette[i];
++        json j = {{"color", encode_color(ColorRGB(e.rgb.x(), e.rgb.y(), e.rgb.z()))}, {"a", e.a}, {"b", e.b}, {"num", e.num}, {"den", e.den}};
++        if (filament_of) j["filament"] = (*filament_of)[i];
++        a.push_back(j);
++    }
++    return a;
++}
++
++void op_texture_displacement(const json& args, std::vector<ToolMesh>& meshes, const uint8_t* blob, int blob_len, ToolOut& out)
++{
++    if (meshes.size() != 1) throw cs::JobError("texture_displacement: exactly one mesh");
++    TdInput in = td_layers(args, blob, blob_len, "texture_displacement");
++    std::vector<TextureDisplacementLayer>& layers = in.layers;
++    const TextureDisplacementOptions& options = in.options;
+     const indexed_triangle_set base = to_its(meshes[0]);
++    const size_t nbase = base.indices.size();
+     // Paint masks through a FacetsAnnotation, exactly as a 3MF load fills ModelVolume::texture_displacement_facet().
+     Model model;
+     ModelObject* mo = model.add_object();
+     ModelVolume* mv = mo->add_volume(TriangleMesh(base));
+-    std::vector<int> ident(base.indices.size());
++    std::vector<int> ident(nbase);
+     for (size_t k = 0; k < ident.size(); ++k) ident[k] = int(k);
+     TextureDisplacementFacetsData facets;
+     const json paint = args.value("paint", json::object());
+     for (int slot = 0; slot < int(TEXTURE_DISPLACEMENT_MAX_LAYERS); ++slot) {
+         auto p = paint.find(std::to_string(slot));
+         if (p == paint.end()) continue;
+-        load_paint_map(mv->texture_displacement_facet(slot), *p, int(base.indices.size()));
++        load_paint_map(mv->texture_displacement_facet(slot), *p, int(nbase));
+         facets[size_t(slot)] = mv->texture_displacement_facet(slot).get_data();
+     }
++    apply_paint(mv, args.value("volumePaint", json::object()), ident);
++    std::vector<Vec2f> model_uv;
++    if (auto u = args.find("modelUv"); u != args.end() && u->is_object()) {
++        const uint64_t off = cs::get_u64(*u, "offset"), len = cs::get_u64(*u, "length");
++        if (off % 4 || len != uint64_t(nbase) * 24 || !cs::checked_range(off, len, 1, uint64_t(blob_len < 0 ? 0 : blob_len)))
++            throw cs::JobError("texture_displacement: modelUv must be 6 float32 per base triangle (4-aligned, in bounds)");
++        model_uv.resize(nbase * 3);
++        std::memcpy(static_cast<void*>(model_uv.data()), blob + off, len);
++        for (const Vec2f& v : model_uv) if (!v.allFinite()) throw cs::JobError("texture_displacement: non-finite modelUv");
++    }
+     Transform3d T = Transform3d::Identity();
+     if (auto t = args.find("transform"); t != args.end()) T = json_matrix(*t, "transform");
+     Vec3d anchor = T.translation();
+     if (auto a = args.find("anchor"); a != args.end()) anchor = json_vec3f(*a, "anchor").cast<double>();
++
++    // Colour (GLGizmoTextureDisplacement::color_settings_for + TextureDisplacementBakeJob::process).
++    DynamicPrintConfig color_cfg;
++    cs_tdc::PaletteResult pal;
++    TextureColorRequest color_request;
++    TextureColorRequest* color = nullptr;
++    std::vector<uint8_t> triangle_color;
++    if (auto c = args.find("color"); c != args.end() && c->is_object()) {
++        color_cfg = td_color_config(*c);
++        pal = cs_tdc::build_palette(layers, options, cs_tdc::project_filaments(color_cfg));
++        if (!pal.settings.empty()) {
++            color_request.quantize = cs_tdc::make_palette_quantizer(pal.settings.palette);
++            if (!pal.settings.palette_pure.empty())
++                color_request.quantize_pure = cs_tdc::make_palette_quantizer(pal.settings.palette_pure);
++            color_request.despeckle_passes = pal.settings.despeckle_passes;
++            color_request.out_triangle = &triangle_color;
++            if (color_request.quantize) color = &color_request;
++        }
++    }
++
+     TextureBakeStats stats;
+     indexed_triangle_set res = build_texture_displacement(base, layers, facets, options,
+-        [](int p) { cs::progress(p, "Baking texture displacement"); return true; }, nullptr, T, nullptr, &stats,
+-        nullptr, &anchor, float(args.value("restingDrop", 0.0)));
++        [](int p) { cs::progress(p, "Baking texture displacement"); return true; }, color, T, nullptr, &stats,
++        model_uv.empty() ? nullptr : &model_uv, &anchor, float(args.value("restingDrop", 0.0)));
+     if (res.indices.empty()) throw cs::JobError("texture_displacement: the bake produced no mesh");
+-    out.result = {{"triangles", res.indices.size()}, {"budgetLimited", stats.budget_limited}};
++
++    // TextureDisplacementBakeJob::finalize: did anything move, did the topology change.
++    bool unchanged = res.indices.size() == base.indices.size() && res.vertices.size() == base.vertices.size();
++    for (size_t v = 0; unchanged && v < res.vertices.size(); ++v)
++        unchanged = (res.vertices[v] - base.vertices[v]).cwiseAbs().maxCoeff() < 1e-5f;
++    const bool topology_changed = options.pipeline_v2 || res.indices.size() != nbase;
++
++    // The filament each palette entry prints in; a used mix gets a mixed slot (Sidebar::ensure_mixed_filament:
++    // an existing fixed slot of that blend, else a new slot appended after every existing one).
++    std::vector<int> filament_of;
++    json new_mixed = json::array();
++    if (color != nullptr) {
++        const cs_tdc::ProjectFilaments pf = cs_tdc::project_filaments(color_cfg);
++        int next_slot = pf.total_slots;
++        filament_of = cs_tdc::palette_filaments(pal.settings.palette, triangle_color, [&](const PrintableColor& mix) -> int {
++            const std::vector<unsigned int> comps = {unsigned(mix.a + 1), unsigned(mix.b + 1)};
++            const std::vector<int> ratios = {mix.a_percent(), 100 - mix.a_percent()};
++            if (pf.physical.size() < 2) return -1;
++            if (const int existing = find_fixed_mixed_filament(color_cfg, comps, ratios); existing >= 0) return existing;
++            if (next_slot >= int(EnforcerBlockerType::ExtruderMax)) return -1;
++            const int slot = next_slot++;
++            new_mixed.push_back({{"slot", slot}, {"components", comps}, {"ratios", ratios},
++                                 {"color", blend_color_multi({pf.physical_hex[size_t(mix.a)], pf.physical_hex[size_t(mix.b)]}, ratios)}});
++            return slot;
++        });
++    }
++
++    // The volume's paint on the baked mesh: carried across a rebuild, then the colour merged over the colour paint.
++    TriangleMesh res_mesh(res);
++    ModelVolume* rv = mo->add_volume(res_mesh);
++    const std::array<FacetsAnnotation*, 4> src{&mv->supported_facets, &mv->seam_facets, &mv->mmu_segmentation_facets, &mv->fuzzy_skin_facets};
++    const std::array<FacetsAnnotation*, 4> dst{&rv->supported_facets, &rv->seam_facets, &rv->mmu_segmentation_facets, &rv->fuzzy_skin_facets};
++    for (size_t ch = 0; ch < src.size(); ++ch) {
++        if (src[ch]->empty()) continue;
++        if (!topology_changed) {
++            TriangleSelector sel(res_mesh);
++            sel.deserialize(src[ch]->get_data(), false);
++            dst[ch]->set(sel);
++            continue;
++        }
++        const std::vector<uint8_t> state = transfer_facet_paint(base, src[ch]->get_data(), res);
++        if (state.empty()) continue;
++        TriangleSelector sel(res_mesh);
++        bool any = false;
++        for (size_t t = 0; t < state.size(); ++t)
++            if (state[t] != 0) { sel.set_facet(int(t), EnforcerBlockerType(state[t])); any = true; }
++        if (any) dst[ch]->set(sel);
++    }
++    int painted = 0;
++    if (!triangle_color.empty() && triangle_color.size() == res.indices.size()) {
++        TriangleSelector sel(res_mesh);
++        const TriangleSelector::TriangleSplittingData& existing = rv->mmu_segmentation_facets.get_data();
++        if (!existing.bitstream.empty()) sel.deserialize(existing, false);
++        for (size_t t = 0; t < triangle_color.size(); ++t) {
++            const size_t entry = size_t(triangle_color[t]);
++            if (entry > 0 && entry <= filament_of.size() && filament_of[entry - 1] >= 0) {
++                sel.set_facet(int(t), EnforcerBlockerType(filament_of[entry - 1] + 1));
++                ++painted;
++            }
++        }
++        rv->mmu_segmentation_facets.set(sel);
++    }
++    json pj = json::object();
++    if (!rv->supported_facets.empty()) pj["support"] = paint_map(rv->supported_facets);
++    if (!rv->seam_facets.empty()) pj["seam"] = paint_map(rv->seam_facets);
++    if (!rv->mmu_segmentation_facets.empty()) pj["color"] = paint_map(rv->mmu_segmentation_facets);
++    if (!rv->fuzzy_skin_facets.empty()) pj["fuzzy"] = paint_map(rv->fuzzy_skin_facets);
++
++    // The layer masks a commit clears: every one after a rebuild, else those of the layers that were baked.
++    json clear = json::array();
++    for (int slot = 0; slot < int(TEXTURE_DISPLACEMENT_MAX_LAYERS); ++slot) {
++        const auto it = std::find_if(layers.begin(), layers.end(), [slot](const TextureDisplacementLayer& l) { return l.slot == slot; });
++        if (topology_changed || (it != layers.end() && !it->empty())) clear.push_back(slot);
++    }
++
++    out.result = {{"triangles", res.indices.size()}, {"budgetLimited", stats.budget_limited}, {"moved", !unchanged},
++                  {"topologyChanged", topology_changed}, {"clearSlots", clear}};
++    if (stats.budget_limited) {
++        out.result["trianglesRefined"] = stats.triangles_refined;
++        out.result["trianglesBudget"] = stats.triangles_budget;
++    }
++    if (!pj.empty()) out.result["paint"] = pj;
++    if (color != nullptr) {
++        out.result["colors"] = {{"palette", td_palette_json(pal.settings.palette, &filament_of)}, {"newMixedFilaments", new_mixed},
++                                {"paintedTriangles", painted}};
++        out.blobs.emplace_back("triangleColor", std::string(triangle_color.begin(), triangle_color.end()));
++    }
++    if (!model_uv.empty()) {
++        const std::vector<Vec2f> uv = topology_changed ? transfer_uv_channel(base, model_uv, res) : model_uv;
++        out.blobs.emplace_back("modelUv", std::string(reinterpret_cast<const char*>(uv.data()), uv.size() * sizeof(Vec2f)));
++    }
+     out.meshes.push_back(std::move(res));
+ }
+ 
++// The gizmo's colour panel, without baking (GLGizmoTextureDisplacement: has_color per layer, flat-colour
++// verdict, cached_palette(), the "Mixed colors" slider bound, "N printable colors from M filaments").
++//   args { layers, images (as texture_displacement), color: { config } }
++//   -> { layers:[{slot, hasColor, flatColors, flatShare}], anyColor, filaments, maxMixes,
++//        palette:[{color, a, b, num, den}] (empty when no layer is colouring) }
++void op_texture_displacement_palette(const json& args, const uint8_t* blob, int blob_len, ToolOut& out)
++{
++    TdInput in = td_layers(args, blob, blob_len, "texture_displacement_palette");
++    const DynamicPrintConfig cfg = td_color_config(args.value("color", json::object()));
++    const cs_tdc::ProjectFilaments pf = cs_tdc::project_filaments(cfg);
++    const cs_tdc::PaletteResult pal = cs_tdc::build_palette(in.layers, in.options, pf);
++    json lj = json::array();
++    for (const TextureDisplacementLayer& l : in.layers) {
++        const bool has = !l.empty() && height_texture_has_color(l);
++        const TextureDetail d = l.empty() ? TextureDetail{} : analyze_texture_detail(l);
++        lj.push_back({{"slot", l.slot}, {"hasColor", has}, {"flatColors", d.flat_colors}, {"flatShare", d.flat_share}});
++    }
++    out.result = {{"layers", lj}, {"anyColor", pal.any_color}, {"filaments", pf.physical.size()}, {"maxMixes", pal.max_mixes},
++                  {"palette", td_palette_json(pal.settings.palette, nullptr)}};
++}
++
+ // ---- Design-tab sketch helpers (libslic3r/CAD without the OCCT kernel) ------------------
+ // Entities: { type: line|arc|circle|point|ellipse|ellipseArc|bspline, p0:[x,y], p1, center, radius,
+ //             startAngle, endAngle, construction, rminor, rotation, ctrl:[[x,y]...] }   (sketch mm)
+@@ -3196,6 +3387,7 @@
+         else if (op == "repair_mesh") op_repair_mesh(args, meshes, out);
+         else if (op == "sketch") op_sketch(args, blob, blob_len, out);
+         else if (op == "texture_displacement") op_texture_displacement(args, meshes, blob, blob_len, out);
++        else if (op == "texture_displacement_palette") op_texture_displacement_palette(args, blob, blob_len, out);
+         else if (op == "inspect_3mf") op_inspect_3mf(blob, blob_len, out);
+         else if (op == "arrange") op_arrange(job_json, job_len, blob, blob_len, args, out);
+         else throw cs::JobError("unknown tool '" + op + "'");
+@@ -3218,6 +3410,16 @@
+         mj.push_back({{"vertexOffset", off}, {"vertexCount", m.vertices.size()}, {"indexOffset", off + vb}, {"triangleCount", m.indices.size()}});
+         off += vb + ib;
+     }
++    if (!out.blobs.empty()) {
++        json bj = json::object();
++        for (const auto& [name, bytes] : out.blobs) {
++            off = out_blob.size();
++            out_blob.resize(off + ((bytes.size() + 3) & ~size_t(3)), '\0');
++            if (!bytes.empty()) std::memcpy(out_blob.data() + off, bytes.data(), bytes.size());
++            bj[name] = {{"offset", off}, {"length", bytes.size()}};
++        }
++        rep["blobs"] = bj;
++    }
+     rep["result"] = out.result;
+     rep["meshes"] = mj;
+     out_json = rep.dump();
+--- a/wasm/CMakeLists.txt
++++ b/wasm/CMakeLists.txt
+@@ -143,7 +143,7 @@
+ # the rest of libslic3r compiles unpatched:
+ #   OCCT     Format/STEP.cpp, Format/svg.cpp     → stubs/formats.cpp
+ #   Draco    Format/DRC.cpp                      → stubs/formats.cpp
+-#   Assimp   Format/AssimpImport.cpp             → stubs/formats.cpp
++#   Assimp   Format/AssimpImport.cpp             → stubs/assimp_import.cpp
+ #   OpenCV   TexturePainting.cpp, TextureToColor/*, ObjColorUtils.cpp → stubs/texture_painting.cpp
+ #   OpenVDB  SLA/Hollowing.cpp                   → stubs/sla_hollowing.cpp
+ get_target_property(_slic3r_src libslic3r SOURCES)
+@@ -154,6 +154,7 @@
+ set_property(TARGET libslic3r PROPERTY SOURCES ${_slic3r_src})
+ target_sources(libslic3r PRIVATE
+   ${CMAKE_CURRENT_LIST_DIR}/stubs/formats.cpp
++  ${CMAKE_CURRENT_LIST_DIR}/stubs/assimp_import.cpp
+   ${CMAKE_CURRENT_LIST_DIR}/stubs/texture_painting.cpp
+   ${CMAKE_CURRENT_LIST_DIR}/stubs/sla_hollowing.cpp
+   ${CMAKE_CURRENT_LIST_DIR}/stubs/nanosvg.cpp)   # (the GUI normally instantiates nanosvg)
+@@ -224,7 +225,8 @@
+ endif()
+ 
+ # ---- engine module ------------------------------------------------------------
+-add_executable(slicer ../bridge/cs_bridge.cpp ../bridge/cs_hooks.cpp ../bridge/common/cs_fast_strtod.cpp)
++add_executable(slicer ../bridge/cs_bridge.cpp ../bridge/cs_hooks.cpp ../bridge/cs_texture_palette.cpp
++  ../bridge/common/cs_fast_strtod.cpp)
+ set_target_properties(slicer PROPERTIES OUTPUT_NAME "slicer" SUFFIX ".mjs")
+ target_include_directories(slicer PRIVATE
+   ${ORCA_SRC_DIR}/src
+@@ -310,6 +312,13 @@
+ endif()
+ target_link_options(slicer PRIVATE ${_link})
+ 
++# Texture import module (separate module, Assimp + OpenCV linked; scripts/build-texture.sh builds the
++# 'texture' target in build-wasm/). Defined only in a single-threaded slicer configuration whose
++# toolchain has the two libraries; the slicer target and its flags are untouched.
++if(NOT ORCA_WASM_CAD)
++  include(${CMAKE_CURRENT_LIST_DIR}/texture.cmake)
++endif()
++
+ # Design-tab CAD kernel (separate module, OCCT linked): only when asked for, in its own build
+ # dir (scripts/build-cad.sh → build-cad/). OFF leaves the slicer configuration unchanged.
+ option(ORCA_WASM_CAD "Also configure the cad target (Design-tab B-rep kernel, needs wasm-deps/occt-8.0.1)" OFF)
+--- a/tests/cs-tool-test.mjs
++++ b/tests/cs-tool-test.mjs
+@@ -27,6 +27,7 @@
+   const H = mod.HEAPU32; const pj = H[outs >>> 2], lj = H[(outs + 4) >>> 2], pb = H[(outs + 8) >>> 2], lb = H[(outs + 12) >>> 2];
+   const r = JSON.parse(new TextDecoder().decode(mod.HEAPU8.slice(pj, pj + lj)));
+   const bytes = pb ? mod.HEAPU8.slice(pb, pb + lb) : new Uint8Array(0);
++  r.blobData = Object.fromEntries(Object.entries(r.blobs ?? {}).map(([k, b]) => [k, bytes.slice(b.offset, b.offset + b.length)]));
+   r.meshData = (r.meshes ?? []).map((m) => ({ p: new Float32Array(bytes.buffer.slice(m.vertexOffset, m.vertexOffset + m.vertexCount * 12)), i: new Uint32Array(bytes.buffer.slice(m.indexOffset, m.indexOffset + m.triangleCount * 12)) }));
+   if (pj) mod._cs_free(pj); if (pb) mod._cs_free(pb); mod._free(jp); mod._free(bp); mod._free(outs);
+   return r;
+@@ -193,6 +194,74 @@
+   ok(!bad.ok && /layers/.test(bad.error), 'texture_displacement rejects bad layers JSON');
+ }
+ 
++// ---- Orca 2.5: texture displacement colour ("Colors", Mix filaments, Mixed colors) --------
++function pngRGB(w, h, f) { // 8-bit RGB; f(x, y) -> [r, g, b]
++  const crcT = Array.from({ length: 256 }, (_, n) => { let c = n; for (let k = 0; k < 8; k++) c = c & 1 ? 0xedb88320 ^ (c >>> 1) : c >>> 1; return c >>> 0; });
++  const crc = (b) => { let c = 0xffffffff; for (const x of b) c = crcT[(c ^ x) & 255] ^ (c >>> 8); return (c ^ 0xffffffff) >>> 0; };
++  const chunk = (type, data) => { const out = Buffer.alloc(12 + data.length); out.writeUInt32BE(data.length, 0); out.write(type, 4, 'ascii'); data.copy(out, 8); out.writeUInt32BE(crc(out.subarray(4, 8 + data.length)), 8 + data.length); return out; };
++  const raw = Buffer.alloc((w * 3 + 1) * h); for (let y = 0; y < h; y++) for (let x = 0; x < w; x++) raw.set(f(x, y), y * (w * 3 + 1) + 1 + x * 3);
++  const ihdr = Buffer.alloc(13); ihdr.writeUInt32BE(w, 0); ihdr.writeUInt32BE(h, 4); ihdr[8] = 8; ihdr[9] = 2;
++  return new Uint8Array(Buffer.concat([Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]), chunk('IHDR', ihdr), chunk('IDAT', zlib.deflateSync(raw)), chunk('IEND', Buffer.alloc(0))]));
++}
++{
++  const all = tool('paint_from_states', { states: Array.from({ length: 12 }, (_, t) => [t, 1]) }, [cube]).result.paint;
++  // Flat colours (red / blue checker): each prints in one filament, no mixes.
++  const flat = pngRGB(64, 64, (x, y) => ((x >> 3) + (y >> 3)) % 2 ? [230, 20, 20] : [20, 20, 230]);
++  const layers = (opts = {}) => ({ version: 1, options: { color_mix_enabled: true, color_mix_count: 4, color_despeckle: 0, ...opts },
++    layers: [{ slot: 0, depth_mm: 0.5, tiling_scale: 8, color_enabled: true }] });
++  const colorCfg = { filament_colour: ['#FF0000', '#0000FF', '#FFFFFF'] };
++  const pal = tool('texture_displacement_palette', (off) => ({ layers: layers(), images: { 0: { offset: off, length: flat.length } }, color: { config: colorCfg } }), [], flat);
++  ok(pal.ok && pal.result.anyColor && pal.result.layers[0].hasColor && pal.result.layers[0].flatColors && pal.result.filaments === 3 && pal.result.maxMixes === 29,
++     `palette: ${JSON.stringify(pal.result?.layers)} filaments ${pal.result?.filaments} maxMixes ${pal.result?.maxMixes} ${pal.error ?? ''}`);
++  const fl = tool('texture_displacement', (off) => ({ layers: layers(), images: { 0: { offset: off, length: flat.length } }, paint: { 0: all },
++    color: { config: colorCfg } }), [cube], flat);
++  const tc = fl.blobData?.triangleColor;
++  const tris = fl.meshData?.[0] ? fl.meshData[0].i.length / 3 : 0;
++  const used = tc ? [...new Set(tc)].filter((v) => v > 0).sort() : [];
++  ok(fl.ok && tc && tc.length === tris && used.join() === '1,2' && fl.result.colors.newMixedFilaments.length === 0,
++     `flat-colour bake: ${tris} tris, palette entries used ${used} (red, blue), no mixes ${fl.error ?? ''}`);
++  const cp = fl.result?.paint?.color ?? [];
++  const reopen = tool('paint_open', { paint: cp, maxState: 32 }, [fl.meshData?.[0] ?? cube]);
++  ok(fl.ok && cp.length > 0 && cp.length <= tris && reopen.ok && reopen.result.states.join() === '1,2',
++     `colour paint strings on the baked mesh (${cp.length} triangles, states ${reopen.result?.states}) — paint.color format`);
++  tool('paint_close', { handle: reopen.result?.handle }, []);
++  ok(fl.ok && fl.result.topologyChanged && fl.result.moved && fl.result.clearSlots.length === 8, `bake reports topology change + masks to clear (${fl.result?.clearSlots})`);
++  // A gradient (photo-like): purple between red and blue → a red/blue mix, reported as a new mixed slot.
++  const grad = pngRGB(64, 64, (x) => { const t = x / 63; return [Math.round(230 * (1 - t)), 20, Math.round(230 * t)]; });
++  const gr = tool('texture_displacement', (off) => ({ layers: layers(), images: { 0: { offset: off, length: grad.length } }, paint: { 0: all },
++    color: { config: colorCfg } }), [cube], grad);
++  const nm = gr.result?.colors?.newMixedFilaments ?? [];
++  const pl = gr.result?.colors?.palette ?? [];
++  ok(gr.ok && pl.length > 3 && nm.length > 0 && nm.every((m) => m.slot >= 3 && m.components.length === 2 && m.ratios[0] + m.ratios[1] === 100),
++     `gradient bake: palette ${pl.length} entries, new mixed slots ${JSON.stringify(nm.map((m) => [m.slot, m.components.join('+'), m.ratios.join(':')]))} ${gr.error ?? ''}`);
++  const mixState = Math.max(...(gr.blobData?.triangleColor ?? [0]));
++  ok(gr.ok && pl[mixState - 1]?.filament >= 3, `a mixed palette entry prints in its new slot (entry ${mixState} -> filament ${pl[mixState - 1]?.filament})`);
++  // An existing fixed mixed slot is reused instead of adding one; mixing off -> no mixes at all.
++  const reuse = nm[0] ? { filament_colour: ['#FF0000', '#0000FF', '#FFFFFF', '#800080'], filament_is_mixed: ['0', '0', '0', '1'],
++    filament_mixed_components: ['', '', '', nm[0].components.join(',')],
++    filament_mixed_sublayer_ratios: ['', '', '', nm[0].ratios.map((r) => (r / 100).toFixed(4)).join(',')] } : colorCfg;
++  const ru = tool('texture_displacement', (off) => ({ layers: layers({ color_mix_count: 1 }), images: { 0: { offset: off, length: grad.length } }, paint: { 0: all },
++    color: { config: reuse } }), [cube], grad);
++  ok(ru.ok && (ru.result.colors.newMixedFilaments.length === 0) && ru.result.colors.palette.some((e) => e.a !== e.b && e.filament === 3),
++     `existing mixed slot reused (${JSON.stringify(ru.result?.colors?.palette?.filter((e) => e.a !== e.b))}) ${ru.error ?? ''}`);
++  const off = tool('texture_displacement', (o) => ({ layers: layers({ color_mix_enabled: false }), images: { 0: { offset: o, length: grad.length } }, paint: { 0: all },
++    color: { config: colorCfg } }), [cube], grad);
++  ok(off.ok && off.result.colors.palette.length === 3 && off.result.colors.newMixedFilaments.length === 0, 'Mix filaments off: filaments only');
++  // The volume's own paint is carried onto the rebuilt mesh; a grey texture colours nothing.
++  const seam = tool('paint_from_states', { states: [[8, 1], [9, 1]] }, [cube]).result.paint;
++  const grey = png(64, 64, (x, y) => ((x >> 3) + (y >> 3)) % 2 ? 255 : 0);
++  const gy = tool('texture_displacement', (o) => ({ layers: layers(), images: { 0: { offset: o, length: grey.length } }, paint: { 0: all.slice(0, 4) },
++    volumePaint: { seam }, color: { config: colorCfg } }), [cube], grey);
++  ok(gy.ok && !gy.result.colors && gy.result.paint?.seam?.length > 0, `grey texture: no colour output; seam paint carried (${gy.result?.paint?.seam?.length} triangles) ${gy.error ?? ''}`);
++  // The model's UV channel goes in and comes back resampled onto the baked triangles.
++  const uv = new Float32Array(12 * 6).map((_, k) => (k % 6) / 6);
++  const uvb = new Uint8Array(uv.buffer);
++  const mu = tool('texture_displacement', (o) => ({ layers: { version: 1, options: {}, layers: [{ slot: 0, depth_mm: 0.5, tiling_scale: 8 }] },
++    images: { 0: { offset: o, length: grey.length } }, paint: { 0: all }, modelUv: { offset: o + grey.length + ((4 - grey.length % 4) % 4), length: uvb.length } }),
++    [cube], (() => { const pad = (4 - grey.length % 4) % 4; const b = new Uint8Array(grey.length + pad + uvb.length); b.set(grey); b.set(uvb, grey.length + pad); return b; })());
++  ok(mu.ok && mu.blobData?.modelUv?.length === (mu.meshData[0].i.length / 3) * 24, `modelUv resampled onto ${mu.meshData?.[0]?.i.length / 3} triangles ${mu.error ?? ''}`);
++}
++
+ // ---- Orca 2.5: Design-tab sketch solver (SolveSpace) / inference / SVG import --------------
+ {
+   const ents = [{ type: 'line', p0: [0, 0], p1: [10, 1.5] }, { type: 'line', p0: [10.4, 1.2], p1: [10, 8] }];
+--- a/README.md
++++ b/README.md
+@@ -19,6 +19,8 @@
+ wasm/wasm_shims/            sequential TBB, single-thread Boost.Thread, MD5 (headers; ST build)
+ wasm/stubs/                 failing stand-ins for the libslic3r sources that need unlinked libraries
+                             (STEP/SVG-OCCT, Draco, Assimp, OpenCV texture painting, OpenVDB hollowing)
++wasm/texture.cmake          texture import module (texture.mjs): real Assimp + OpenCV, bridge/texture_bridge.cpp
++bridge/cs_texture_palette.* texture-displacement colour palette (desktop gizmo's quantizer / mix ranking)
+ wasm/mt_pre.js, mt_post.js  pthreads build: thread count, csTerminateThreads, csSyncHeap
+ scripts/build-wasm.sh       checkout + patch + build + schema
+ scripts/gen-schema.mjs      writes schema.json / version.json next to the build
+@@ -27,6 +29,7 @@
+ tests/cs-tool-test.mjs      cs_tool: painting, layer profiles, cut + connectors / groove, mixed_filament,
+                             resolve_variants, wipe_tower_footprint, repair_mesh, inspect_3mf,
+                             texture_displacement, sketch
++tests/texture-test.mjs      texture module: GLB/OBJ/FBX load, analyze, match (auto-merge, CMYW/RYBW), apply
+ tests/cs-arrange-test.mjs   cs_tool arrange (Orca ArrangeJob): spacing, auto rotate, plates, locked / unprintable,
+                             IDEX/IQEX zones, belt printers
+ tests/cs-arrange-bench.mjs  arrange timing on heavy meshes, per phase
+@@ -62,6 +65,18 @@
+ node tests/cad-smoke.mjs build-cad           # every other method once; ~1 min
+ ```
+ 
++Textured / coloured model import (separate module, `build-wasm/texture.{mjs,wasm,data}`; contract:
++cubby-slicer `docs/ENGINE-CONTRACT.md` "Textured and coloured model import"): Orca's
++`Format/AssimpImport.cpp`, `TexturePainting.cpp` and `TextureToColor/` on real Assimp 5.4.3
++(glTF/GLB, OBJ, FBX importers) and OpenCV 4.14.0 (core, imgproc, imgcodecs), plus the Import
++Model dialog's matching logic, behind `tex_call(json, blob)`. Single-threaded; the slicer links neither library.
++
++```bash
++bash ../wasm-deps/build-deps.sh texture      # once: Assimp + OpenCV → ../wasm-deps/{assimp-5.4.3,opencv-4.14.0}
++bash scripts/build-texture.sh                # → build-wasm/texture.{mjs,wasm,data} + texture-version.json
++node tests/texture-test.mjs build-wasm       # ALL PASSED
++```
++
+ OCCT is built without `OCC_CONVERT_SIGNALS` (setjmp inside `try` is miscompiled by this LLVM's
+ WebAssembly backend; see `build_occt` in `toolchain/build-deps.sh`), and every OCCT object is
+ checked with `wasm-validate`.
+@@ -146,10 +161,9 @@
+ 
+ ## Disabled / not available
+ 
+-OCCT: STEP/SVG-as-model import and the Design tab's B-rep kernel (CadDocument,
+-GeometryEngine, SketchEngine); the sketch solver/inference/import are in (cs_tool
+-`sketch`). OpenCV: texture → colour painting of textured OBJ/GLB imports and the
+-texture-displacement colour output. Assimp (FBX/GLB/DAE import), Draco, OpenVDB
++In the slicer engine: OCCT (STEP/SVG-as-model import and the Design tab's B-rep kernel:
++the CAD module); Assimp and OpenCV (glTF/GLB/FBX import and texture → colour painting:
++the texture module; the texture-displacement colour output IS in the engine). Draco, OpenVDB
+ (SLA hollowing), Python (plugins run in the host; their libslic3r hook points are
+ bridged, see ENGINE-CONTRACT.md "Plugin hooks"), networking/printer connectivity,
+ multithreading in the ST build (see build-wasm-mt). Thumbnails are not generated
+--- a/wasm/README.md
++++ b/wasm/README.md
+@@ -7,6 +7,7 @@
+ |---|---|
+ | `CMakeLists.txt` | superbuild: options for the upstream tree, libslic3r source substitutions, link flags, exports |
+ | `cmake/Find*.cmake` | real dependencies from the toolchain prefix, or empty packages for libraries that are not linked |
++| `texture.cmake` | texture import module (Assimp + OpenCV), built in build-wasm/ by scripts/build-texture.sh |
+ | `stubs/` | failing stand-ins for libslic3r sources that need an unlinked library |
+ | `wasm_shims/` | single-threaded header shims: sequential TBB, `boost::thread`, MD5 |
+ | `mt_pre.js`, `mt_post.js` | pthreads build: thread count, `csSyncHeap`, `csTerminateThreads` |
+@@ -17,9 +18,9 @@
+ | upstream feature | needs | engine behaviour |
+ |---|---|---|
+ | STEP / SVG-as-model import, Design-tab B-rep kernel | OCCT | import fails cleanly; sketch solver/inference/import are in |
+-| FBX/GLB/DAE/… import (`Format/AssimpImport`) | Assimp | fails cleanly (host loads meshes) |
++| glTF/GLB/FBX import (`Format/AssimpImport`) | Assimp | fails cleanly in the slicer; real in the texture module (`texture.cmake`) |
+ | Draco mesh files | Draco | fails cleanly |
+-| texture → colour painting of textured imports | OpenCV | fails cleanly |
++| texture → colour painting of textured imports | OpenCV | fails cleanly in the slicer; real in the texture module |
+ | SLA hollowing / drain holes | OpenVDB | no-op (FFF only) |
+ | Python plugins | CPython | hooks bridged to the host (`Module.csHook`) |
+ | multithreading (single-threaded build) | pthreads | sequential TBB shim; use `build-wasm-mt` |
+--- a/wasm/stubs/formats.cpp
++++ b/wasm/stubs/formats.cpp
+@@ -6,11 +6,11 @@
+ //   Format/STEP.cpp          OCCT     (STEP.hpp is patched to build with SLIC3R_NO_OCCT)
+ //   Format/svg.cpp           OCCT
+ //   Format/DRC.cpp           Draco
+-//   Format/AssimpImport.cpp  Assimp   (FBX/GLB/DAE/... textured import)
++//   (Format/AssimpImport.cpp: stubs/assimp_import.cpp, its own archive member so the texture
++//    module's real AssimpImport object replaces it without a duplicate symbol)
+ #include "libslic3r/Format/STEP.hpp"
+ #include "libslic3r/Format/svg.hpp"
+ #include "libslic3r/Format/DRC.hpp"
+-#include "libslic3r/Format/AssimpImport.hpp"
+ 
+ #ifndef SLIC3R_NO_OCCT
+ #error "stubs/formats.cpp is only for builds without OCCT"
+@@ -66,12 +66,4 @@
+ bool store_drc(const char *, ModelObject *, int, int) { return false; }
+ bool store_drc(const char *, Model *, int, int) { return false; }
+ 
+-// ---- Assimp ----
+-bool load_assimp_textured_model(const std::string &, TexturedMesh &, std::string *error_message)
+-{
+-    if (error_message)
+-        *error_message = "This file format is not available in this build.";
+-    return false;
+-}
+-
+ } // namespace Slic3r

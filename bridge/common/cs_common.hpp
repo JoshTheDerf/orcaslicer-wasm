@@ -39,7 +39,7 @@ struct JobError : std::runtime_error { using std::runtime_error::runtime_error; 
 // transform maps its own mesh-local coordinates straight to bed coordinates.
 struct VolumeInput {
     std::string name;
-    std::string type = "part"; // part | negative | modifier | support_blocker | support_enforcer
+    std::string type = "part"; // part | negative | modifier | support_blocker | support_enforcer | precise_seam_* (orca 2.5)
     std::vector<float>    positions;
     std::vector<uint32_t> indices;
     double transform[16];
@@ -175,7 +175,9 @@ inline Job parse_job(const char* job_json, int job_len, const uint8_t* blob, int
                 VolumeInput v;
                 v.name = pj.value("name", m.name + " part");
                 v.type = pj.value("type", std::string("part"));
-                if (v.type != "part" && v.type != "negative" && v.type != "modifier" && v.type != "support_blocker" && v.type != "support_enforcer")
+                // precise_seam_*: OrcaSlicer 2.5 Precise Seam modifiers (engines without them may reject).
+                if (v.type != "part" && v.type != "negative" && v.type != "modifier" && v.type != "support_blocker" && v.type != "support_enforcer" &&
+                    v.type.rfind("precise_seam_", 0) != 0)
                     throw JobError(v.name + ": unknown part type '" + v.type + "'");
                 parse_mesh_entry(pj, v.name, blob, len, v.positions, v.indices, v.transform);
                 if (auto c = pj.find("config"); c != pj.end()) {

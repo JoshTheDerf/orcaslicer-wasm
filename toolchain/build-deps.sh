@@ -19,7 +19,7 @@
 # in the previous builds, which were papered over with
 # -sEMULATE_FUNCTION_POINTER_CASTS. Keep this file the single source of truth.
 #
-# Usage:  bash build-deps.sh [boost|gmp|mpfr|cgal|eigen|...|preflight-extras|all]
+# Usage:  bash build-deps.sh [boost|gmp|mpfr|cgal|eigen|slvs|...|preflight-extras|all]
 #         WASM_THREADS=1 bash build-deps.sh all-mt      # pthreads prefix (orca MT engine)
 set -euo pipefail
 
@@ -44,6 +44,8 @@ fetch() { # name url [sha256]
   curl -L --fail --retry 3 --connect-timeout 20 -o "$out.partial" "$2"
   mv "$out.partial" "$out"
 }
+
+unzip_to() { python3 -c "import zipfile,sys;zipfile.ZipFile(sys.argv[1]).extractall(sys.argv[2])" "$1" "$2"; }
 
 build_boost() {
   local ver=1.84.0 dir="boost_1_84_0"
@@ -115,7 +117,7 @@ build_mpfr() {
   echo "mpfr: installed"
 }
 
-# CGAL is header-only. Orca pins 5.6.3; preFlight needs 6.1 (AABB_traits_3,
+# CGAL is header-only. Orca 2.5 pins 6.2.1; preFlight needs 6.1 (AABB_traits_3,
 # std::optional property maps). Each gets its own prefix so the engines can't
 # pick up the wrong one.
 install_cgal() { # version subdir
@@ -180,8 +182,192 @@ install_cereal() {
   echo "cereal: installed"
 }
 
+# libslvs (SolveSpace solver) — Orca 2.5's Design-tab sketch constraint solver
+# (libslic3r/CAD/SketchSolver). Same pinned commit + CMakeLists as orca/deps/SLVS
+# (copied to slvs/CMakeLists.txt; upstream's builds a demo and installs nothing).
+build_slvs() {
+  [[ -f "$PREFIX/lib/libslvs.a" ]] && { echo "slvs: up to date"; return; }
+  local rev=4d8704523e4bf212fadf5189f92484244f670fea
+  fetch "SolveSpaceLib-$rev.zip" "https://github.com/JacobStoren/SolveSpaceLib/archive/$rev.zip"
+  rm -rf "$SRC/SolveSpaceLib-$rev"; unzip_to "$DL/SolveSpaceLib-$rev.zip" "$SRC"
+  cp "$HERE/slvs/CMakeLists.txt" "$SRC/SolveSpaceLib-$rev/CMakeLists.txt"
+  em_cmake_lib slvs "$SRC/SolveSpaceLib-$rev"
+}
+
+# OCCT 8.0.1 HEADERS ONLY (same pin as orca/deps/OCCT), no library: they let the parts of
+# libslic3r/CAD that use only OCCT's value types in their headers (SketchSolver, SketchInference)
+# compile. Nothing from OCCT is linked; a reference to an OCCT symbol fails the link.
+install_occt_headers() {
+  local ver=8_0_1 dest="$HERE/occt-headers-8.0.1"
+  [[ -f "$dest/include/occt/Standard_Version.hxx" ]] && { echo "occt headers: up to date"; return; }
+  fetch "OCCT-V$ver.zip" "https://github.com/Open-Cascade-SAS/OCCT/archive/refs/tags/V$ver.zip"
+  rm -rf "$SRC/OCCT-$ver"; unzip_to "$DL/OCCT-V$ver.zip" "$SRC"
+  rm -rf "$dest"; mkdir -p "$dest/include/occt"
+  find "$SRC/OCCT-$ver/src" \( -name '*.hxx' -o -name '*.lxx' -o -name '*.gxx' -o -name '*.pxx' \) -exec cp {} "$dest/include/occt/" \;
+  sed -e 's/@OCC_VERSION_MAJOR@/8/g' -e 's/@OCC_VERSION_MINOR@/0/g' -e 's/@OCC_VERSION_MAINTENANCE@/1/g' \
+      -e 's/@SET_OCC_VERSION_DEVELOPMENT@//' -e 's/@OCCT_VERSION_DATE@//' \
+      "$SRC/OCCT-$ver/adm/templates/Standard_Version.hxx.in" > "$dest/include/occt/Standard_Version.hxx"
+  echo "occt headers: installed"
+}
+
+# OCCT 8.0.1 LIBRARIES (static) for the Design-tab CAD module (orcaslicer-wasm's cad.mjs; the
+# slicer engine never links them). Same pin and BRepMesh seam patch as orca/deps/OCCT, its own
+# prefix (occt-8.0.1/: include/occt, lib/*.a) so no slicer build can pick it up. Only the
+# toolkits Orca's libslic3r/CAD needs (+ their OCCT dependencies, resolved by OCCT's CMake):
+#   TKFillet TKOffset TKBool TKMesh TKDESTEP  →  TKernel TKMath TKG2d TKG3d TKGeomBase TKBRep
+#   TKGeomAlgo TKTopAlgo TKPrim TKBO TKShHealing TKDE TKXSBase TKXCAF TKLCAF TKCAF TKCDF (+TKXCAF's
+#   TKService/TKV3d/TKVCAF, unreferenced by the CAD code and dropped by wasm-ld).
+# Compile model: $WASM_CXXFLAGS (native Wasm EH). OCCT's own adm/cmake adds `-fexceptions`
+# (JS-emulated EH) and `-fPIC` for every non-MSVC compiler; both are stripped here so every object
+# matches the rest of the prefix. OCC_CONVERT_SIGNALS stays (OCC_CATCH_SIGNALS → setjmp/longjmp,
+# i.e. -sSUPPORT_LONGJMP=wasm). Single-threaded only (no USE_TBB; OSD_Parallel runs inline).
+# OCCT_JOBS (default 3) caps the parallel compile jobs: the build is ~2000 TUs.
+build_occt() {
+  local ver=8_0_1 dest="$HERE/occt-8.0.1"
+  [[ $MT == 1 ]] && { echo "occt: single-threaded only (no WASM_THREADS=1 build)" >&2; exit 1; }
+  [[ -f "$dest/lib/libTKDESTEP.a" && -f "$dest/lib/libTKFillet.a" ]] && { echo "occt: up to date"; return; }
+  fetch "OCCT-V$ver.zip" "https://github.com/Open-Cascade-SAS/OCCT/archive/refs/tags/V$ver.zip"
+  local src="$SRC/OCCT-$ver-lib"
+  rm -rf "$src"; mkdir -p "$src.tmp"; unzip_to "$DL/OCCT-V$ver.zip" "$src.tmp"
+  mv "$src.tmp/OCCT-$ver" "$src"; rmdir "$src.tmp"
+  local patch="${ORCA_SRC:-$HERE/../orcaslicer-wasm/orca}/deps/OCCT/0001-BRepMesh-seam-pcurve-at-edge-parameter.patch"
+  [[ -f "$patch" ]] || patch="$HERE/occt/0001-BRepMesh-seam-pcurve-at-edge-parameter.patch"
+  (cd "$src" && git apply --ignore-space-change --whitespace=nowarn "$patch") \
+    || { echo "occt: BRepMesh patch did not apply ($patch)" >&2; exit 1; }
+  sed -i -e 's/ -fexceptions")/")/' -e 's/ -fPIC")/")/' "$src/adm/cmake/occt_defs_flags.cmake"
+  # OCC_CONVERT_SIGNALS (OCCT's default on every non-MSVC compiler) makes each OCC_CATCH_SIGNALS
+  # call setjmp() inside a C++ try block, so signals can longjmp into a C++ exception. WebAssembly
+  # has no signals to convert (a trap is not catchable), and setjmp + try in one function is miscompiled
+  # by this LLVM's WebAssembly CFGStackify: legacy EH emits an invalid br_table (V8: "br_table: label
+  # arity inconsistent", wasm-opt: "popping from empty stack") in ShapeUpgrade_ShapeDivide::Perform and
+  # ShapeCustom_BSplineRestriction::ConvertSurface; exnref EH crashes the compiler. Without it OCCT
+  # behaves as its MSVC build (OCC_CATCH_SIGNALS empty, exceptions thrown directly) and matches the
+  # consumers (Orca never defines it), so Standard_ErrorHandler::Callback is the same in every TU.
+  sed -i -e 's/^\( *\)add_definitions(-DOCC_CONVERT_SIGNALS)/\1# (wasm) no OCC_CONVERT_SIGNALS/' "$src/adm/cmake/occt_defs_flags.cmake"
+  ! grep -qE -- '-fexceptions"|-fPIC"|-DOCC_CONVERT_SIGNALS' "$src/adm/cmake/occt_defs_flags.cmake" \
+    || { echo "occt: occt_defs_flags.cmake flag strip did not apply" >&2; exit 1; }
+  local launcher=(); command -v ccache >/dev/null && launcher=(-DCMAKE_C_COMPILER_LAUNCHER=ccache -DCMAKE_CXX_COMPILER_LAUNCHER=ccache)
+  emcmake cmake -S "$src" -B "$src/build-wasm" -G Ninja -DCMAKE_BUILD_TYPE=Release \
+    -DCMAKE_INSTALL_PREFIX="$dest" -DBUILD_LIBRARY_TYPE=Static -DCMAKE_CXX_STANDARD=17 \
+    -DCMAKE_C_FLAGS="$WASM_CFLAGS" -DCMAKE_CXX_FLAGS="$WASM_CXXFLAGS" "${launcher[@]}" \
+    -DINSTALL_DIR_LAYOUT=Unix -DINSTALL_DIR_LIB=lib -DINSTALL_DIR_INCLUDE=include/occt \
+    -DINSTALL_DIR_CMAKE=lib/cmake/occt -DINSTALL_DIR_BIN=bin -DINSTALL_DIR_RESOURCE=share/occt/resources \
+    -DBUILD_MODULE_FoundationClasses=OFF -DBUILD_MODULE_ModelingData=OFF -DBUILD_MODULE_ModelingAlgorithms=OFF \
+    -DBUILD_MODULE_Visualization=OFF -DBUILD_MODULE_ApplicationFramework=OFF -DBUILD_MODULE_DataExchange=OFF \
+    -DBUILD_MODULE_Draw=OFF "-DBUILD_ADDITIONAL_TOOLKITS=TKFillet TKOffset TKBool TKMesh TKDESTEP" \
+    -DUSE_TK=OFF -DUSE_TBB=OFF -DUSE_FREETYPE=OFF -DUSE_FREEIMAGE=OFF -DUSE_FFMPEG=OFF -DUSE_VTK=OFF \
+    -DUSE_RAPIDJSON=OFF -DUSE_DRACO=OFF -DUSE_OPENVR=OFF -DUSE_EIGEN=OFF -DUSE_GLES2=OFF \
+    -DBUILD_DOC_Overview=OFF -DBUILD_GTEST=OFF -DBUILD_USE_PCH=ON \
+    > "$LOGS/occt-configure.log" 2>&1 || { tail -30 "$LOGS/occt-configure.log"; exit 1; }
+  # Precompiled headers (OCCT's own, per toolkit): ~4600 small TUs that mostly re-parse the same
+  # Standard/NCollection headers. ccache may cache PCH users only with these sloppiness flags.
+  CCACHE_SLOPPINESS="pch_defines,time_macros,include_file_mtime,include_file_ctime" \
+  cmake --build "$src/build-wasm" -j"${OCCT_JOBS:-3}" > "$LOGS/occt-build.log" 2>&1 \
+    || { tail -30 "$LOGS/occt-build.log"; exit 1; }
+  # Every object must be valid wasm (catches EH/SjLj miscompiles before they surface as a link-time
+  # wasm-opt parse error or a CompileError in the browser). wabt's wasm-validate, when installed.
+  if command -v wasm-validate >/dev/null; then
+    local bad
+    bad=$(find "$src/build-wasm" -name '*.o' -print0 | xargs -0 -n1 -P"${OCCT_JOBS:-3}" sh -c \
+      'wasm-validate --enable-all "$0" >/dev/null 2>&1 || echo "$0"')
+    [[ -z "$bad" ]] || { echo "occt: invalid wasm objects:" >&2; echo "$bad" >&2; exit 1; }
+  fi
+  cmake --install "$src/build-wasm" >> "$LOGS/occt-build.log" 2>&1 \
+    || { tail -30 "$LOGS/occt-build.log"; exit 1; }
+  echo "occt: installed ($(ls "$dest"/lib/libTK*.a | wc -l) toolkits)"
+}
+
+# ---- texture module libraries (orcaslicer-wasm's texture.mjs; the slicer engine never links them) ----
+# Emscripten ports the slicer links (-sUSE_ZLIB/-sUSE_LIBPNG/-sUSE_LIBJPEG): the texture libraries
+# use these same archives instead of bundling their own copies (a second zlib/libpng/libjpeg in one
+# link would be duplicate symbols, or worse, two layouts of one struct).
+em_ports_ready() {
+  local probe="$SRC/.ports-probe.c"
+  printf '#include <zlib.h>\n#include <png.h>\n#include <stdio.h>\n#include <jpeglib.h>\nint main(void){return 0;}\n' > "$probe"
+  emcc $WASM_CFLAGS -sUSE_ZLIB=1 -sUSE_LIBPNG=1 -sUSE_LIBJPEG=1 "$probe" -o "$SRC/.ports-probe.js" >/dev/null 2>&1 \
+    || { echo "emscripten ports zlib/libpng/libjpeg could not be built" >&2; exit 1; }
+  rm -f "$SRC"/.ports-probe.*
+  EM_SYSROOT="$(em-config CACHE)/sysroot"
+}
+
+# Assimp 5.4.3 (same pin and importer set as orca/deps/Assimp: glTF/GLB, OBJ, FBX; no exporters).
+# Orca's AssimpImport.cpp (Format/) is its only user. Port zlib instead of contrib/zlib. Own prefix
+# assimp-5.4.3[-mt]/ so no slicer build can pick its headers up.
+build_assimp() {
+  local ver=5.4.3 dest="$HERE/assimp-5.4.3"; [[ $MT == 1 ]] && dest+="-mt"
+  [[ -f "$dest/lib/libassimp.a" ]] && { echo "assimp: up to date"; return; }
+  em_ports_ready
+  fetch "assimp-$ver.tar.gz" "https://github.com/assimp/assimp/archive/refs/tags/v$ver.tar.gz"
+  local src="$SRC/assimp-$ver"
+  rm -rf "$src"; tar xf "$DL/assimp-$ver.tar.gz" -C "$SRC"
+  local launcher=(); command -v ccache >/dev/null && launcher=(-DCMAKE_C_COMPILER_LAUNCHER=ccache -DCMAKE_CXX_COMPILER_LAUNCHER=ccache)
+  emcmake cmake -S "$src" -B "$src/build-wasm" -G Ninja -DCMAKE_BUILD_TYPE=Release \
+    -DCMAKE_INSTALL_PREFIX="$dest" -DBUILD_SHARED_LIBS=OFF -DCMAKE_POLICY_VERSION_MINIMUM=3.5 \
+    -DCMAKE_C_FLAGS="$WASM_CFLAGS -sUSE_ZLIB=1" -DCMAKE_CXX_FLAGS="$WASM_CXXFLAGS -sUSE_ZLIB=1" "${launcher[@]}" \
+    -DASSIMP_BUILD_USE_CCACHE=OFF -DASSIMP_BUILD_TESTS=OFF -DASSIMP_BUILD_SAMPLES=OFF \
+    -DASSIMP_BUILD_ASSIMP_TOOLS=OFF -DASSIMP_INSTALL_PDB=OFF -DASSIMP_NO_EXPORT=ON \
+    -DASSIMP_BUILD_ALL_IMPORTERS_BY_DEFAULT=OFF -DASSIMP_BUILD_GLTF_IMPORTER=ON \
+    -DASSIMP_BUILD_OBJ_IMPORTER=ON -DASSIMP_BUILD_FBX_IMPORTER=ON \
+    -DASSIMP_WARNINGS_AS_ERRORS=OFF -DASSIMP_INJECT_DEBUG_POSTFIX=OFF -DASSIMP_IGNORE_GIT_HASH=ON \
+    -DASSIMP_BUILD_ZLIB=OFF -DZLIB_INCLUDE_DIR="$EM_SYSROOT/include" \
+    -DZLIB_LIBRARY="$EM_SYSROOT/lib/wasm32-emscripten/libz.a" -DASSIMP_BUILD_DRACO=OFF \
+    > "$LOGS/assimp-configure.log" 2>&1 || { tail -30 "$LOGS/assimp-configure.log"; exit 1; }
+  # Same exception model as everything else: nothing may add JS-emulated EH.
+  ! grep -qE -- '-fexceptions|DISABLE_EXCEPTION_CATCHING' "$src/build-wasm/build.ninja" \
+    || { echo "assimp: build adds a second exception model (-fexceptions)" >&2; exit 1; }
+  cmake --build "$src/build-wasm" -j"$NPROC" > "$LOGS/assimp-build.log" 2>&1 \
+    && cmake --install "$src/build-wasm" >> "$LOGS/assimp-build.log" 2>&1 \
+    || { tail -30 "$LOGS/assimp-build.log"; exit 1; }
+  echo "assimp: installed"
+}
+
+# OpenCV 4.14.0 (same pin as orca/deps/OpenCV), only the modules Orca's texture code uses: core
+# (Mat, kmeans), imgproc (cvtColor), imgcodecs (imdecode PNG/JPEG through the port libpng/libjpeg,
+# as Orca shares its own). No SIMD dispatch, no parallel framework (pthreads off in both variants:
+# the texture module is single-threaded), no 3rdparty codecs. Own prefix opencv-4.14.0[-mt]/.
+build_opencv() {
+  local ver=4.14.0 dest="$HERE/opencv-4.14.0"; [[ $MT == 1 ]] && dest+="-mt"
+  [[ -f "$dest/lib/libopencv_imgcodecs.a" ]] && { echo "opencv: up to date"; return; }
+  em_ports_ready
+  fetch "opencv-$ver.tar.gz" "https://github.com/opencv/opencv/archive/refs/tags/$ver.tar.gz"
+  local src="$SRC/opencv-$ver"
+  rm -rf "$src"; tar xf "$DL/opencv-$ver.tar.gz" -C "$SRC"
+  local launcher=(); command -v ccache >/dev/null && launcher=(-DCMAKE_C_COMPILER_LAUNCHER=ccache -DCMAKE_CXX_COMPILER_LAUNCHER=ccache)
+  local libdir="$EM_SYSROOT/lib/wasm32-emscripten"
+  emcmake cmake -S "$src" -B "$src/build-wasm" -G Ninja -DCMAKE_BUILD_TYPE=Release \
+    -DCMAKE_INSTALL_PREFIX="$dest" -DBUILD_SHARED_LIBS=OFF -DCMAKE_POLICY_VERSION_MINIMUM=3.5 \
+    -DCMAKE_C_FLAGS="$WASM_CFLAGS -sUSE_ZLIB=1 -sUSE_LIBPNG=1 -sUSE_LIBJPEG=1" \
+    -DCMAKE_CXX_FLAGS="$WASM_CXXFLAGS -sUSE_ZLIB=1 -sUSE_LIBPNG=1 -sUSE_LIBJPEG=1" "${launcher[@]}" \
+    -DBUILD_LIST=core,imgproc,imgcodecs -DBUILD_opencv_world=OFF -DBUILD_opencv_apps=OFF \
+    -DBUILD_TESTS=OFF -DBUILD_PERF_TESTS=OFF -DBUILD_EXAMPLES=OFF -DBUILD_DOCS=OFF -DBUILD_JAVA=OFF \
+    -DBUILD_opencv_python2=OFF -DBUILD_opencv_python3=OFF -DBUILD_opencv_js=OFF \
+    -DCPU_BASELINE= -DCPU_DISPATCH= -DCV_ENABLE_INTRINSICS=OFF -DCV_TRACE=OFF \
+    -DWITH_PTHREADS_PF=OFF -DWITH_OPENMP=OFF -DWITH_TBB=OFF -DWITH_IPP=OFF -DWITH_ITT=OFF \
+    -DWITH_OPENCL=OFF -DWITH_CUDA=OFF -DWITH_EIGEN=OFF -DWITH_LAPACK=OFF -DWITH_PROTOBUF=OFF -DWITH_ADE=OFF \
+    -DWITH_KLEIDICV=OFF -DWITH_CAROTENE=OFF -DWITH_FFMPEG=OFF -DWITH_GSTREAMER=OFF -DWITH_1394=OFF \
+    -DWITH_GTK=OFF -DWITH_QT=OFF -DWITH_VTK=OFF -DWITH_OPENEXR=OFF -DWITH_OPENJPEG=OFF -DWITH_JASPER=OFF \
+    -DWITH_TIFF=OFF -DWITH_WEBP=OFF -DWITH_AVIF=OFF -DWITH_SPNG=OFF -DWITH_IMGCODEC_GIF=OFF \
+    -DWITH_IMGCODEC_HDR=OFF -DWITH_IMGCODEC_SUNRASTER=OFF -DWITH_IMGCODEC_PXM=OFF -DWITH_IMGCODEC_PFM=OFF \
+    -DWITH_QUIRC=OFF -DWITH_OBSENSOR=OFF -DWITH_VA=OFF -DWITH_VA_INTEL=OFF \
+    -DBUILD_ZLIB=OFF -DBUILD_PNG=OFF -DBUILD_JPEG=OFF -DBUILD_TIFF=OFF -DBUILD_WEBP=OFF -DBUILD_OPENEXR=OFF \
+    -DBUILD_OPENJPEG=OFF -DBUILD_JASPER=OFF -DBUILD_ITT=OFF -DBUILD_IPP_IW=OFF -DBUILD_TBB=OFF \
+    -DWITH_ZLIB=ON -DZLIB_INCLUDE_DIR="$EM_SYSROOT/include" -DZLIB_LIBRARY="$libdir/libz.a" \
+    -DWITH_PNG=ON -DPNG_PNG_INCLUDE_DIR="$EM_SYSROOT/include" -DPNG_LIBRARY="$libdir/libpng$([[ $MT == 1 ]] && echo -mt)-legacysjlj.a" \
+    -DWITH_JPEG=ON -DJPEG_INCLUDE_DIR="$EM_SYSROOT/include" -DJPEG_LIBRARY="$libdir/libjpeg.a" \
+    -DENABLE_PRECOMPILED_HEADERS=OFF -DOPENCV_GENERATE_PKGCONFIG=OFF -DOPENCV_GENERATE_SETUPVARS=OFF \
+    -DINSTALL_TESTS=OFF -DINSTALL_C_EXAMPLES=OFF -DINSTALL_PYTHON_EXAMPLES=OFF \
+    -DOPENCV_INSTALL_FFMPEG_DOWNLOAD_SCRIPT=OFF -DOPENCV_LIB_INSTALL_PATH=lib \
+    -DOPENCV_3P_LIB_INSTALL_PATH=lib/opencv4/3rdparty -DOPENCV_CONFIG_INSTALL_PATH=lib/cmake/opencv4 \
+    > "$LOGS/opencv-configure.log" 2>&1 || { tail -30 "$LOGS/opencv-configure.log"; exit 1; }
+  ! grep -qE -- '-fexceptions|DISABLE_EXCEPTION_CATCHING' "$src/build-wasm/build.ninja" \
+    || { echo "opencv: build adds a second exception model (-fexceptions)" >&2; exit 1; }
+  cmake --build "$src/build-wasm" -j"$NPROC" > "$LOGS/opencv-build.log" 2>&1 \
+    && cmake --install "$src/build-wasm" >> "$LOGS/opencv-build.log" 2>&1 \
+    || { tail -30 "$LOGS/opencv-build.log"; exit 1; }
+  echo "opencv: installed"
+}
+
 # ---- preFlight extras (PrusaSlicer-family deps; same flags as everything else) ----
-unzip_to() { python3 -c "import zipfile,sys;zipfile.ZipFile(sys.argv[1]).extractall(sys.argv[2])" "$1" "$2"; }
 
 # Qhull: TriangleMesh::convex_hull_3d (ModelVolume convex hulls). Same tag preFlight pins.
 build_qhull() {
@@ -234,7 +420,7 @@ install_nanosvg() {
 }
 
 # oneTBB (MT variant only; the single-thread engine uses a sequential header
-# shim). Orca 2.4.2 pins 2021.5.0 on desktop; 2022.x is API/ABI-compatible with
+# shim). Orca pins 2021.5.0 on desktop; 2022.x is API/ABI-compatible with
 # that code (TBB_VERSION_MAJOR >= 2021 paths) and is the first line with
 # upstream Emscripten+pthreads support.
 build_onetbb() {
@@ -263,7 +449,10 @@ case "$what" in
   boost) build_boost ;;
   gmp)   build_gmp ;;
   mpfr)  build_gmp; build_mpfr ;;
-  cgal)  install_cgal 5.6.3; install_cgal 6.1 ;;
+  cgal)  install_cgal 6.2.1; install_cgal 6.1 ;;
+  slvs)  build_slvs ;;
+  occt-headers) install_occt_headers ;;
+  occt) build_occt ;;          # CAD module only; not part of `all` (≈1–2 h)
   eigen) install_eigen ;;
   libnoise) build_libnoise ;;
   nlopt) build_nlopt ;;
@@ -274,11 +463,14 @@ case "$what" in
   json) install_json ;;
   nanosvg) install_nanosvg ;;
   onetbb) build_onetbb ;;
+  assimp) build_assimp ;;      # texture module only; not part of `all`
+  opencv) build_opencv ;;      # texture module only; not part of `all`
+  texture) build_assimp; build_opencv ;;
   preflight-extras) build_qhull; build_expat; build_heatshrink; install_json; install_nanosvg ;;
-  all)   install_eigen; install_cgal 5.6.3; install_cgal 6.1; install_cereal; build_gmp; build_mpfr;
-         build_libnoise; build_nlopt; build_boost ;;
+  all)   install_eigen; install_cgal 6.2.1; install_cgal 6.1; install_cereal; build_gmp; build_mpfr;
+         build_libnoise; build_nlopt; build_slvs; install_occt_headers; build_boost ;;
   all-mt) [[ $MT == 1 ]] || { echo "all-mt needs WASM_THREADS=1" >&2; exit 1; }
          install_eigen; install_cereal; build_gmp; build_mpfr; build_libnoise; build_nlopt;
-         build_onetbb; build_boost ;;
+         build_slvs; install_occt_headers; build_onetbb; build_boost ;;
   *) echo "unknown target $what" >&2; exit 1 ;;
 esac

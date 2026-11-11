@@ -141,6 +141,8 @@ vite.config.ts.timestamp-*
 # Build and dist directories
 build-wasm/
 build-wasm-mt/
+build-cad/
+build-cad-debug/
 web/public/wasm/*.wasm
 web/public/wasm/*.wasm.map
 web/public/wasm/*.js
@@ -178,7 +180,7 @@ web/public/wasm/*.sym
 web/public/wasm/*.wat
 web/public/wasm/tmp*
 
-# FullSpectrum fork checkout + build (see scripts/build-fullspectrum.sh)
+# Leftovers of the removed FullSpectrum engine (local checkouts only)
 /fullspectrum/
 /build-fs/
 /build-fs*.log
@@ -199,3 +201,4 @@ web/public/wasm/tmp*
 /deps/emsdk/
 /deps/boost-wasm/install/
 /toolchain/cgal-*/
+/toolchain/occt-headers-*/

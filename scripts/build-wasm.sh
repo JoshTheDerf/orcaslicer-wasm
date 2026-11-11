@@ -23,7 +23,7 @@ BUILD_DIR="build-wasm"; [[ "$VARIANT" == "debug" ]] && BUILD_DIR="build-wasm-deb
 THREADS=OFF
 if [[ "${WASM_THREADS:-0}" == "1" ]]; then THREADS=ON; BUILD_DIR="$BUILD_DIR-mt"; fi
 NPROC="${NPROC:-3}"
-ORCA_TAG="${ORCA_TAG:-v2.4.2}"
+ORCA_TAG="${ORCA_TAG:-v2.5.0}"
 
 # 1) Orca source at the pinned tag with the WASM patch applied (idempotent).
 if [[ ! -d orca/.git && ! -f orca/.git ]]; then

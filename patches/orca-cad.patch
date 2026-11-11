@@ -1,0 +1,150 @@
+diff --git a/src/libslic3r/CAD/CadDocument.cpp b/src/libslic3r/CAD/CadDocument.cpp
+index 7e85dd81e..609ebebb5 100644
+--- a/src/libslic3r/CAD/CadDocument.cpp
++++ b/src/libslic3r/CAD/CadDocument.cpp
+@@ -4036,9 +4036,18 @@ void CadDocument::route_feature(std::vector<CadBody>& bodies, const CadFeature&
+ void CadDocument::bind_expressions()
+ {
+     std::map<std::string, double> varvals = evaluate_variables(variables);
+-    for (CadFeature& f : features)
++    for (size_t fi = 0; fi < features.size(); ++fi) {
++        CadFeature& f = features[fi];
++        if (!f.expr.empty()) failed_feature = int(fi);   // CubbySlicer: the feature a binding error names
+         for (const auto& [field, e] : f.expr)
+             assign_field(f, field, eval_expr(e, varvals));
++    }
++    failed_feature = -1;
++}
++
++std::map<std::string, double> CadDocument::evaluate_variable_values(const std::map<std::string, std::string>& variables)
++{
++    return evaluate_variables(variables);
+ }
+ 
+ void CadDocument::replay_feature(size_t fi, std::vector<CadBody>& built)
+@@ -4067,8 +4076,16 @@ void CadDocument::replay_feature(size_t fi, std::vector<CadBody>& built)
+ }
+ 
+ bool CadDocument::recompute()
++{
++    const bool ok = recompute_impl();
++    if (replay_observer) replay_observer->finished(*this, ok);
++    return ok;
++}
++
++bool CadDocument::recompute_impl()
+ {
+     error.clear();
++    failed_feature = -1;
+     set_sketch_auto_close(auto_close_loops);   // this document's weld rule, not the last one's
+     detect_mate_conflicts();
+     std::vector<CadBody> built;
+@@ -4082,14 +4099,26 @@ bool CadDocument::recompute()
+     const bool any_solid_feature = std::any_of(features.begin(), features.end(), [](const CadFeature& f) {
+         return f.enabled && produces_body(f.type);
+     });
++    size_t replaying = features.size();   // CubbySlicer: the feature in the loop, for failed_feature
+     try {
+         bind_expressions();
+-        for (size_t fi = 0; fi < features.size(); ++fi)
++        const size_t start = replay_observer ? replay_observer->begin(*this, built) : 0;
++        for (size_t fi = start; fi < features.size(); ++fi) {
++            replaying = fi;
++            if (replay_observer && !replay_observer->before_feature(*this, fi, built))
++                throw std::runtime_error("rebuild cancelled");
+             replay_feature(fi, built);
++            if (replay_observer) replay_observer->after_feature(*this, fi, built);
++        }
++        replaying = features.size();
++        if (replay_observer && !replay_observer->replayed(*this, built))
++            throw std::runtime_error("rebuild cancelled");
+     } catch (const std::exception& e) {
++        if (replaying < features.size()) failed_feature = int(replaying);
+         error = *e.what() ? e.what() : _u8L("OCCT operation failed");
+         return false;
+     } catch (...) {
++        if (replaying < features.size()) failed_feature = int(replaying);
+         error = _u8L("unknown geometry error");
+         return false;
+     }
+@@ -4111,6 +4140,7 @@ bool CadDocument::recompute()
+                 : (features[src].name.empty() ? format(_u8L("feature %1%"), src + 1)
+                                               : features[src].name);
+         error = format(_u8L("body %1% was destroyed by %2% (the operation produced an empty shape)"), i + 1, fname);
++        if (src >= 0 && src < int(features.size())) failed_feature = src;
+         return false;
+     }
+ 
+@@ -4139,9 +4169,11 @@ bool CadDocument::recompute()
+     try {
+         for (CadFeature& f : features) {
+             if (!f.enabled) continue;   // a hidden feature keeps its pending re-point for when it returns
++            failed_feature = int(&f - features.data());
+             settle_body_refs(f, bodies, false);
+             f.body_refs_pending = false;
+         }
++        failed_feature = -1;
+     } catch (const std::exception& e) {
+         error = e.what();
+         return false;
+@@ -4361,6 +4393,16 @@ std::vector<std::pair<int, int>> CadDocument::faces_made_by(int index) const
+     } catch (...) {   // OCCT's Standard_Failure as well as std::exception
+         return out;
+     }
++    return faces_made_by(index, before, after);
++}
++
++std::vector<std::pair<int, int>> CadDocument::faces_made_by(int index, const std::vector<CadBody>& before,
++                                                            const std::vector<CadBody>& after) const
++{
++    std::vector<std::pair<int, int>> out;
++    if (index < 0 || index >= int(features.size()) || !features[index].enabled
++        || !produces_body(features[index].type) || bodies.empty())
++        return out;
+ 
+     // The bodies the step made or replaced. A face on any other body was on the boundary before
+     // the step too, so only these are probed after it.
+diff --git a/src/libslic3r/CAD/CadDocument.hpp b/src/libslic3r/CAD/CadDocument.hpp
+index 8adbd7b20..cdebfad60 100644
+--- a/src/libslic3r/CAD/CadDocument.hpp
++++ b/src/libslic3r/CAD/CadDocument.hpp
+@@ -858,7 +858,39 @@ public:
+     // that leaves no body, a hidden one, or a history that no longer rebuilds up to it.
+     std::vector<std::pair<int, int>> faces_made_by(int index) const;
+ 
++    // ---- CubbySlicer (cad.wasm bridge, patches/orca-cad.patch) ---------------------------------
++    // Observer of recompute()'s replay loop: progress, cancellation, the failing feature, and a
++    // cache of the running body list. Not owned, and not part of the document's value (a copy
++    // of the document copies the pointer: set it per instance). Every hook has a no-op default.
++    struct ReplayObserver {
++        virtual ~ReplayObserver() = default;
++        // After the parametric pass, before the first feature. May put features[0..k) and
++        // `built` back to the state a previous replay had right before features[k], and return
++        // k: the loop then starts there. 0 = replay everything.
++        virtual size_t begin(CadDocument& doc, std::vector<CadBody>& built) { (void)doc; (void)built; return 0; }
++        // Around replay_feature(fi). Returning false from before_feature cancels the rebuild
++        // (recompute() fails with "rebuild cancelled").
++        virtual bool before_feature(CadDocument& doc, size_t fi, const std::vector<CadBody>& built) { (void)doc; (void)fi; (void)built; return true; }
++        virtual void after_feature(CadDocument& doc, size_t fi, const std::vector<CadBody>& built) { (void)doc; (void)fi; (void)built; }
++        // Every feature replayed, before the finishing passes and tessellation; false = cancel.
++        virtual bool replayed(CadDocument& doc, const std::vector<CadBody>& built) { (void)doc; (void)built; return true; }
++        // recompute() is about to return `ok`.
++        virtual void finished(CadDocument& doc, bool ok) { (void)doc; (void)ok; }
++    };
++    ReplayObserver* replay_observer{nullptr};
++    // The feature the last recompute() failed on (its replay or its expression binding threw, or
++    // it destroyed its body), -1 when it succeeded or failed outside any one feature.
++    int failed_feature{-1};
++    // faces_made_by(index) from the body lists right before and right after features[index] in a
++    // replay of the current history (what faces_made_by(index) replays a scratch document for).
++    std::vector<std::pair<int, int>> faces_made_by(int index, const std::vector<CadBody>& before,
++                                                   const std::vector<CadBody>& after) const;
++    // The evaluator the parametric pass uses: every variable's value; throws std::runtime_error
++    // on the first one that does not evaluate (unknown identifier, cycle, syntax).
++    static std::map<std::string, double> evaluate_variable_values(const std::map<std::string, std::string>& variables);
++
+ private:
++    bool recompute_impl();
+     TopoDS_Wire build_sketch_wire(const CadFeature& sketch, bool closed_only = false) const;
+     // The planar region an Extrude sweeps: the sketch's outer loop with its inner loops as
+     // holes. Falls back to a face over build_sketch_wire() for the legacy profile/shape paths,

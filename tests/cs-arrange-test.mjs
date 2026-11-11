@@ -145,6 +145,50 @@ for (const settings of [{ distance: 0, enableRotation: false }, { distance: 4, e
   ok(same, `vertex subset arranges like the whole mesh (${JSON.stringify(settings)}) ${a.error ?? ''}${b.error ?? ''}`);
 }
 
+// ---- IDEX/IQEX parallel modes (ArrangeJob::prepare_imex_zones + ImexArranger) ----------------
+// Two heads side by side (Vivedino Xplorer IDEX shape): in Copy / Mirror the parts must stay in the
+// first head's zone (the left half), and in Mirror also clear of the carriage strip at its edge.
+const idex = { nozzle_diameter: ['0.4', '0.4'], is_imex: '1', imex_mode_names: ['primary', 'copy', 'mirror'],
+  imex_mode_active_tools: ['0:P', '0:P,1:C', '0:P,1:M'], imex_nozzle_clearance_x: '40', imex_tool_layout: 'front-left' };
+const six = Array.from({ length: 6 }, () => ({ mesh: box(30, 30, 10), transform: T(128, 128) }));
+const maxX = (res) => Math.max(...res.result.items.map((it) => rect(it, 30, 30).x1));
+r = arrange(six, {}, idex);
+ok(r.ok && !r.result.imex && maxX(r) > 140, `IDEX primary: whole bed (max x ${maxX(r).toFixed(1)})`);
+r = arrange(six, { plates: [{ locked: false, imexMode: 'copy' }] }, idex);
+ok(r.ok && r.result.imex && r.result.unplaced.length === 0 && maxX(r) <= 128 + 1e-6 && r.result.items.every((it) => rect(it, 30, 30).x0 >= -1e-6),
+   `IDEX copy plate: parts in the left zone (max x ${maxX(r).toFixed(1)} ≤ 128) ${r.error ?? ''}`);
+r = arrange(six, { plates: [{ locked: false, imexMode: 'mirror' }] }, idex);
+ok(r.ok && r.result.unplaced.length === 0 && maxX(r) <= 128 - 40 + 1e-6, `IDEX mirror plate: clear of the 40 mm carriage strip (max x ${maxX(r).toFixed(1)} ≤ 88)`);
+r = arrange(six, { mode: 'plate', plates: [{ locked: false, imexMode: 'copy' }] }, idex);
+ok(r.ok && maxX(r) <= 128 + 1e-6, `IDEX copy, arrange plate: left zone (max x ${maxX(r).toFixed(1)})`);
+// A plate without its own mode takes the process preset's imex_parallel_mode.
+r = arrange(six, {}, { ...idex, imex_parallel_mode: 'copy' });
+ok(r.ok && r.result.imex && maxX(r) <= 128 + 1e-6, `IDEX process mode copy: left zone (max x ${maxX(r).toFixed(1)})`);
+// Mixed plates: plate 0 copy, plate 1 primary; overflow stays fenced on plate 0.
+const many = Array.from({ length: 10 }, () => ({ mesh: box(50, 50, 10), transform: T(128, 128) }));
+r = arrange(many, { plates: [{ locked: false, imexMode: 'copy' }, { locked: false }] }, idex);
+const onP0 = r.result.items.filter((it) => it.plate === 0), onP1 = r.result.items.filter((it) => it.plate === 1);
+ok(r.ok && onP0.length > 0 && onP0.every((it) => rect(it, 50, 50).x1 <= 128 + 1e-6) && onP1.some((it) => rect(it, 50, 50).x1 > 128),
+   `IDEX copy plate 0 fenced (${onP0.length} parts, max x ${Math.max(...onP0.map((it) => rect(it, 50, 50).x1)).toFixed(1)}), primary plate 1 uses the whole bed`);
+
+// ---- Belt printers (init_arrange_params is_belt + prepare_belt_regions) -------------------------
+// belt_slice_rotation x: the belt runs along Y; parts pack from the top-left, the brim strip along
+// every edge stays free, and the purge prism neither moves nor blocks.
+const belt = { belt_printer: '1', belt_slice_rotation: 'x', belt_slice_rotation_angle: '45', brim_type: 'outer_only', brim_width: '5', brim_object_gap: '0', extra_brim_width: '0' };
+const three = Array.from({ length: 3 }, () => ({ mesh: b50, transform: T(128, 128) }));
+r = arrange(three, {}, belt);
+rs = r.result.items.map((it) => rect(it, 50, 50));
+const flat = arrange(three, {}, {});
+ok(r.ok && rs.every((q) => q.x0 >= 4 - 1e-6 && q.y0 >= 4 - 1e-6 && q.x1 <= 252 + 1e-6 && q.y1 <= 252 + 1e-6),
+   `belt: brim strips kept free (${rs.map((q) => `${q.x0.toFixed(1)}..${q.x1.toFixed(1)}×${q.y0.toFixed(1)}..${q.y1.toFixed(1)}`).join(' ')})`);
+// Belt order: one row across the belt (rotation x: belt along Y → equal Y; y: belt along X → equal X).
+ok(new Set(r.result.items.map((it) => it.y.toFixed(3))).size === 1 && new Set(flat.result.items.map((it) => it.y.toFixed(3))).size > 1,
+   `belt (x): parts in one row across the belt (y ${r.result.items.map((it) => it.y.toFixed(1))}; non-belt ${flat.result.items.map((it) => it.y.toFixed(1))})`);
+r = arrange(three, {}, { ...belt, belt_slice_rotation: 'y' });
+ok(new Set(r.result.items.map((it) => it.x.toFixed(3))).size === 1, `belt (y): parts in one row along Y (x ${r.result.items.map((it) => it.x.toFixed(1))})`);
+r = arrange([...three, { mesh: box(10, 200, 20), transform: T(240, 128), config: { belt_purge_tower_object: '1' } }], {}, { ...belt, enable_prime_tower: '1' });
+ok(r.ok && !r.result.items[3].moved && r.result.items.slice(0, 3).every((it) => it.moved), 'belt: the purge prism is left where it is');
+
 // Bad request is an error, not a trap.
 r = arrange(four, { mode: 'sideways' });
 ok(!r.ok && /mode/.test(r.error), 'unknown mode rejected');

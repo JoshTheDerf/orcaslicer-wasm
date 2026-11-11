@@ -1,0 +1,242 @@
+--- a/docs/ENGINE-CONTRACT.md
++++ b/docs/ENGINE-CONTRACT.md
+@@ -24,6 +24,9 @@
+   Python). Orca replaces the few sources that need them with failing stubs
+   (`orcaslicer-wasm/wasm/stubs/`) rather than shimming their headers; OCCT's
+   real *headers* (no code) are on the path for the CAD sketch sources only.
++  The separate modules link the real libraries instead of those stubs: the CAD
++  module OCCT, the texture module Assimp + OpenCV (see "Textured and coloured
++  model import"); the slicer engine links none of them.
+ * Link: `-sALLOW_MEMORY_GROWTH=1 -sMAXIMUM_MEMORY=4GB -sSTACK_SIZE=64MB
+   -sMALLOC=mimalloc|dlmalloc -sABORTING_MALLOC=0 -sSTACK_OVERFLOW_CHECK=1
+   -sMODULARIZE=1 -sEXPORT_ES6=1 -sENVIRONMENT=web,worker,node`.
+@@ -88,7 +91,9 @@
+ //   resolve_variants      (orca) per-extruder values of the extruder-variant vectors
+ //   wipe_tower_footprint  (orca) prime tower size + desktop placement for a plate (see "Prime tower")
+ //   repair_mesh           (orca) desktop "Fix model" / "Fix All" (CGAL repair_mesh, see "Mesh repair")
+-//   texture_displacement  (orca) bake Orca 2.5 texture displacement into a mesh
++//   texture_displacement  (orca) bake Orca 2.5 texture displacement into a mesh (+ its colour output,
++//                         see "Texture displacement")
++//   texture_displacement_palette  (orca) the colour panel's palette / limits, without baking
+ //   sketch                (orca) Design-tab sketch solver / inference / text + SVG import
+ //   inspect_3mf           OrcaSlicer's own 3MF loader on a project file (checks). Result:
+ //     {isOrca, isBbl, hasOrcaTag, objects:[{name, autoDrop, config, instances,
+@@ -408,14 +413,210 @@
+ 
+ Desktop bakes texture displacement into the volume's mesh **before** slicing;
+ the slicer itself sees an ordinary mesh. Hosts call `cs_tool`
+-`texture_displacement`: `meshes[0]` = the volume's base mesh (mesh-local),
+-`args {layers: <Orca's texture_displacement_layers_to_json text or object>,
+-images: {"<slot>": {offset, length}} (PNG bytes in the request blob),
+-paint: {"<slot>": [[triangle, hex], …]} (the layer's paint mask), transform?: [16]
+-mesh→world, anchor?: [x,y,z], restingDrop?: mm}` → `meshes[0]` = baked mesh,
+-`result {triangles, budgetLimited}`. Then slice that mesh. Not available: the
+-bake's colour output (`color_enabled` layers; it needs the GUI's palette
+-quantizer).
++`texture_displacement`, then slice the returned mesh with the returned paint.
++
++```jsonc
++meshes[0]: the volume's base (undisplaced) mesh, mesh-local
++args: {
++  "layers": <texture_displacement_layers_to_json text or object {version, options, layers}>,
++                                   // options carry the colour settings: color_mix_enabled ("Mix filaments",
++                                   // default true), color_mix_count ("Mixed colors", default 8),
++                                   // color_despeckle ("Denoise", 0..6, default 2); a layer colours with color_enabled
++  "images": { "<slot>": { "offset", "length" } },   // the layer's PNG bytes in the request blob (grey or colour, 8/16-bit)
++  "paint":  { "<slot>": [[triangle, hex], …] },      // the layer's paint mask (TriangleSelector strings)
++  "transform": [16],               // optional, column-major mesh → world (instance × volume); default identity
++  "anchor": [x, y, z],             // optional world anchor (every part of a multibody object passes the same)
++  "restingDrop": 0,                // optional mm the object's lowest point lies below this volume's
++  // additive (TextureDisplacementBakeJob):
++  "volumePaint": { "support"|"seam"|"color"|"fuzzy": [[triangle, hex], …] },  // the volume's other paint
++  "modelUv": { "offset", "length" },  // optional: the model's own UV channel (ModelVolume::texture_uv), float32
++                                      // u,v × 3 per base triangle (length = triangles × 24, 4-aligned); ModelUV
++                                      // layers map through it (without it they fall back to Triplanar)
++  "color": { "config": {           // optional: turns on the "Colors" output. The project's filament slots:
++    "filament_colour": [...],      //   every slot, physical first, mixed at the tail
++    "filament_is_mixed": [...], "filament_mixed_components": [...],
++    "filament_mixed_sublayer_ratios": [...], "filament_mixed_gradient": [...] } }
++}
++→ meshes[0]: the baked mesh
++  result: {
++    "triangles", "budgetLimited", "trianglesRefined"?, "trianglesBudget"?,   // budget message numbers when limited
++    "moved": bool,                 // false: nothing displaced; desktop then keeps the paint and changes nothing
++    "topologyChanged": bool,       // the default pipeline rebuilds the mesh (pipeline_v2), the classic one does not
++    "clearSlots": [0, …],          // layer masks the commit clears (all after a rebuild, else the baked layers')
++    "paint": { "support"?, "seam"?, "color"?, "fuzzy"? },   // the volume's paint on the baked mesh: carried over
++                                   // (transfer_facet_paint) when the topology changed, the bake's colour merged
++                                   // OVER the colour paint (unpainted triangles keep the volume's own filament)
++    "colors"?: {                   // only when `color` was given and a layer colours (colour image, color_enabled)
++      "palette": [{ "color": "#RRGGBB", "a", "b", "num", "den", "filament" }],
++                                   // a = b: filament a (0-based physical); else a mix of a and b, a's share num/den;
++                                   // filament = the 0-based slot it prints in (-1 = unused mix)
++      "newMixedFilaments": [{ "slot", "components": [1-based a, b], "ratios": [a%, b%], "color" }],
++                                   // mixes the result paints with and the project has no fixed slot for
++                                   // (Sidebar::ensure_mixed_filament): append them as mixed slots, in this order,
++                                   // at these slot numbers (after every existing slot)
++      "paintedTriangles": n
++    }
++  }
++  blobs: { "triangleColor"?: uint8 per baked triangle (palette entry + 1, 0 = not coloured),
++           "modelUv"?: float32 × 6 per baked triangle (the UV channel resampled onto the new triangles) }
++```
++
++A mix is used only where it beats the nearest single filament by ΔE00 2; a
++layer whose image is made of flat colours (tiles, logos) prints in single
++filaments only (`flatColors`). The palette, its ranking of mixes (greedy over
++the colouring layers' colour histogram, every pair at ratios n/d, d ≤ 6) and
++the 24³ lookup cube are desktop's `GLGizmoTextureDisplacement` code; at most
++32 states (ExtruderMax), so `maxMixes` = 32 − physical filaments.
++
++`cs_tool` `texture_displacement_palette` is the gizmo's colour panel without
++baking: `args {layers, images, color: {config}}` (as above) → `result {layers:
++[{slot, hasColor, flatColors, flatShare}], anyColor, filaments (physical count),
++maxMixes, palette: [{color, a, b, num, den}]}` — "Colors" is offered only for a
++layer with `hasColor`; "N printable colors from M filaments" = `palette.length`
++/ `filaments`; the "Mixed colors" slider runs 1..`maxMixes`.
++
++`cs_tool` responses may carry `"blobs": {name: {offset, length}}`: named byte
++ranges of the output blob after the meshes (each 4-aligned).
++
++## Textured and coloured model import (orca 2.5, texture module)
++
++Desktop 2.5 imports glTF / GLB / FBX through Assimp, and any model that
++carries a texture, vertex colours or OBJ material colours opens the **Import
++Model** dialog: reduce the colours to a Color Count, smooth them, map each to a
++project filament (adding filaments, or mixed filaments with one-click CMYW /
++RYBW auto-mix), and the result becomes colour paint. That needs Assimp and
++OpenCV, so it lives in a **separate, lazily loaded module** next to the
++slicer, `public/wasm/texture/` (`scripts/fetch-texture-wasm.sh`):
++
++```
++texture.mjs     ES module factory (default export, EXPORT_NAME OrcaTextureModule)
++texture.wasm    single-threaded (no pthreads variant; the import runs once per model)
++texture.data    preloaded resources/filament_mixing (CMYW / RYBW recipe tables)
++version.json    {"module":"orca-texture","abi":1,"orca":"2.5.0","assimp":"5.4.3","opencv":"4.14.0","build"}
++```
++
++The slicer engine does not contain it; a host that never imports such a model
++never downloads it. Same build invariants as the engine (native Wasm EH, no
++function-pointer-cast emulation, dlmalloc, 4 GB max heap, 64 MB stack); Assimp
++(importers glTF/GLB, OBJ, FBX only, as Orca's deps) and OpenCV (core, imgproc,
++imgcodecs; PNG/JPEG through the same Emscripten ports the engine uses) are real
++libraries built by the port's toolchain.
++
++```c
++const char* tex_version(void);                   // version.json, NUL-terminated
++int  tex_call(const char* req_json, int req_len, const uint8_t* blob, int blob_len,
++              char** out_json, int* out_len, uint8_t** out_blob, int* out_blob_len);
++void tex_free(void* p);
++```
++
++`tex_call` follows `cs_tool`: request `{op, args}` + blob; response `{ok, error,
++result, meshes: [{vertexOffset, vertexCount, indexOffset, triangleCount}],
++blobs: {name: {offset, length}}}` + one output blob (meshes: float32 xyz then
++uint32 triangles; then the named blobs; each part 4-aligned). rc 0 = ok.
++Progress: `Module.csProgress(percent, message)`. A model **session** (`handle`)
++keeps the loaded textured mesh and its last analysis inside the instance (at
++most 16; `close` frees one). Filament indices are **0-based** in results, paint
++states 1-based, as everywhere. Desktop's flow, op by op:
++
++**`load`** (Model::read_from_file's textured branches; the dialog's preview data)
++```jsonc
++args: { "files": [{ "name", "offset", "length" }],   // files[0] = the model: .glb .gltf .fbx .obj; the rest are
++                                                     // what it references under their relative names (.bin,
++                                                     // .mtl, "textures/a.jpg"); no absolute paths, no ".."
++        "texturePixels": true }                      // false: skip the decoded RGBA blobs
++→ result: { "handle", "format": "glb"|"gltf"|"fbx"|"obj",
++            "importable": bool,          // desktop opens the dialog only when true (a texture with data, or
++                                         // vertex / MTL face colours); false = import the geometry as is
++            "source": "texture"|"faceColors"|null,
++            "objectTriangles", "texturedTriangles"?, "hasModelUv",
++            "materials": [{ "rgba": [r,g,b,a], "texture": index | -1 }],
++            "textures"?: [{ "width", "height", "encodedBytes", "pixels"?: blob name }] }
++  meshes[0]: the object's geometry (glTF/FBX: Assimp's triangles merged / cleaned like desktop; OBJ: Orca's
++             OBJ loader), in the FILE's frame and units (desktop then centres it and may offer a
++             metres / inches conversion; do the same and remember the transform)
++  meshes[1]: (importable) the textured mesh the analysis and the preview blobs index
++  blobs: "originalColors" uint8 RGB per textured triangle (the dialog's "Original" view: precomputed
++           colours, else sampled from the textures / material colours),
++         "uv" float32 6 per textured triangle, "faceTexture" int32 per triangle (texture index, -1 none),
++         "texture<i>" RGBA8 width×height (decoded), "modelUv" (OBJ) float32 6 per object triangle =
++           ModelVolume::texture_uv (V flipped), for Texture Displacement's ModelUV mapping
++```
++Errors: "The file format is incompatible and cannot be parsed." (Assimp),
++the OBJ loader's message, "unsupported model file".
++
++**`analyze`** (texture_to_painting / face_colors_to_painting)
++```jsonc
++args: { "handle", "colorCount": 0,      // 0 = automatic (desktop's first run), else 1..32
++        "smooth": 5,                    // 0..10 (smooth_weight = smooth / 10)
++        "repair": "ask"|"none"|"repair" }   // desktop starts with "ask"
++→ result: { "needsRepairDecision": true }   // non-manifold mesh with "ask": show desktop's choice
++                                            // ("Import without repair" → "none", "Repair and import" → "repair")
++  or      { "needsRepairDecision": false, "clusters": ["#RRGGBB"…], "clusterTriangles": [n…],
++            "colorCount", "triangles" }
++  meshes[0]: the painted mesh (subdivided / repaired; it REPLACES the object's mesh on apply)
++  blobs: "faceCluster" uint8 per painted triangle (index into clusters)
++```
++After an automatic run desktop sets the Color Count control to
++`colorCount` when it is 2..32. Errors: "Computation failed. Please adjust
++parameters and retry." (desktop falls back to a geometry-only import on the
++first run).
++
++**`match`** (do_auto_match + compaction + rows by filament, then apply_auto_standard_mix)
++```jsonc
++args: { "handle" | "clusters": ["#hex"…],
++        "filaments": [{ "color", "name"?, "type"?, "presetName"?,      // the project's slots, in order
++                        "mixed"?: bool, "components"?: "1,3"|[1,3], "ratios"?: "0.5000,0.5000"|[50,50] }],
++        "autoMerge": true,                  // "Auto-merge same filament"
++        "autoMix": "none"|"cmyw"|"rybw",    // the one-click auto-mix (none = "reset auto-mix")
++        "defaultPresetName": "" }           // preset for new filaments (desktop: the printer's
++                                            // default_filament_profile starting "Bambu PLA Basic", …)
++→ result: { "entries": [Entry…], "matches": [Match…], "dropped": bool, "autoMixApplied": bool }
++Entry: { "kind": "existing"|"existingMixed"|"new"|"newMixed", "project"?: slot (existing kinds),
++         "color", "name", "type", "presetName"?, "components"?: [1-based ENTRY indices], "ratios"?: [percent] }
++Match: { "cluster": index into clusters, "color": cluster "#hex", "filament": entry index, "deltaE" }
++```
++Entries are the dialog's filament list (existing slots first, then new ones);
++matches are its rows, in display order. Auto-merge on: each colour takes the
++nearest project filament (CIEDE2000), a new filament where ΔE > 5; off: one new
++filament per colour. Auto-mix replaces every row it has a recipe for by a new
++mixed filament of standard "Bambu PLA Basic" base colours (reusing a matching
++existing physical / mixed entry). `dropped` = the 32-filament cap was hit
++(desktop's orange warning). The host owns this state: a manual row change is
++`matches[i].filament = entry`, then pass entries + matches on.
++
++**`add_mixed`** (add_decomposed_mixed_filament: the row's colour-decompose dialog, recipe from
++`cs_tool` `mixed_filament` `recommend`)
++```jsonc
++args: { "entries", "matches", "row", "components": [{ "filament": existing physical entry } | { "color": "#hex" }],
++        "ratios": [percent…], "color": matched "#hex", "defaultPresetName"? }
++→ result: { entries, matches, dropped, autoMixApplied }   // a component colour reuses an official
++                                                         // "Bambu … Basic" entry of that colour, else a new one
++```
++
++**`apply`** (on_ok_clicked + Plater::apply_textured_mesh_import_result + apply_painted_mesh_to_volume)
++```jsonc
++args: { "handle", "entries", "matches" }      // every match must name an entry
++→ result: {
++    "newFilaments": [{ "index", "color", "presetName", "name" }],   // add as physical slots at these indices
++    "newMixedFilaments": [{ "index", "components": [1-based final], "ratios": [percent], "color" }],
++                                   // then as mixed slots (e.g. cs_tool mixed_filament expand)
++    "remap": [final slot per entry], "matches": [{ cluster, color, filament: final slot }],
++    "extruder": 1-based | null,    // the lowest filament the paint uses: the object's and the part's "extruder"
++    "paint": { "color": [[triangle, hex]…] },   // the slice job's paint.color for meshes[0]
++    "triangles" }
++  meshes[0]: the painted mesh, in the same file frame as load's meshes[0]: replace the object's (first model
++             part's) mesh with it under the transform the host gave the loaded mesh, drop to bed
++  blobs: "faceFilament" uint8 per triangle (paint state), "modelUv"? (OBJ: resampled onto the new triangles)
++```
++Unused new entries are pruned first. New physical filaments go after the
++existing physical ones, so **existing mixed slots move up** by
++`newFilaments.length` (`remap` gives their new numbers; renumber other paint
++/ extruder references to them the way adding a physical filament does); new
++mixed slots follow every existing slot. **`close`** `{handle}`.
++
++Limits: 256 input files; 32 filaments (ExtruderMax); 255 clusters per `match`.
++Not reproduced: desktop's GL preview itself (the host draws it from the blobs),
++the dialog's progress-dialog cancel (terminate the worker instead).
+ 
+ ## Prime tower (orca)
+ 

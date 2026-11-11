@@ -47,8 +47,9 @@ jobs:
         with:
           path: |
             toolchain/install
-            toolchain/cgal-5.6.3
+            toolchain/cgal-6.2.1
             toolchain/cgal-6.1
+            toolchain/occt-headers-8.0.1
           key: deps-${{ runner.os }}-${{ hashFiles('toolchain/build-deps.sh', 'toolchain/env.sh', 'toolchain/bootstrap.sh') }}
       - name: Build dependencies
         if: steps.deps.outputs.cache-hit != 'true'
@@ -88,56 +89,3 @@ jobs:
           files: dist/*
           generate_release_notes: true
 
-  fullspectrum:
-    needs: orca   # reuses the toolchain / dependency caches the orca job saved
-    runs-on: ubuntu-24.04
-    timeout-minutes: 360
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          fetch-depth: 1
-      - uses: actions/setup-node@v4
-        with:
-          node-version: '22'
-      - name: System packages
-        run: sudo apt-get update -qq && sudo apt-get install -y --no-install-recommends build-essential m4 xz-utils unzip curl git python3 ccache
-      - uses: actions/cache/restore@v4
-        with:
-          path: |
-            toolchain/emsdk
-            toolchain/cmake
-            toolchain/tools
-          key: tools-${{ runner.os }}-${{ hashFiles('toolchain/bootstrap.sh') }}
-          fail-on-cache-miss: true
-      - uses: actions/cache/restore@v4
-        with:
-          path: |
-            toolchain/install
-            toolchain/cgal-5.6.3
-            toolchain/cgal-6.1
-          key: deps-${{ runner.os }}-${{ hashFiles('toolchain/build-deps.sh', 'toolchain/env.sh', 'toolchain/bootstrap.sh') }}
-          fail-on-cache-miss: true
-      - name: Cache ccache
-        uses: actions/cache@v4
-        with:
-          path: toolchain/ccache-cache
-          key: ccache-fs-${{ runner.os }}-${{ github.run_id }}
-          restore-keys: ccache-fs-${{ runner.os }}-
-
-      - name: Build engine
-        run: NPROC=4 bash scripts/build-fullspectrum.sh
-
-      - name: Test
-        run: node tests/cs-fs-test.mjs build-fs
-
-      - name: Package
-        run: |
-          mkdir -p dist
-          cp build-fs/slicer.mjs build-fs/slicer.wasm build-fs/schema.json build-fs/version.json dist/
-          [ -f build-fs/slicer.data ] && cp build-fs/slicer.data dist/ || true
-          tar -C fullspectrum/resources -czf dist/profiles.tar.gz profiles
-      - uses: actions/upload-artifact@v4
-        with:
-          name: fullspectrum-wasm-${{ github.sha }}
-          path: dist/
-          retention-days: 30

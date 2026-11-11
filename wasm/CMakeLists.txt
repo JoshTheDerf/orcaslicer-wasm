@@ -49,7 +49,7 @@ if(ORCA_WASM_THREADS AND NOT WASM_DEPS_PREFIX MATCHES "/install-mt$")
 elseif(NOT ORCA_WASM_THREADS AND WASM_DEPS_PREFIX MATCHES "/install-mt$")
   message(FATAL_ERROR "single-threaded build must not use ${WASM_DEPS_PREFIX}")
 endif()
-set(WASM_CGAL_PREFIX "$ENV{WASM_DEPS_ROOT}/cgal-5.6.3" CACHE PATH "" FORCE)   # orca pins CGAL 5.6.3
+set(WASM_CGAL_PREFIX "$ENV{WASM_DEPS_ROOT}/cgal-6.2.1" CACHE PATH "" FORCE)   # orca 2.5 pins CGAL 6.2.1
 set(WASM_SHIMS_DIR "${CMAKE_CURRENT_LIST_DIR}/wasm_shims" CACHE PATH "" FORCE)
 set(EM_EH "$ENV{WASM_EH_FLAGS}")
 if(NOT EM_EH)
@@ -105,53 +105,112 @@ endif()
 include_directories(SYSTEM "${WASM_DEPS_PREFIX}/include" "${WASM_DEPS_PREFIX}/include/eigen3")
 
 # Emscripten ports: at compile time too, so a fresh emsdk fetches their headers (jpeglib.h, png.h, …).
-add_compile_options(-sUSE_ZLIB=1 -sUSE_LIBPNG=1 -sUSE_LIBJPEG=1 -sUSE_FREETYPE=1)
+add_compile_options(-sUSE_ZLIB=1 -sUSE_LIBPNG=1 -sUSE_LIBJPEG=1)
 
 add_compile_definitions(
   WASM_BUILD=1
   BOOST_LOG_STATIC_LINK
   BOOST_ALL_NO_LIB
   BOOST_NO_CXX98_FUNCTION_BASE
-  ORCA_DISABLE_OPENVDB=1
+  SLIC3R_NO_OCCT=1
   _LIBCPP_ENABLE_CXX17_REMOVED_FEATURES=1
   _LIBCPP_DISABLE_DEPRECATION_WARNINGS=1)
 
 # ---- orca configuration ------------------------------------------------------
-# ORCA_SRC_DIR: the OrcaSlicer tree to build (default ../orca). Forks with the
-# same libslic3r layout build the same way, e.g. ../fullspectrum (engine id
-# CS_ENGINE_ID=fullspectrum).
-set(ORCA_SRC_DIR "${CMAKE_CURRENT_LIST_DIR}/../orca" CACHE PATH "OrcaSlicer source tree")
-set(CS_ENGINE_ID "orca" CACHE STRING "Engine id reported by cs_version")
-set(SLIC3R_WITH_ASSIMP OFF CACHE BOOL "" FORCE)
+set(ORCA_SRC_DIR "${CMAKE_CURRENT_LIST_DIR}/../orca")
+set(ORCA_LIBSLIC3R "${ORCA_SRC_DIR}/src/libslic3r")
 set(SLIC3R_STATIC ON CACHE BOOL "" FORCE)
 set(SLIC3R_GUI OFF CACHE BOOL "" FORCE)
+# OFF: the Design tab's B-rep kernel needs OCCT, which is not linked. The parts
+# of libslic3r/CAD that don't touch OCCT are added back below.
+set(SLIC3R_CAD OFF CACHE BOOL "" FORCE)
 set(SLIC3R_PCH OFF CACHE BOOL "" FORCE)
+# 2.5 turns every clang warning into an error for its own targets; that gate is
+# upstream CI's, not this cross build's.
+set(SLIC3R_WARNINGS OFF CACHE BOOL "" FORCE)
 set(SLIC3R_NLS OFF CACHE BOOL "" FORCE)
 set(SLIC3R_ENC_CHECK OFF CACHE BOOL "" FORCE)
-set(SLIC3R_WITH_OCCT OFF CACHE BOOL "" FORCE)
-set(SLIC3R_WITH_OPENCV OFF CACHE BOOL "" FORCE)
-set(SLIC3R_WITH_DRACO OFF CACHE BOOL "" FORCE)
 set(BUILD_TESTS OFF CACHE BOOL "" FORCE)
 set(ORCA_TOOLS OFF CACHE BOOL "" FORCE)
+set(ORCA_BUILD_PYTHON_STUBGEN_MODULE OFF CACHE BOOL "" FORCE)
 set(ORCA_CHECK_GCODE_PLACEHOLDERS "0" CACHE STRING "" FORCE)
-if(NOT ORCA_WASM_THREADS)
-  set(CMAKE_DISABLE_FIND_PACKAGE_TBB ON)
-endif()
 include(${CMAKE_CURRENT_LIST_DIR}/cmake/FindTBB.cmake)  # shim or real TBB::* targets
 
 add_subdirectory(${ORCA_SRC_DIR} ${CMAKE_BINARY_DIR}/orca-build EXCLUDE_FROM_ALL)
 
+# libslic3r sources that need a library this build does not link. Each is
+# replaced by a stub in wasm/stubs/ with the same symbols (failing cleanly), so
+# the rest of libslic3r compiles unpatched:
+#   OCCT     Format/STEP.cpp, Format/svg.cpp     → stubs/formats.cpp
+#   Draco    Format/DRC.cpp                      → stubs/formats.cpp
+#   Assimp   Format/AssimpImport.cpp             → stubs/formats.cpp
+#   OpenCV   TexturePainting.cpp, TextureToColor/*, ObjColorUtils.cpp → stubs/texture_painting.cpp
+#   OpenVDB  SLA/Hollowing.cpp                   → stubs/sla_hollowing.cpp
+get_target_property(_slic3r_src libslic3r SOURCES)
+list(REMOVE_ITEM _slic3r_src
+  Format/STEP.cpp Format/svg.cpp Format/DRC.cpp Format/AssimpImport.cpp
+  TexturePainting.cpp TextureToColor/TextureToColor.cpp TextureToColor/ColorUtils.cpp
+  ObjColorUtils.cpp SLA/Hollowing.cpp)
+set_property(TARGET libslic3r PROPERTY SOURCES ${_slic3r_src})
+target_sources(libslic3r PRIVATE
+  ${CMAKE_CURRENT_LIST_DIR}/stubs/formats.cpp
+  ${CMAKE_CURRENT_LIST_DIR}/stubs/texture_painting.cpp
+  ${CMAKE_CURRENT_LIST_DIR}/stubs/sla_hollowing.cpp
+  ${CMAKE_CURRENT_LIST_DIR}/stubs/nanosvg.cpp)   # (the GUI normally instantiates nanosvg)
+
+# libslic3r/CAD without the OCCT kernel (SLIC3R_CAD=OFF drops all of CAD/): the
+# SolveSpace sketch solver + constraint inference, the SVG/text → sketch importer,
+# the legacy constraint model and the thread tables. SketchSolver/SketchInference
+# include SketchEngine.hpp, which names OCCT value types, so they (and the bridge,
+# which exposes them as cs_tool "sketch") compile against OCCT's HEADERS; no OCCT
+# code is linked, and wasm-ld rejects any reference to it.
+set(WASM_OCCT_HEADERS "$ENV{WASM_DEPS_ROOT}/occt-headers-8.0.1/include/occt" CACHE PATH "" FORCE)
+if(NOT EXISTS "${WASM_OCCT_HEADERS}/Standard_Version.hxx")
+  message(FATAL_ERROR "OCCT headers missing — bash wasm-deps/build-deps.sh occt-headers")
+endif()
+find_package(SLVS REQUIRED)
+set(_cad_occt_src ${ORCA_LIBSLIC3R}/CAD/SketchSolver.cpp ${ORCA_LIBSLIC3R}/CAD/SketchInference.cpp
+                  ${CMAKE_CURRENT_LIST_DIR}/stubs/cad_sketch.cpp)
+target_sources(libslic3r PRIVATE
+  ${ORCA_LIBSLIC3R}/CAD/SketchConstraints.cpp
+  ${ORCA_LIBSLIC3R}/CAD/SketchImport.cpp
+  ${ORCA_LIBSLIC3R}/CAD/ThreadStandards.cpp
+  ${_cad_occt_src})
+set_source_files_properties(${_cad_occt_src} DIRECTORY ${ORCA_LIBSLIC3R}
+  PROPERTIES COMPILE_OPTIONS "-isystem;${WASM_OCCT_HEADERS}")
+target_link_libraries(libslic3r PUBLIC SLVS::slvs)
+
 # VoronoiUtilsCgal.cpp lives in libslic3r but needs the (real) CGAL headers;
 # scope the include to that one file so the rest of libslic3r is unaffected.
 set_source_files_properties(
-  ${ORCA_SRC_DIR}/src/libslic3r/Geometry/VoronoiUtilsCgal.cpp
-  DIRECTORY ${ORCA_SRC_DIR}/src/libslic3r
-  PROPERTIES COMPILE_OPTIONS "-isystem;${WASM_CGAL_PREFIX}/include;-frounding-math")
+  ${ORCA_LIBSLIC3R}/Geometry/VoronoiUtilsCgal.cpp
+  DIRECTORY ${ORCA_LIBSLIC3R}
+  PROPERTIES COMPILE_OPTIONS "-isystem;${WASM_CGAL_PREFIX}/include;-frounding-math;-DBOOST_NUMERIC_INTERVAL_HW_ROUNDING_HPP")
+# ^ CGAL 6.2's Surface_sweep_2 headers pull in Boost.Interval (via the algebraic
+#   kernel this file never instantiates), whose hw_rounding.hpp #errors on wasm:
+#   WebAssembly has no directed rounding (boost/config/platform/wasm.hpp sets
+#   BOOST_NO_FENV_H). Skipping that header leaves Boost's generic round-to-nearest
+#   rounding_control, which is what wasm does anyway.
+
+if(NOT ORCA_WASM_THREADS)
+  # Orca 2.5 builds CGAL with CGAL_LINKED_WITH_TBB everywhere (it changes
+  # Kd_tree's layout). The sequential shim is not oneTBB, so the single-thread
+  # build drops the define from every target consistently.
+  foreach(_t libslic3r libslic3r_cgal)
+    foreach(_p COMPILE_DEFINITIONS INTERFACE_COMPILE_DEFINITIONS)
+      get_target_property(_defs ${_t} ${_p})
+      if(_defs)
+        list(REMOVE_ITEM _defs CGAL_LINKED_WITH_TBB)
+        set_property(TARGET ${_t} PROPERTY ${_p} ${_defs})
+      endif()
+    endforeach()
+  endforeach()
+endif()
 
 set(ORCA_WASM_ASSERT_DIRS "" CACHE STRING "libslic3r subdirs (e.g. Arachne) compiled with assert() enabled")
 foreach(_d ${ORCA_WASM_ASSERT_DIRS})
-  file(GLOB _asrc ${ORCA_SRC_DIR}/src/libslic3r/${_d}/*.cpp)
-  set_source_files_properties(${_asrc} DIRECTORY ${ORCA_SRC_DIR}/src/libslic3r
+  file(GLOB _asrc ${ORCA_LIBSLIC3R}/${_d}/*.cpp)
+  set_source_files_properties(${_asrc} DIRECTORY ${ORCA_LIBSLIC3R}
     PROPERTIES COMPILE_OPTIONS "-UNDEBUG;-g")
 endforeach()
 
@@ -165,17 +224,18 @@ if(TARGET mcut)
 endif()
 
 # ---- engine module ------------------------------------------------------------
-add_executable(slicer ../bridge/cs_bridge.cpp ${CMAKE_CURRENT_LIST_DIR}/../bridge/common/cs_fast_strtod.cpp)
+add_executable(slicer ../bridge/cs_bridge.cpp ../bridge/cs_hooks.cpp ../bridge/common/cs_fast_strtod.cpp)
 set_target_properties(slicer PROPERTIES OUTPUT_NAME "slicer" SUFFIX ".mjs")
 target_include_directories(slicer PRIVATE
   ${ORCA_SRC_DIR}/src
   ${ORCA_SRC_DIR}/deps_src
   ${CMAKE_BINARY_DIR}/orca-build/src/libslic3r
   ${CMAKE_CURRENT_LIST_DIR}/../bridge/common)
+target_include_directories(slicer SYSTEM PRIVATE ${WASM_OCCT_HEADERS})  # sketch types only (see CAD above)
 target_link_libraries(slicer PRIVATE libslic3r libslic3r_cgal ${Boost_LIBRARIES}
   "${WASM_DEPS_PREFIX}/lib/libmpfr.a" "${WASM_DEPS_PREFIX}/lib/libgmp.a")
-target_compile_definitions(slicer PRIVATE CS_ENGINE_ID="${CS_ENGINE_ID}")
 if(ORCA_WASM_THREADS)
+  target_sources(slicer PRIVATE ${CMAKE_CURRENT_LIST_DIR}/stubs/pthread_setname.c)
   target_link_libraries(slicer PRIVATE TBB::tbb TBB::tbbmalloc)
   target_compile_definitions(slicer PRIVATE CS_ENGINE_THREADS=1)
 endif()
@@ -193,7 +253,7 @@ set(_link
   -sEXPORT_ES6=1
   -sEXPORT_NAME=OrcaModule
   -sENVIRONMENT=web,worker,node
-  -sUSE_ZLIB=1 -sUSE_LIBPNG=1 -sUSE_LIBJPEG=1 -sUSE_FREETYPE=1
+  -sUSE_ZLIB=1 -sUSE_LIBPNG=1 -sUSE_LIBJPEG=1
   -sFILESYSTEM=1
   # Module hooks the host passes in (anything not listed is silently ignored in
   # release builds): the web worker uses instantiateWasm + getPreloadedPackage,
@@ -201,18 +261,18 @@ set(_link
   # (INCOMING_MODULE_JS_API / EXPORTED_FUNCTIONS are appended below per variant.)
   -sEXIT_RUNTIME=0
   "-sEXPORTED_RUNTIME_METHODS=['HEAPU8','HEAP32','HEAPU32','UTF8ToString','stringToUTF8','lengthBytesUTF8','FS']"
-  # libslic3r reads only resources/info (nozzle tables) and resources/flush
-  # (MM flush matrices) at slice time — ~40 KB. Profiles are resolved in JS.
+  # libslic3r reads resources/info (nozzle tables), resources/flush (MM flush
+  # matrices) and resources/filament_mixing at run time. Profiles are resolved in JS.
   "--preload-file=${ORCA_SRC_DIR}/resources/info@/resources/info"
+  "--preload-file=${ORCA_SRC_DIR}/resources/flush@/resources/flush"
+  # Mixed-filament colour recipes / lab-measured blends (FilamentMixer, ColorDecomposeRecipe), 250 KB.
+  "--preload-file=${ORCA_SRC_DIR}/resources/filament_mixing@/resources/filament_mixing"
 )
-if(EXISTS "${ORCA_SRC_DIR}/resources/flush")  # not in every fork (FullSpectrum has none)
-  list(APPEND _link "--preload-file=${ORCA_SRC_DIR}/resources/flush@/resources/flush")
-endif()
 # Module hooks the host passes in (anything not listed is silently ignored in
 # release builds) and the engine ABI exports — shared by both variants; the
 # pthreads build appends its extras below.
 set(_incoming "'locateFile','print','printErr','instantiateWasm','wasmBinary','getPreloadedPackage','onAbort','monitorRunDependencies','setStatus'")
-set(_exports "'_cs_version','_cs_describe_config','_cs_slice','_cs_eval_condition','_cs_orient','_cs_tool','_cs_free','_malloc','_free'")
+set(_exports "'_cs_version','_cs_describe_config','_cs_slice','_cs_eval_condition','_cs_orient','_cs_tool','_cs_hook_query','_cs_free','_malloc','_free'")
 if(ORCA_WASM_THREADS)
   # Worker pool. The host's engine Web Worker is the main runtime thread; it
   # starts each slice on a dedicated pthread (cs_slice_start) and returns to
@@ -249,3 +309,10 @@ else()
   list(APPEND _link ${ORCA_WASM_LINK_OPT} -sSTACK_OVERFLOW_CHECK=2)
 endif()
 target_link_options(slicer PRIVATE ${_link})
+
+# Design-tab CAD kernel (separate module, OCCT linked): only when asked for, in its own build
+# dir (scripts/build-cad.sh → build-cad/). OFF leaves the slicer configuration unchanged.
+option(ORCA_WASM_CAD "Also configure the cad target (Design-tab B-rep kernel, needs wasm-deps/occt-8.0.1)" OFF)
+if(ORCA_WASM_CAD)
+  include(${CMAKE_CURRENT_LIST_DIR}/cad.cmake)
+endif()
