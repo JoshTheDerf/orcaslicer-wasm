@@ -288,7 +288,7 @@ if(ORCA_WASM_THREADS)
   # mainScriptUrlOrBlob: where pthread workers load slicer.mjs from when the
   # host bundles/relocates it (Module.csThreads is read directly by mt_pre.js).
   string(APPEND _incoming ",'mainScriptUrlOrBlob'")
-  string(APPEND _exports ",'_cs_slice_start','_cs_thread_count'")
+  string(APPEND _exports ",'_cs_slice_start','_cs_tool_start','_cs_thread_count'")
 endif()
 list(APPEND _link "-sINCOMING_MODULE_JS_API=[${_incoming}]" "-sEXPORTED_FUNCTIONS=[${_exports}]")
 if(BUILD_VARIANT STREQUAL "debug")

@@ -184,13 +184,105 @@ function png(w, h, f) { // 8-bit greyscale
 {
   const img = png(64, 64, (x, y) => ((x >> 3) + (y >> 3)) % 2 ? 255 : 0);
   const all = tool('paint_from_states', { states: Array.from({ length: 12 }, (_, t) => [t, 1]) }, [cube]).result.paint;
-  const td = tool('texture_displacement', (off) => ({ layers: { version: 1, options: {}, layers: [{ slot: 0, depth_mm: 1, tiling_scale: 8 }] },
-    images: { 0: { offset: off, length: img.length } }, paint: { 0: all } }), [cube], img);
+  const tdArgs = (extra = {}, options = {}) => (off) => ({ layers: { version: 1, options, layers: [{ slot: 0, depth_mm: 1, tiling_scale: 8 }] },
+    images: { 0: { offset: off, length: img.length } }, paint: { 0: all }, ...extra });
+  const progress = [];
+  mod.csProgress = (p, m) => progress.push([p, m]);
+  let t0 = performance.now();
+  const td = tool('texture_displacement', tdArgs(), [cube], img);
+  const serialMs = performance.now() - t0;
   const out = td.meshData?.[0];
   let maxX = -Infinity; if (out) for (let k = 0; k < out.p.length; k += 3) maxX = Math.max(maxX, out.p[k]);
-  ok(td.ok && out && out.i.length / 3 > 12 && maxX > 10.05 && maxX < 11.5, `texture displacement bake: ${out ? out.i.length / 3 : 0} tris, max X ${maxX.toFixed(2)} (cube 10) ${td.error ?? ''}`);
+  ok(td.ok && out && out.i.length / 3 > 12 && maxX > 10.05 && maxX < 11.5, `texture displacement bake: ${out ? out.i.length / 3 : 0} tris, max X ${maxX.toFixed(2)} (cube 10), ${Math.round(serialMs)} ms ${td.error ?? ''}`);
+  ok(progress.length > 3 && progress.every(([p, m]) => p >= 0 && p <= 100 && m === 'Baking texture displacement'),
+     `texture_displacement reports progress (${progress.length} reports, max ${Math.max(...progress.map((x) => x[0]))}%)`);
   const bad = tool('texture_displacement', { layers: '{not json' }, [cube]);
   ok(!bad.ok && /layers/.test(bad.error), 'texture_displacement rejects bad layers JSON');
+
+  // Cancellation through Module.csCancelled (the single-threaded host's hook): stops at the next progress check.
+  progress.length = 0;
+  mod.csCancelled = () => progress.length >= 2;
+  t0 = performance.now();
+  const cx = tool('texture_displacement', tdArgs(), [cube], img);
+  const cancelMs = performance.now() - t0;
+  mod.csCancelled = undefined;
+  ok(cx.ok && cx.result.cancelled === true && !cx.meshData.length, `texture_displacement cancelled by Module.csCancelled after ${Math.round(cancelMs)} ms (full run ${Math.round(serialMs)} ms)`);
+  const badFlag = tool('texture_displacement', tdArgs({ cancelFlag: 6 }), [cube], img);
+  ok(!badFlag.ok && /cancelFlag/.test(badFlag.error), 'texture_displacement rejects a misaligned cancelFlag');
+  // A cancel flag in engine memory that is already set (what a pthreads host stores while the op runs).
+  const flag = mod._malloc(4) >>> 0;
+  (mod.csSyncHeap?.(), mod.HEAP32)[flag >>> 2] = 1;
+  const fx = tool('texture_displacement', tdArgs({ cancelFlag: flag }), [cube], img);
+  ok(fx.ok && fx.result.cancelled === true, 'texture_displacement honours args.cancelFlag');
+  (mod.csSyncHeap?.(), mod.HEAP32)[flag >>> 2] = 0;
+
+  // Desktop's bake commit carries support / seam / colour / fuzzy paint across (transfer_facet_paint).
+  // Bottom face (triangles 0, 1) support enforcer, top face (2, 3) filament 3, side 4 seam blocker.
+  const sup = tool('paint_from_states', { states: [[0, 1], [1, 1]] }, [cube]).result.paint;
+  const col = tool('paint_from_states', { states: [[2, 3], [3, 3]] }, [cube]).result.paint;
+  const seam = tool('paint_from_states', { states: [[4, 2]] }, [cube]).result.paint;
+  const cp = tool('texture_displacement', tdArgs({ carryPaint: { support: sup, color: col, seam } }), [cube], img);
+  const res = cp.meshData?.[0];
+  const decode = (paint, maxState) => {
+    const o = tool('paint_open', { paint, maxState }, [res]);
+    tool('paint_close', { handle: o.result.handle }, []);
+    return o;
+  };
+  const zs = (m) => { let lo = Infinity, hi = -Infinity; for (let k = 2; k < m.p.length; k += 3) { lo = Math.min(lo, m.p[k]); hi = Math.max(hi, m.p[k]); } return [lo, hi]; };
+  if (cp.ok && res && cp.result.paint) {
+    const ds = decode(cp.result.paint.support, 2), dc = decode(cp.result.paint.color, 32), dm = decode(cp.result.paint.seam, 2);
+    const [sLo, sHi] = zs(ds.meshData[0]), [cLo] = zs(dc.meshData[0]);
+    ok(ds.result.states.join() === '1' && sHi < -8.5, `support paint carried onto the bottom (${ds.meshData[0].i.length / 3} tris, z ${sLo.toFixed(2)}..${sHi.toFixed(2)})`);
+    ok(dc.result.states.join() === '3' && cLo > 8.5, `colour paint carried onto the top as filament 3 (${dc.meshData[0].i.length / 3} tris, z >= ${cLo.toFixed(2)})`);
+    ok(dm.result.states.join() === '2', `seam blocker carried (${dm.meshData[0]?.i.length / 3} tris)`);
+    ok(!('fuzzy' in cp.result.paint), 'an unpainted channel stays absent');
+  } else ok(false, `texture_displacement carryPaint: ${cp.error ?? JSON.stringify(cp.result)}`);
+
+  // Pthreads build: cs_tool_start runs the op on its own thread with Orca's TBB loops, and the host
+  // cancels through cancelFlag while it runs.
+  if (typeof mod._cs_tool_start === 'function') {
+    const H32 = () => (mod.csSyncHeap?.(), mod.HEAP32);
+    const start = async (args, meshes, extra, onProgress) => {
+      let size = 0; const ents = meshes.map((m) => { const v = size; size += m.p.byteLength; const i = size; size += m.i.byteLength; return { vertexOffset: v, vertexCount: m.p.length / 3, indexOffset: i, triangleCount: m.i.length / 3 }; });
+      const xo = size; size += extra.length;
+      const blob = new Uint8Array(size);
+      meshes.forEach((m, k) => { blob.set(new Uint8Array(m.p.buffer), ents[k].vertexOffset); blob.set(new Uint8Array(m.i.buffer), ents[k].indexOffset); });
+      blob.set(extra, xo);
+      const json = new TextEncoder().encode(JSON.stringify({ op: 'texture_displacement', args: args(xo), meshes: ents }));
+      const w = (b) => { const p = mod._malloc(b.byteLength) >>> 0; (mod.csSyncHeap?.(), mod.HEAPU8).set(b, p); return p; };
+      const jp = w(json), bp = w(blob), outs = mod._malloc(16) >>> 0, st = mod._malloc(8) >>> 0;
+      H32().fill(0, outs >>> 2, (outs >>> 2) + 4); H32().fill(0, st >>> 2, (st >>> 2) + 2);
+      mod.csProgress = (p) => onProgress?.(p);
+      if (mod._cs_tool_start(jp, json.byteLength, bp, blob.byteLength, outs, outs + 4, outs + 8, outs + 12, st) !== 0) throw new Error('cs_tool_start failed');
+      const keepAlive = setInterval(() => {}, 1000);
+      try {
+        while (Atomics.load(H32(), st >>> 2) === 0) { const r = Atomics.waitAsync(H32(), st >>> 2, 0, 200); if (r.async) await r.value; }
+      } finally { clearInterval(keepAlive); }
+      const H = (mod.csSyncHeap?.(), mod.HEAPU32), pj = H[outs >>> 2], lj = H[(outs + 4) >>> 2], pb = H[(outs + 8) >>> 2];
+      const r = JSON.parse(new TextDecoder().decode(mod.HEAPU8.slice(pj, pj + lj)));
+      if (pj) mod._cs_free(pj); if (pb) mod._cs_free(pb); mod._free(jp); mod._free(bp); mod._free(outs); mod._free(st);
+      return r;
+    };
+    // The 20 mm cube at preview resolution (no simplification), serial (cs_tool) vs threaded (cs_tool_start).
+    const prev = { v2_max_triangles_k: 0 };
+    t0 = performance.now();
+    const ser = tool('texture_displacement', tdArgs({}, prev), [cube], img);
+    const serMs = performance.now() - t0;
+    t0 = performance.now();
+    const par = await start(tdArgs({}, prev), [cube], img);
+    const parMs = performance.now() - t0;
+    ok(par.ok && par.result.triangles === ser.result.triangles,
+       `cs_tool_start texture_displacement (${mod._cs_thread_count()} threads): ${par.result.triangles} tris in ${Math.round(parMs)} ms, serial cs_tool ${ser.result.triangles} tris in ${Math.round(serMs)} ms`);
+    let n = 0;
+    t0 = performance.now();
+    let setAt = 0;
+    const can = await start(tdArgs({ cancelFlag: flag }, prev), [cube], img, () => { if (++n === 2) { setAt = performance.now(); Atomics.store(H32(), flag >>> 2, 1); } });
+    const stopMs = performance.now() - (setAt || t0);
+    Atomics.store(H32(), flag >>> 2, 0);
+    ok(can.ok && can.result.cancelled === true, `cs_tool_start cancelled through cancelFlag; stopped ${Math.round(stopMs)} ms after the flag was set`);
+  }
+  mod._free(flag);
+  mod.csProgress = () => {};
 }
 
 // ---- Orca 2.5: Design-tab sketch solver (SolveSpace) / inference / SVG import --------------
@@ -217,5 +309,6 @@ function png(w, h, f) { // 8-bit greyscale
   ok(svg.ok && svg.result.regions.length === 1 && svg.result.regions[0][0].length >= 4, `SVG → ${svg.result?.regions?.length} sketch region(s) ${svg.error ?? ''}`);
 }
 
+mod.csTerminateThreads?.();
 console.log(failures ? `\n${failures} FAILED` : '\nALL PASSED');
 process.exit(failures ? 1 : 0);

@@ -66,6 +66,9 @@
 #include <set>
 #include <sys/stat.h>
 #include <unistd.h>
+#ifdef __EMSCRIPTEN__
+#include <emscripten/heap.h>
+#endif
 
 #ifdef CS_ENGINE_THREADS
 // Pthreads engine (build-wasm-mt): real oneTBB. See cs_slice_start().
@@ -2046,6 +2049,57 @@ void op_repair_mesh(const json& args, const std::vector<ToolMesh>& meshes, ToolO
     out.meshes.push_back(res);
 }
 
+// ---- tool cancellation -------------------------------------------------------------
+// A long tool run (texture_displacement) stops when the host asks: desktop's jobs pass an abort check
+// through build_texture_displacement()'s progress callback (TextureDisplacementPreviewJob still_wanted,
+// TextureDisplacementBakeJob ctl.was_canceled()). Two ways in, because only one fits each build:
+//  - args.cancelFlag: the byte address of an int32 in the engine's memory; nonzero = cancel. Only useful
+//    when that memory is shared (pthreads build, run through cs_tool_start): the host's thread is free
+//    while the op runs and stores 1 there.
+//  - Module.csCancelled(): polled on the main runtime thread; the single-threaded build blocks the host's
+//    Worker for the whole op, so the host answers from a SharedArrayBuffer the page writes.
+std::atomic<const int32_t*> g_tool_cancel{nullptr};
+
+#ifdef __EMSCRIPTEN__
+EM_JS(int, cs_js_cancelled, (), {
+    try {
+        return typeof Module["csCancelled"] === "function" && Module["csCancelled"]() ? 1 : 0;
+    } catch (e) { return 0; }
+});
+#endif
+
+bool tool_cancelled()
+{
+    if (const int32_t* f = g_tool_cancel.load(std::memory_order_acquire))
+        if (__atomic_load_n(f, __ATOMIC_ACQUIRE) != 0) return true;
+#ifdef __EMSCRIPTEN__
+#ifdef CS_ENGINE_THREADS
+    if (!emscripten_is_main_runtime_thread()) return false; // a pthread's Module has no host hooks
+#endif
+    return cs_js_cancelled() != 0;
+#else
+    return false;
+#endif
+}
+
+// Installs args.cancelFlag for the duration of one op.
+struct CancelScope {
+    explicit CancelScope(const json& args)
+    {
+        auto it = args.find("cancelFlag");
+        if (it == args.end() || it->is_null()) return;
+        const uint64_t addr = it->is_number_unsigned() || it->is_number_integer() ? it->get<uint64_t>() : 0;
+        if (addr == 0 || (addr & 3u) || addr + 4 > uint64_t(UINT32_MAX)) throw cs::JobError("cancelFlag must be a 4-byte aligned address");
+#ifdef __EMSCRIPTEN__
+        if (addr + 4 > uint64_t(emscripten_get_heap_size())) throw cs::JobError("cancelFlag out of bounds");
+#endif
+        g_tool_cancel.store(reinterpret_cast<const int32_t*>(uintptr_t(addr)), std::memory_order_release);
+    }
+    ~CancelScope() { g_tool_cancel.store(nullptr, std::memory_order_release); }
+    CancelScope(const CancelScope&) = delete;
+    CancelScope& operator=(const CancelScope&) = delete;
+};
+
 // ---- texture displacement bake (Orca 2.5 "Texture displacement" tool) ---------------
 // The desktop bakes the relief into the volume's mesh before slicing; hosts do the
 // same with this op and slice the returned mesh.
@@ -2055,11 +2109,19 @@ void op_repair_mesh(const json& args, const std::vector<ToolMesh>& meshes, ToolO
 //          paint:  { "<slot>": [[triangle, hex], ...] }  the layer's paint mask (3MF TriangleSelector strings)
 //          transform?: [16] column-major mesh → world (instance * volume; default identity),
 //          anchor?: [x,y,z] world point the texture is anchored at (multi-part objects pass one point),
-//          restingDrop?: mm }
-//   -> meshes[0] = displaced mesh; result { triangles, budgetLimited }
+//          restingDrop?: mm,
+//          carryPaint?: { support?, seam?, color?, fuzzy?: [[triangle, hex], ...] }  the volume's other
+//                       painting on the base mesh, carried onto the result (desktop's bake commit:
+//                       transfer_facet_paint per channel when the topology changed, kept as is otherwise),
+//          cancelFlag?: address of an int32 in shared engine memory (see "tool cancellation") }
+//   progress: Module.csProgress(percent, "Baking texture displacement") - the bake's own 0..100, which
+//             restarts per pipeline stage (desktop's bake job reports the same numbers).
+//   -> meshes[0] = displaced mesh; result { triangles, budgetLimited, paint? (carried channels that are
+//      painted on the result, same keys) } - or result { cancelled: true } and no mesh.
 void op_texture_displacement(const json& args, std::vector<ToolMesh>& meshes, const uint8_t* blob, int blob_len, ToolOut& out)
 {
     if (meshes.size() != 1) throw cs::JobError("texture_displacement: exactly one mesh");
+    const CancelScope cancel_scope(args);
     const json lj = args.value("layers", json(nullptr));
     const std::string text = lj.is_string() ? lj.get<std::string>() : lj.dump();
     std::vector<TextureDisplacementLayer> layers;
@@ -2093,11 +2155,58 @@ void op_texture_displacement(const json& args, std::vector<ToolMesh>& meshes, co
     Vec3d anchor = T.translation();
     if (auto a = args.find("anchor"); a != args.end()) anchor = json_vec3f(*a, "anchor").cast<double>();
     TextureBakeStats stats;
+    std::atomic<bool> cancelled{false};
+    // Desktop's job callbacks: abort when cancelled, otherwise report the percentage.
     indexed_triangle_set res = build_texture_displacement(base, layers, facets, options,
-        [](int p) { cs::progress(p, "Baking texture displacement"); return true; }, nullptr, T, nullptr, &stats,
+        [&cancelled](int p) {
+            if (cancelled.load() || tool_cancelled()) { cancelled.store(true); return false; }
+            cs::progress(p, "Baking texture displacement");
+            return true;
+        }, nullptr, T, nullptr, &stats,
         nullptr, &anchor, float(args.value("restingDrop", 0.0)));
+    if (cancelled.load() || tool_cancelled()) {
+        out.result = {{"cancelled", true}};
+        return;
+    }
     if (res.indices.empty()) throw cs::JobError("texture_displacement: the bake produced no mesh");
     out.result = {{"triangles", res.indices.size()}, {"budgetLimited", stats.budget_limited}};
+
+    // TextureDisplacementBakeJob::finalize(): the volume's support / seam / colour / fuzzy paint carried
+    // across the rebuilt mesh with transfer_facet_paint() (a baked triangle takes the state of the source
+    // sub-triangle nearest its centroid); untouched when the bake kept the topology.
+    const json carry = args.value("carryPaint", json(nullptr));
+    if (carry.is_object() && !carry.empty()) {
+        apply_paint(mv, carry, ident);
+        const bool topology_changed = options.pipeline_v2 || res.indices.size() != base.indices.size();
+        const std::array<std::pair<const char*, FacetsAnnotation*>, 4> channels{{
+            {"support", &mv->supported_facets}, {"seam", &mv->seam_facets},
+            {"color", &mv->mmu_segmentation_facets}, {"fuzzy", &mv->fuzzy_skin_facets}}};
+        json carried = json::object();
+        if (!topology_changed) {
+            for (const auto& [key, fa] : channels)
+                if (!fa->empty()) carried[key] = paint_map(*fa);
+        } else {
+            const TriangleMesh dst(res);
+            ModelVolume* rv = mo->add_volume(dst); // a FacetsAnnotation to serialise the result through
+            const std::array<FacetsAnnotation*, 4> target{&rv->supported_facets, &rv->seam_facets,
+                                                          &rv->mmu_segmentation_facets, &rv->fuzzy_skin_facets};
+            for (size_t ch = 0; ch < channels.size(); ++ch) {
+                if (tool_cancelled()) { out.result = {{"cancelled", true}}; return; }
+                const FacetsAnnotation& src = *channels[ch].second;
+                if (src.empty()) continue;
+                const std::vector<uint8_t> state = transfer_facet_paint(base, src.get_data(), res);
+                if (state.empty()) continue;
+                TriangleSelector selector(dst);
+                bool any = false;
+                for (size_t t = 0; t < state.size(); ++t)
+                    if (state[t] != 0) { selector.set_facet(int(t), EnforcerBlockerType(state[t])); any = true; }
+                if (!any) continue;
+                target[ch]->set(selector);
+                carried[channels[ch].first] = paint_map(*target[ch]);
+            }
+        }
+        if (!carried.empty()) out.result["paint"] = std::move(carried);
+    }
     out.meshes.push_back(std::move(res));
 }
 
@@ -3399,5 +3508,52 @@ int cs_tool(const char* job_json, int job_len, const uint8_t* blob, int blob_len
     }
     return rc;
 }
+
+#ifdef CS_ENGINE_THREADS
+// cs_tool_start(): cs_tool's arguments plus `state` (2 x int32, 4-byte aligned), the asynchronous
+// form of cs_slice_start() for long tool runs (texture_displacement). cs_tool called on the main
+// runtime thread runs in a 1-slot arena (serial; see serial_on_main_thread), so a run that wants
+// Orca's TBB loops starts here instead: cs_tool on its own pthread (64 MB stack), and this returns
+// at once (0 = started, -1 = could not start: call cs_tool). state[1] = cs_tool's return code,
+// state[0] flips 0 -> 1 with a futex wake when the out-params are written. The host must not call
+// into the engine until then, and keeps its event loop free meanwhile (progress is proxied there,
+// and TBB's workers are started from it); it can cancel through args.cancelFlag.
+struct ToolStart {
+    const char* job; int job_len; const uint8_t* blob; int blob_len;
+    char** out_json; int* out_json_len; uint8_t** out_blob; int* out_blob_len;
+    int32_t* state;
+};
+
+static void* tool_thread_main(void* p)
+{
+    std::unique_ptr<ToolStart> a(static_cast<ToolStart*>(p));
+    const int rc = cs_tool(a->job, a->job_len, a->blob, a->blob_len, a->out_json, a->out_json_len, a->out_blob, a->out_blob_len);
+    __atomic_store_n(&a->state[1], rc, __ATOMIC_SEQ_CST);
+    __atomic_store_n(&a->state[0], 1, __ATOMIC_SEQ_CST);
+    emscripten_futex_wake(&a->state[0], INT_MAX);
+    return nullptr;
+}
+
+EMSCRIPTEN_KEEPALIVE
+int cs_tool_start(const char* job_json, int job_len, const uint8_t* blob, int blob_len,
+                  char** out_json, int* out_json_len, uint8_t** out_blob, int* out_blob_len, int32_t* state)
+{
+    if (!state || (reinterpret_cast<uintptr_t>(state) & 3u)) return -1;
+    state[0] = 0;
+    state[1] = -1;
+    engine_threads();
+    auto* a = new (std::nothrow) ToolStart{job_json, job_len, blob, blob_len, out_json, out_json_len, out_blob, out_blob_len, state};
+    if (!a) return -1;
+    pthread_attr_t attr;
+    pthread_attr_init(&attr);
+    pthread_attr_setstacksize(&attr, size_t(64) << 20);
+    pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED);
+    pthread_t t;
+    const int err = pthread_create(&t, &attr, tool_thread_main, a);
+    pthread_attr_destroy(&attr);
+    if (err != 0) { delete a; return -1; }
+    return 0;
+}
+#endif
 
 } // extern "C"

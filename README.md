@@ -27,7 +27,8 @@ tests/cs-slice-test.mjs     end-to-end + robustness suite (node); 2.5: extruder 
                             stats.sliceInfo (sliced-3MF plate data) and stats.mass (centre-of-mass sums)
 tests/cs-tool-test.mjs      cs_tool: painting, layer profiles, cut + connectors / groove, mixed_filament,
                             resolve_variants, wipe_tower_footprint, repair_mesh, inspect_3mf,
-                            texture_displacement, sketch
+                            texture_displacement (progress, cancel via Module.csCancelled / cancelFlag,
+                            carryPaint; MT: cs_tool_start serial vs threaded timing), sketch
 tests/cs-arrange-test.mjs   cs_tool arrange (Orca ArrangeJob): spacing, auto rotate, plates, locked / unprintable,
                             IDEX/IQEX zones, belt printers
 tests/cs-arrange-bench.mjs  arrange timing on heavy meshes, per phase
@@ -73,7 +74,9 @@ OFF (default) is unchanged.
 
 ## Multi-threaded build (`build-wasm-mt/`)
 
-* Same ABI plus `cs_slice_start(…same args…, int32_t* state)` and
+* Same ABI plus `cs_slice_start(…same args…, int32_t* state)`,
+  `cs_tool_start(…cs_tool's args…, int32_t* state)` (the same for a tool op:
+  the texture-displacement bake's TBB loops run in parallel this way) and
   `cs_thread_count()`. `cs_slice_start` runs `cs_slice` on its own pthread
   (64 MB stack) and returns at once; `state[0]` flips to 1 (futex wake) when
   done, `state[1]` = return code. The host awaits it with `Atomics.waitAsync`
