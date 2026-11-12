@@ -23,7 +23,8 @@ wasm/mt_pre.js, mt_post.js  pthreads build: thread count, csTerminateThreads, cs
 scripts/build-wasm.sh       checkout + patch + build + schema
 scripts/gen-schema.mjs      writes schema.json / version.json next to the build
 tests/cs-slice-test.mjs     end-to-end + robustness suite (node); 2.5: extruder variants (presets with `include`),
-                            H2C nozzle rack / Hybrid (Manual, Nozzle Manual), mixed filaments, plugin hooks
+                            H2C nozzle rack / Hybrid (Manual, Nozzle Manual), mixed filaments, plugin hooks,
+                            stats.sliceInfo (sliced-3MF plate data) and stats.mass (centre-of-mass sums)
 tests/cs-tool-test.mjs      cs_tool: painting, layer profiles, cut + connectors / groove, mixed_filament,
                             resolve_variants, wipe_tower_footprint, repair_mesh, inspect_3mf,
                             texture_displacement, sketch

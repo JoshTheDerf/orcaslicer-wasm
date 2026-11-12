@@ -22,6 +22,7 @@
 #include <libslic3r/calib.hpp>
 #include <libslic3r/BrimEarsPoint.hpp>
 #include <libslic3r/GCode/GCodeProcessor.hpp>
+#include <libslic3r/LocalesUtils.hpp>
 #include <libslic3r/Layer.hpp>
 #include <libslic3r/Model.hpp>
 #include <libslic3r/MeshRepair.hpp>
@@ -760,6 +761,148 @@ json collect_stats(const Print& print, const GCodeProcessorResult& result, const
     return st;
 }
 
+// GCodeProcessorResult::ObjectMass as JSON: per layer id, what is printed up to it (finalize_object_masses), flat
+// [mass, volume, moment x y z, second x y z, cross xy xz yz] x layers; the boxes as [min x y z, max x y z].
+json mass_json(const GCodeProcessorResult::ObjectMass& m)
+{
+    const auto box = [](const BoundingBoxf3& b) -> json {
+        if (!b.defined) return nullptr;
+        return json::array({b.min.x(), b.min.y(), b.min.z(), b.max.x(), b.max.y(), b.max.z()});
+    };
+    json layers = json::array();
+    for (const auto& s : m.printed_up_to_layer)
+        for (double v : {s.mass, s.volume, s.moment.x(), s.moment.y(), s.moment.z(), s.second.x(), s.second.y(), s.second.z(),
+                         s.cross.x(), s.cross.y(), s.cross.z()})
+            layers.push_back(v);
+    json o = {{"layers", std::move(layers)}, {"box", box(m.box)}, {"beltBox", box(m.belt_box)}, {"assembly", m.assembly}};
+    if (!m.name.empty() || m.instance >= 0) { o["name"] = m.name; o["instance"] = m.instance; }
+    return o;
+}
+
+// The centre-of-mass data desktop's Preview draws (GLCanvas3D::CenterOfMass::render from the G-code processor's
+// plate_mass / object_masses / body_masses / support_masses).
+json collect_mass(const GCodeProcessorResult& result)
+{
+    const auto list = [](const std::vector<GCodeProcessorResult::ObjectMass>& v) {
+        json a = json::array();
+        for (const auto& m : v) a.push_back(mass_json(m));
+        return a;
+    };
+    return {{"plate", mass_json(result.plate_mass)}, {"objects", list(result.object_masses)}, {"bodies", list(result.body_masses)},
+            {"supports", list(result.support_masses)}};
+}
+
+// What desktop's sliced 3MF takes from the slice beyond the statistics: the slice_info.config plate values
+// (PartPlateList::store_to_3mf_structure + PlateData::parse_filament_info), filament_sequence.json and the
+// plate_N.json first-layer boxes (Plater::priv::generate_first_layer_bbox).
+json collect_slice_info(const Print& print, const GCodeProcessorResult& result)
+{
+    json si;
+    si["firstLayerTime"] = result.initial_layer_time;
+    si["toolpathOutside"] = result.toolpath_outside;
+    si["labelObjectEnabled"] = result.label_object_enabled;
+    si["supportUsed"] = print.is_support_used();
+
+    json warnings = json::array();
+    for (const auto& w : result.warnings)
+        warnings.push_back({{"level", w.level}, {"msg", w.msg}, {"errorCode", w.error_code}, {"params", w.params}});
+    si["warnings"] = std::move(warnings);
+
+    json limit = json::array();
+    for (uint64_t v : result.limit_filament_maps) limit.push_back(v);
+    si["limitFilamentMaps"] = std::move(limit);
+
+    // An unordered_map: in its iteration order, as the 3MF writer walks it.
+    json layer_filaments = json::array();
+    for (const auto& [filaments, ranges] : result.layer_filaments) {
+        json r = json::array();
+        for (const auto& [a, b] : ranges) r.push_back({a, b});
+        layer_filaments.push_back({{"filaments", filaments}, {"ranges", std::move(r)}});
+    }
+    si["layerFilaments"] = std::move(layer_filaments);
+    si["filamentChangeSequence"] = result.filament_change_sequence;
+    si["nozzleChangeSequence"] = result.nozzle_change_sequence;
+    si["optimalAssignment"] = result.optimal_assignment;
+
+    // Mixed filaments used (store_to_3mf_structure): 1-based slot, with the print config's type, colour, components.
+    std::vector<unsigned int> used_mixed = result.used_mixed_filaments;
+    if (used_mixed.empty()) used_mixed = print.get_slice_used_mixed_filaments();
+    json mixed = json::array();
+    const auto& types = print.config().filament_type.values;
+    const auto& colours = print.config().filament_colour.values;
+    const auto& comps = print.config().filament_mixed_components.values;
+    for (unsigned int f : used_mixed)
+        mixed.push_back({{"id", int(f) + 1}, {"type", f < types.size() ? types[f] : std::string()},
+                         {"color", f < colours.size() ? colours[f] : std::string()}, {"components", f < comps.size() ? comps[f] : std::string()}});
+    si["mixedFilaments"] = std::move(mixed);
+
+    // The layer-aware nozzle grouping (parse_filament_info: a LayeredNozzleGroupResult only).
+    if (auto grouping = std::dynamic_pointer_cast<MultiNozzleUtils::LayeredNozzleGroupResult>(result.nozzle_group_result)) {
+        json filaments = json::array();
+        for (const auto& [f, volume] : result.print_statistics.total_volumes_per_extruder) {
+            (void) volume;
+            const auto nozzles = grouping->get_nozzles_for_filament(int(f));
+            if (nozzles.empty()) continue;
+            std::vector<int> groups;
+            std::set<double> diameters;
+            std::set<NozzleVolumeType> volume_types;
+            for (const auto& n : nozzles) {
+                groups.push_back(n.group_id);
+                diameters.insert(string_to_double_decimal_point(n.diameter));
+                volume_types.insert(n.volume_type);
+            }
+            std::sort(groups.begin(), groups.end());
+            groups.erase(std::unique(groups.begin(), groups.end()), groups.end());
+            json fj = {{"id", f}, {"groupIds", groups}};
+            if (!diameters.empty()) fj["diameter"] = *diameters.begin();
+            if (volume_types.size() > 1) fj["volumeType"] = get_nozzle_volume_type_string(nvtHybrid);
+            else if (!volume_types.empty()) fj["volumeType"] = get_nozzle_volume_type_string(*volume_types.begin());
+            filaments.push_back(std::move(fj));
+        }
+        json used = json::array();
+        for (const auto& n : grouping->get_used_nozzles_in_extruder())
+            used.push_back({{"id", n.group_id}, {"extruderId", n.extruder_id}, {"diameter", n.diameter},
+                            {"volumeType", get_nozzle_volume_type_string(n.volume_type)}});
+        si["nozzleGrouping"] = {{"dynamic", grouping->is_support_dynamic_nozzle_map()}, {"filaments", std::move(filaments)}, {"usedNozzles", std::move(used)}};
+    }
+
+    // Plater::priv::generate_first_layer_bbox, plate-local (the bridge slices at the origin). As there, the prime
+    // tower's entry keeps the area and layer height of the object before it.
+    json fl;
+    fl["firstExtruder"] = print.get_tool_ordering().first_extruder();
+    fl["bedType"] = bed_type_to_gcode_string(print.config().curr_bed_type.value);
+    fl["firstLayerTime"] = result.initial_layer_time;
+    if (const auto* nd = print.config().option<ConfigOptionFloats>("nozzle_diameter"))
+        fl["nozzleDiameter"] = float(nd->get_at(print.get_tool_ordering().first_extruder()));
+    else
+        fl["nozzleDiameter"] = 0.4f;
+    BoundingBoxf all;
+    json objects = json::array();
+    float area = 0.f, layer_height = 0.f;
+    std::string name;
+    for (const PrintObject* obj : print.objects()) {
+        const BoundingBox bs = const_cast<PrintObject*>(obj)->get_first_layer_bbox(area, layer_height, name);
+        const auto bb = unscaled(bs);
+        all.merge(bb);
+        area *= float(SCALING_FACTOR * SCALING_FACTOR);
+        objects.push_back({{"id", obj->id().id}, {"bbox", {bb.min.x(), bb.min.y(), bb.max.x(), bb.max.y()}}, {"area", area},
+                           {"layerHeight", layer_height}, {"name", name}});
+    }
+    if (print.has_wipe_tower()) {
+        const Points corners = print.first_layer_wipe_tower_corners();
+        if (!corners.empty()) {
+            const auto bb = unscaled(BoundingBox(corners[0], corners[2]));
+            all.merge(bb);
+            objects.push_back({{"id", nullptr}, {"wipeTower", true}, {"bbox", {bb.min.x(), bb.min.y(), bb.max.x(), bb.max.y()}}, {"area", area},
+                               {"layerHeight", layer_height}, {"name", "wipe_tower"}});
+        }
+    }
+    fl["bboxAll"] = {all.min.x(), all.min.y(), all.max.x(), all.max.y()};
+    fl["objects"] = std::move(objects);
+    si["firstLayerBBox"] = std::move(fl);
+    return si;
+}
+
 int slice_impl(const char* job_json, int job_len, const uint8_t* blob, int blob_len,
                uint8_t** out_gcode, int* out_gcode_len, json& report)
 {
@@ -927,6 +1070,8 @@ int slice_impl(const char* job_json, int job_len, const uint8_t* blob, int blob_
     if (got != size_t(sz)) { std::free(buf); throw cs::JobError("short read of exported G-code"); }
 
     report["stats"] = collect_stats(print, result, config);
+    report["stats"]["sliceInfo"] = collect_slice_info(print, result);
+    report["stats"]["mass"] = collect_mass(result);
     report["timings"] = {{"processMs", t1 - t0}, {"exportMs", t2 - t1}};
     report["ok"] = true;
     *out_gcode = buf;

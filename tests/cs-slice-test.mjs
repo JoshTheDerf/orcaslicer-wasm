@@ -336,6 +336,49 @@ for (let i = 0; i < 3; i++) {
   ok(line === '500,200', `H2D: outer_wall_speed per extruder = ${line} (want 500,200)`);
 }
 
+// ---- stats.sliceInfo / stats.mass: the sliced 3MF's plate data and the Preview's centres of mass -----
+{
+  const centre = (m) => { const L = m.layers, o = L.length - 11; return [L[o + 2] / L[o], L[o + 3] / L[o], L[o + 4] / L[o]]; };
+  const total = (m) => m.layers[m.layers.length - 11];
+  const r = await slice(mod, bbl.config, [{ name: 'cube', ...box(20, 20, 20), transform: translate(118, 118, 0) }]);
+  checkGcode('sliceInfo: cube (P1S)', r, { minLayers: 50 });
+  const si = r.report.stats.sliceInfo, mass = r.report.stats.mass;
+  ok(si && si.firstLayerTime > 0 && si.labelObjectEnabled === true && si.toolpathOutside === false && Array.isArray(si.warnings),
+     `sliceInfo: first layer ${si?.firstLayerTime}s, label objects ${si?.labelObjectEnabled}, warnings ${JSON.stringify(si?.warnings)}`);
+  const fl = si?.firstLayerBBox;
+  const ob = fl?.objects?.[0];
+  ok(fl && fl.objects.length === 1 && ob.name === 'cube' && Math.abs(ob.layerHeight - 0.2) < 1e-6 && Math.abs(fl.nozzleDiameter - 0.4) < 1e-6
+     && ob.bbox[0] < 118.5 && ob.bbox[2] > 137.5 && Math.abs(ob.area - 400) < 8 && typeof fl.bedType === 'string' && fl.firstExtruder === 0,
+     `firstLayerBBox: ${JSON.stringify(fl)}`);
+  ok(si?.nozzleGrouping && si.nozzleGrouping.dynamic === false && si.nozzleGrouping.filaments[0]?.groupIds?.[0] === 0 && si.nozzleGrouping.usedNozzles.length === 1,
+     `nozzleGrouping (single nozzle): ${JSON.stringify(si?.nozzleGrouping)}`);
+  const c = mass && centre(mass.plate), co = mass?.objects?.[0] && centre(mass.objects[0]);
+  const grams = r.report.stats.filamentG[0];
+  ok(mass && mass.objects.length === 1 && Math.abs(c[0] - 128) < 1.5 && Math.abs(c[1] - 128) < 1.5 && Math.abs(c[2] - 10) < 1.5
+     && Math.abs(co[2] - 10) < 1.5 && total(mass.objects[0]) <= total(mass.plate) && Math.abs(total(mass.plate) / 1000 - grams) / grams < 0.1,
+     `mass: plate ${total(mass?.plate)} mg at ${c?.map((v) => v.toFixed(2))}, object at ${co?.map((v) => v.toFixed(2))}, ${grams.toFixed(2)} g used, ${mass?.plate.layers.length / 11} layers`);
+  // Two filaments, one per object: layer filament lists, change sequence, a prime tower box.
+  const two = multiFilament(bbl.config, ['#FF0000', '#00FF00']);
+  const r2 = await slice(mod, { ...two, enable_prime_tower: '1', flush_multiplier: ['1'], flush_volumes_matrix: ['0', '100', '100', '0'] }, [
+    { name: 'red', ...box(15, 15, 6), transform: translate(90, 110, 0) },
+    { name: 'green', ...box(15, 15, 6), transform: translate(140, 110, 0), config: { extruder: '2' } }]);
+  checkGcode('sliceInfo: two filaments (P1S)', r2, { minLayers: 20 });
+  const s2 = r2.report.stats.sliceInfo;
+  ok(s2 && s2.layerFilaments.some((l) => l.filaments.join() === '0,1') && s2.filamentChangeSequence.length > 0
+     && s2.firstLayerBBox.objects.some((o) => o.wipeTower && o.name === 'wipe_tower') && r2.report.stats.mass.objects.length === 2,
+     `two filaments: layerFilaments ${JSON.stringify(s2?.layerFilaments)}, sequence ${s2?.filamentChangeSequence?.length} changes, boxes ${s2?.firstLayerBBox?.objects?.map((o) => o.name)}`);
+  // H2D: the grouping puts each filament on its extruder.
+  const h2dTwo = multiFilament(configFor('BBL', 'Bambu Lab H2D 0.4 nozzle', '0.20mm Standard @BBL H2D', 'Bambu PLA Basic @BBL H2D').config, ['#FF0000', '#00FF00']);
+  const r3 = await slice(mod, { ...h2dTwo, filament_map_mode: 'Manual', filament_map: ['1', '2'], enable_prime_tower: '0', flush_multiplier: ['1', '1'], flush_volumes_matrix: Array(8).fill('100') }, [
+    { name: 'left', ...box(15, 15, 4), transform: translate(120, 150, 0) },
+    { name: 'right', ...box(15, 15, 4), transform: translate(180, 150, 0), config: { extruder: '2' } }]);
+  checkGcode('sliceInfo: H2D two extruders', r3, { minLayers: 10 });
+  const g3 = r3.report.stats.sliceInfo?.nozzleGrouping;
+  ok(g3 && g3.usedNozzles.length === 2 && g3.usedNozzles.map((n) => n.extruderId).sort().join() === '0,1'
+     && g3.filaments.length === 2 && g3.filaments[0].groupIds[0] !== g3.filaments[1].groupIds[0],
+     `H2D nozzleGrouping: ${JSON.stringify(g3)}, optimalAssignment ${JSON.stringify(r3.report.stats.sliceInfo?.optimalAssignment)}`);
+}
+
 // ---- Orca 2.5: Hybrid nozzle rack (H2C), Manual / Nozzle Manual grouping ----------------------
 // Desktop's full_config(false, f_maps, f_volume_maps) shape: each filament's variant vectors
 // concatenated (3 columns per H2C filament, from its `include` template), filament_volume_map per
